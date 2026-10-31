@@ -13,7 +13,7 @@ function loadModule(filename, dependencies = {}, globals = {}) {
   const result = ts.transpileModule(fs.readFileSync(path.join(__dirname, filename), 'utf8'), { fileName: filename, compilerOptions: options, reportDiagnostics: true });
   assert.deepEqual((result.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), []);
   const module = { exports: {} };
-  const context = vm.createContext({ module, exports: module.exports, URL, AbortController, setTimeout, clearTimeout,
+  const context = vm.createContext({ module, exports: module.exports, URL, AbortController, TextEncoder, setTimeout, clearTimeout,
     require(name) { if (name in dependencies) return dependencies[name]; throw new Error(`Unexpected dependency ${name}`); }, ...globals });
   vm.runInContext(result.outputText, context, { filename });
   return module.exports;
@@ -88,7 +88,7 @@ test('MAX browser authorization checks owner session only and makes zero Python 
   const req = request(); req.user.id = 'other';
   await rejected(Promise.resolve().then(() => instance.browserAuthorize(req)), 'EDITORIAL_OWNER_REQUIRED');
   assert.equal(calls.length, 0);
-  const source = fs.readFileSync(path.join(__dirname, 'editorial.controller.ts'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, 'editorial.controller.ts'), 'utf8').replace(/\r\n/g, '\n');
   assert.ok(source.includes("@Get('/browser-authorize')\n  @HttpCode(204)"));
 });
 test('settings/control enforce envelopes and revision, no publish endpoint exists', async () => {
@@ -105,6 +105,90 @@ test('settings/control enforce envelopes and revision, no publish endpoint exist
     await rejected(Promise.resolve().then(() => instance.control(req, { action: 'pause', revision })), 'EDITORIAL_CONTROL_INVALID', 422);
   }
   assert.equal(calls.length, 2); assert.equal(instance.publish, undefined);
+});
+
+test('four-route BFF uses fixed paths and exact action envelopes without forwarding browser credentials', async () => {
+  const { instance, calls } = controller(() => response({ targets: [], variants: [], dispatches: [] }));
+  const req = request(); req.headers.cookie = 'private-browser-cookie';
+  await instance.routes(req);
+  assert.equal(calls[0][0], `${env.EDITORIAL_INTERNAL_URL}/routes`);
+  assert.equal(calls[0][1].method, 'GET');
+  for (const action of ['inspect', 'preflight', 'preview', 'pause', 'resume', 'reconcile']) {
+    await instance.routeAction(req, { action, id: 'saved-object_123' });
+    assert.equal(calls.at(-1)[0], `${env.EDITORIAL_INTERNAL_URL}/route-action`);
+    assert.deepEqual(JSON.parse(calls.at(-1)[1].body), { action, id: 'saved-object_123' });
+  }
+  const approval = { action: 'approve', id: 'variant-123', revision: 4,
+    content_hash: 'a'.repeat(64), due_at: Math.floor(Date.now() / 1000) + 3600 };
+  await instance.routeAction(req, approval);
+  assert.deepEqual(JSON.parse(calls.at(-1)[1].body), approval);
+  assert.equal(calls.at(-1)[1].headers['X-Editorial-Owner'], env.EDITORIAL_OWNER_USER_ID);
+  assert.ok(!JSON.stringify(calls).includes('private-browser-cookie'));
+  assert.equal(instance.publish, undefined);
+});
+
+test('four-route mutations preserve cookie owner/origin/JSON authorization', async () => {
+  for (const mutate of [req => { delete req.headers.origin; }, req => { req.cookies = {}; },
+    req => { req.user.id = 'someone-else'; }, req => { req.headers['content-type'] = 'text/plain'; }]) {
+    const { instance, calls } = controller(); const req = request(); mutate(req);
+    await assert.rejects(Promise.resolve().then(() => instance.routeAction(req, { action: 'inspect', id: 'max_test' })));
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('explicit isolated port18092 forwards to copy API with unchanged trusted identity', async () => {
+  const internalUrl = 'http://host.docker.internal:18092/internal/editorial';
+  const { instance, calls } = controller(undefined, { EDITORIAL_INTERNAL_PORT: '18092', EDITORIAL_INTERNAL_URL: internalUrl });
+  await instance.routes(request());
+  assert.equal(calls.length, 1); assert.equal(calls[0][0], `${internalUrl}/routes`);
+  assert.equal(calls[0][1].headers['X-Editorial-Owner'], env.EDITORIAL_OWNER_USER_ID);
+  assert.equal(calls[0][1].redirect, 'error');
+});
+
+test('production default8092 never accepts isolated18092 implicitly', async () => {
+  for (const port of [undefined, '', '8092']) {
+    const { instance, calls } = controller(undefined, { EDITORIAL_INTERNAL_PORT: port,
+      EDITORIAL_INTERNAL_URL: 'http://localhost:18092/internal/editorial' });
+    await rejected(instance.state(request()), 'EDITORIAL_NOT_CONFIGURED', 503);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('port selection remains a two-value allowlist and does not relax URL or owner guards', async () => {
+  for (const port of ['8093', '443', '80', '08092', ' 18092', '18092 ', '18092/other', '*']) {
+    const { instance, calls } = controller(undefined, { EDITORIAL_INTERNAL_PORT: port });
+    await rejected(instance.state(request()), 'EDITORIAL_NOT_CONFIGURED', 503);
+    assert.equal(calls.length, 0);
+  }
+  for (const url of ['https://localhost:18092/internal/editorial', 'http://evil.test:18092/internal/editorial',
+    'http://localhost:18092/other', 'http://user:pass@localhost:18092/internal/editorial',
+    'http://localhost:18092/internal/editorial?next=evil', 'http://localhost:18092/internal/editorial#fragment']) {
+    const { instance, calls } = controller(undefined, { EDITORIAL_INTERNAL_PORT: '18092', EDITORIAL_INTERNAL_URL: url });
+    await rejected(instance.state(request()), 'EDITORIAL_NOT_CONFIGURED', 503);
+    assert.equal(calls.length, 0);
+  }
+  const { instance, calls } = controller(undefined, { EDITORIAL_INTERNAL_PORT: '18092',
+    EDITORIAL_INTERNAL_URL: 'http://localhost:18092/internal/editorial' });
+  const req = request(); req.user.id = 'someone-else';
+  await rejected(instance.state(req), 'EDITORIAL_OWNER_REQUIRED');
+  assert.equal(calls.length, 0);
+});
+
+test('four-route actions reject arbitrary publish, URL/credential keys, malformed IDs and stale schedules', async () => {
+  const { instance, calls } = controller();
+  const due = Math.floor(Date.now() / 1000) + 3600;
+  const valid = { action: 'approve', id: 'variant-123', revision: 1, content_hash: 'b'.repeat(64), due_at: due };
+  const invalid = [null, [], 'publish', {}, { action: 'publish', id: 'max_test' },
+    { action: 'inspect', id: 'https://evil.test/publish' }, { action: 'inspect', id: '../max_test' },
+    { action: 'inspect', id: 'x'.repeat(129) }, { action: 'inspect', id: 'max_test', url: 'http://internal/' },
+    { action: 'resume', id: 'max_test', token: 'private' }, { action: 'inspect', id: 'max_test', due_at: due },
+    { ...valid, revision: true }, { ...valid, revision: 0 }, { ...valid, content_hash: 'A'.repeat(64) },
+    { ...valid, content_hash: 'short' }, { ...valid, due_at: String(due) }, { ...valid, due_at: 1 },
+    { ...valid, due_at: due + 0.5 }, { ...valid, body: 'bypass exact saved body' },
+    { ...valid, human_checked: true }, { ...valid, api_url: 'https://evil.test' }];
+  for (const body of invalid) await rejected(Promise.resolve().then(() => instance.routeAction(request(), body)),
+    'EDITORIAL_ROUTE_ACTION_INVALID', 422);
+  assert.equal(calls.length, 0);
 });
 for (const internalUrl of ['https://evil.test/internal/editorial', 'http://host.docker.internal:8092/other',
   'http://user:pass@localhost:8092/internal/editorial', 'http://127.0.0.1:8092/internal/editorial?next=evil', 'http://localhost:8090/internal/editorial']) {
@@ -270,6 +354,353 @@ test('MAX login link supplies the exact root-relative noVNC WebSocket proxy path
   assert.equal(new URL('/' + url.searchParams.get('path'), url.origin).pathname, '/owner-browser/websockify');
   const source = fs.readFileSync(path.join(__dirname, 'editorial-panel.tsx'), 'utf8');
   assert.ok(source.includes('path=owner-browser/websockify')); assert.ok(source.includes('href={OWNER_BROWSER_URL}'));
+});
+
+function routeUi(react, globals = {}) {
+  return loadModule('editorial-panel.tsx', { react: react || require(path.join(tooling, 'react')),
+    'react/jsx-runtime': require(path.join(tooling, 'react/jsx-runtime')), './editorial-form': formApi,
+    './editorial.module.css': new Proxy({}, { get: (_, key) => String(key) }) }, globals);
+}
+const routeTarget = { id: 'vk_target', platform: 'vk', route: 'vk_api', destination: '-123456', enabled: true,
+  paused: true, binding_hash: 'c'.repeat(64), live_verified: false, status_kind: 'configuration_only',
+  credentials_configured: true, adapter_mode: 'live' };
+const routeVariant = { id: 'variant-123', target_id: 'vk_target', title: 'Полный материал', body: 'Начало\n\nКонец материала',
+  revision: 2, state: 'ready', content_hash: 'd'.repeat(64), media_count: 1, source_count: 2 };
+
+test('real Telegram access-only inspect confirms access and permissions without claiming delivery', () => {
+  const ui = routeUi();
+  const access = { platform: 'telegram', fixture: false, verification: 'access_only', live_verified: false,
+    publish: true, can_publish: true };
+  assert.equal(ui.routeAccessText(access), 'Доступ и право публикации подтверждены. Доставка ещё не проверена.');
+  assert.equal(ui.routeAccessText({ ...access, publish: false, can_publish: false }),
+    'Соединение с площадкой подтверждено; право публикации не подтверждено. Доставка не проверена.');
+});
+
+test('browser access-only and legacy live access retain separate delivery wording', () => {
+  const ui = routeUi();
+  const expected = 'Доступ и право публикации подтверждены. Доставка ещё не проверена.';
+  assert.equal(ui.routeAccessText({ fixture: false, state: 'access_only', publish: true, live_verified: false }), expected);
+  assert.equal(ui.routeAccessText({ live_verified: true, publish: true }), expected);
+});
+
+test('fixture inspect has priority and incomplete or conflicting access data stays neutral', () => {
+  const ui = routeUi();
+  assert.equal(ui.routeAccessText({ fixture: true, live_verified: true, publish: true }),
+    'Локальная проверка доступа; живая доставка не проверена.');
+  const positive = { fixture: false, verification: 'access_only', live_verified: false, publish: true };
+  for (const value of [undefined, null, [], 'available', {}, { publish: true, live_verified: false },
+    { ...positive, can_publish: false }, { ...positive, publish: 'true' }, { ...positive, can_publish: 'true' },
+    { ...positive, fixture: 'false', live_verified: true }, { ...positive, live_verified: 'false' },
+    { ...positive, state: false }, { ...positive, state: [] }, { ...positive, state: 'offline' },
+    { ...positive, verification: {} }, { ...positive, verification: 'fixture' },
+    { live_verified: true, publish: true, verification: 'api_receipt' },
+    { live_verified: true, publish: true, state: 'published' },
+    { state: 'available', publish: false, live_verified: false, contract_verified: false }]) {
+    assert.equal(ui.routeAccessText(value), 'Проверка доступа завершена; доставка не проверена.');
+  }
+});
+
+test('actual panel inspect handler displays the real access result after its read-only refresh', async () => {
+  const React = require(path.join(tooling, 'react'));
+  for (const [access, expected] of [
+    [{ fixture: false, verification: 'access_only', live_verified: false, can_publish: true, publish: true },
+      'Доступ и право публикации подтверждены. Доставка ещё не проверена.'],
+    [{ fixture: false, verification: 'access_only', live_verified: false, can_publish: false, publish: false },
+      'Соединение с площадкой подтверждено; право публикации не подтверждено. Доставка не проверена.'],
+    [{ fixture: true, live_verified: true, publish: true },
+      'Локальная проверка доступа; живая доставка не проверена.'],
+  ]) {
+    const values = [], calls = [];
+    let index = 0;
+    const hooks = { ...React,
+      useState(initial) { const key = index++; if (!(key in values)) values[key] = initial;
+        return [values[key], next => { values[key] = typeof next === 'function' ? next(values[key]) : next; }]; },
+      useEffect() {}, useCallback(callback) { return callback; }, useRef(value) { return { current: value }; },
+    };
+    const ui = routeUi(hooks, { fetch: async (url, options) => {
+      calls.push([url, options]);
+      const body = url === '/api/editorial/route-action' ? { access, delivery_verified: false }
+        : url === '/api/editorial/state' ? { revision: 1, paused: true }
+        : url === '/api/editorial/routes' ? { targets: [], variants: [], dispatches: [] }
+        : assert.fail(`Unexpected panel request ${url}`);
+      return { ok: true, json: async () => body };
+    } });
+    function elements(node, matches) {
+      if (!node || typeof node !== 'object') return [];
+      if (Array.isArray(node)) return node.flatMap(item => elements(item, matches));
+      return [...(matches(node) ? [node] : []), ...elements(node.props?.children, matches)];
+    }
+    function render() { index = 0; return ui.EditorialPanel(); }
+    const routes = elements(render(), node => node.type === ui.EditorialRoutes)[0];
+    assert.equal(await routes.props.onAction({ action: 'inspect', id: 'telegram_test' }), true);
+    const notice = elements(render(), node => node.props?.role === 'status')[0];
+    assert.equal(notice.props.children, expected);
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls.map(([url, options]) => [url, options.method]), [
+      ['/api/editorial/route-action', 'POST'], ['/api/editorial/state', 'GET'], ['/api/editorial/routes', 'GET']]);
+    assert.deepEqual(JSON.parse(calls[0][1].body), { action: 'inspect', id: 'telegram_test' });
+  }
+});
+
+test('owner schedule is parsed as Moscow regardless of browser timezone; invalid dates fail closed', () => {
+  const ui = routeUi(); const clock = Date.UTC(2026, 9, 31, 0, 0);
+  assert.equal(ui.moscowSchedule('2026-10-31T06:15', clock), Date.UTC(2026, 9, 31, 3, 15) / 1000);
+  for (const value of ['', '2026-10-31T03:00', '2026-02-30T12:00', '2026-13-01T12:00',
+    '2026-10-31T06:15Z', '2026-10-31T06:15:00', '2026-10-31T24:00', '<script>']) {
+    assert.equal(ui.moscowSchedule(value, clock), null);
+  }
+  assert.match(ui.readableTime(Date.UTC(2026, 9, 31, 0, 0) / 1000), /03:00/);
+});
+
+test('route cards and exact full drafts render safely without credentials, auto-consent or delivery overclaims', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  const targets = ['max', 'telegram', 'vk', 'pikabu'].map((platform, index) => ({ ...routeTarget,
+    id: index === 2 ? 'vk_target' : `target-${index}`, platform,
+    route: { max: 'max_browser', telegram: 'telegram_api', vk: 'vk_browser', pikabu: 'pikabu_browser' }[platform],
+    token: 'never-render-this-token' }));
+  targets.push({ ...routeTarget, id: 'disabled-reddit', platform: 'reddit', route: 'postiz', destination: 'UNMANAGED-REDDIT' });
+  const lastLine = 'END-OF-COMPLETE-APPROVED-TEXT';
+  const markup = renderToStaticMarkup(React.createElement(ui.EditorialRoutes, { pending: false,
+    inventory: { targets, variants: [{ ...routeVariant, body: `<script>alert(1)</script>\n${'Полный текст '.repeat(500)}${lastLine}` }],
+      dispatches: [{ id: 'dispatch-123', target_id: 'vk_target', title: 'API receipt', state: 'published',
+        due_at: 1867111200, verified: false, evidence_kind: 'api_receipt', external_id: '-123456_77', attempts: 1,
+        snapshot_hash: 'e'.repeat(64), permalink: 'javascript:alert(1)' },
+      { id: 'dispatch-unknown', target_id: 'vk_target', title: 'Unknown send', state: 'unknown',
+        due_at: 1867114800, verified: false, external_id: '-123456_78', attempts: 1, snapshot_hash: 'f'.repeat(64) }] },
+    onAction: async () => true }));
+  for (const label of ['MAX', 'Telegram', 'ВКонтакте', 'Пикабу', 'Проверить доступ', 'Возобновить канал',
+    'API-квитанция; без независимой сверки', 'Сверить результат', 'Москва, UTC+3', lastLine]) assert.ok(markup.includes(label));
+  assert.ok(markup.includes('&lt;script&gt;'));
+  assert.ok(!markup.includes('<script>')); assert.ok(!markup.includes('javascript:'));
+  assert.ok(!markup.includes('never-render-this-token')); assert.ok(!markup.includes('Доставка подтверждена'));
+  assert.ok(!markup.includes('UNMANAGED-REDDIT'));
+  assert.ok(!markup.includes('checked=""')); assert.ok(!markup.includes('Повторить отправку'));
+});
+
+test('delivery labels require persistent evidence kinds and never promote fixture or missing proof', () => {
+  const ui = routeUi();
+  const published = { id: 'historical', target_id: 'vk_target', title: 'History', state: 'published',
+    due_at: 1867111200, verified: false, attempts: 1, snapshot_hash: 'e'.repeat(64) };
+  for (const verified of [true, false, null]) {
+    assert.equal(ui.routeDeliveryText({ ...published, verified, evidence_kind: 'fixture' }),
+      'Локальная проверка; живая доставка не проверена');
+  }
+  assert.equal(ui.routeDeliveryText({ ...published, evidence_kind: 'api_receipt' }),
+    'API-квитанция; без независимой сверки');
+  assert.equal(ui.routeDeliveryText({ ...published, verified: true, evidence_kind: 'independent_readback' }),
+    'Доставка подтверждена');
+  for (const evidence_kind of [undefined, 'unverified', 'unknown', true, [], {}, 'independent_readback']) {
+    assert.equal(ui.routeDeliveryText({ ...published, evidence_kind }), 'Отправка отмечена; подтверждения нет');
+  }
+  assert.equal(ui.routeDeliveryText({ ...published, verified: true }),
+    'В истории отмечено подтверждение; новых доказательств нет');
+  assert.equal(ui.routeDeliveryText({ ...published, state: 'unknown' }), 'Исход неизвестен — требуется сверка');
+});
+
+test('historical fixture badge survives a target changing to live and has no publication link', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  for (const adapter_mode of ['fixture', 'browser', 'live']) {
+    const markup = renderToStaticMarkup(React.createElement(ui.EditorialRoutes, { pending: false,
+      inventory: { targets: [{ ...routeTarget, adapter_mode, route: 'vk_browser' }], variants: [], dispatches: [{
+        id: 'fixture-history', target_id: 'vk_target', title: 'Local fixture', state: 'published',
+        due_at: 1867111200, verified: true, evidence_kind: 'fixture', attempts: 1,
+        snapshot_hash: 'e'.repeat(64), permalink: 'https://vk.ru/wall123456_51' }] }, onAction: async () => true }));
+    assert.ok(markup.includes('Локальная проверка; живая доставка не проверена'));
+    assert.ok(!markup.includes('API-квитанция')); assert.ok(!markup.includes('Доставка подтверждена'));
+    assert.ok(!markup.includes('Открыть публикацию')); assert.ok(!markup.includes('https://vk.ru/wall123456_51'));
+  }
+});
+
+test('historical recipient comes only from the dispatch snapshot after target destination changes', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  const target = { ...routeTarget };
+  const saved = { id: 'snapshot-history', target_id: target.id, title: 'Saved recipient', state: 'published',
+    destination: '-111111', platform: 'vk', route: 'vk_api', evidence_kind: 'api_receipt',
+    due_at: 1867111200, verified: false, attempts: 1, snapshot_hash: 'e'.repeat(64) };
+  const renderRows = dispatches => {
+    const markup = renderToStaticMarkup(React.createElement(ui.EditorialRoutes, { pending: false,
+      inventory: { targets: [target], variants: [], dispatches }, onAction: async () => true }));
+    return markup.match(/<tbody>([\s\S]*?)<\/tbody>/)[1];
+  };
+  const before = renderRows([saved]);
+  target.destination = 'CHANGED-CURRENT-DESTINATION'; target.platform = 'telegram'; target.route = 'telegram_api';
+  const after = renderRows([saved]);
+  assert.equal(after, before);
+  assert.ok(after.includes('ВКонтакте · -111111')); assert.ok(!after.includes('CHANGED-CURRENT-DESTINATION'));
+  const legacy = renderRows([{ ...saved, destination: undefined, platform: undefined, route: undefined }]);
+  assert.ok(legacy.includes('Адресат не сохранён')); assert.ok(!legacy.includes('CHANGED-CURRENT-DESTINATION'));
+});
+
+test('unknown dispatch can reconcile from its journal without DB ID, and historical variants have no approval form', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  const markup = renderToStaticMarkup(React.createElement(ui.EditorialRoutes, { pending: false,
+    inventory: { targets: [routeTarget], variants: ['published', 'unknown', 'cancelled', 'failed'].map(state => ({
+      ...routeVariant, id: `history-${state}`, title: `HISTORICAL-${state}`, state })),
+      dispatches: [{ id: 'dispatch-unknown', target_id: 'vk_target', title: 'Lost DB receipt', state: 'unknown',
+        due_at: 1867114800, verified: false, external_id: null, attempts: 1, snapshot_hash: 'f'.repeat(64) }] },
+    onAction: async () => true }));
+  const reconcile = markup.match(/<button[^>]*>Сверить результат<\/button>/);
+  assert.ok(reconcile); assert.ok(!reconcile[0].includes('disabled'));
+  assert.ok(markup.includes('сохранённые доказательства'));
+  assert.ok(!markup.includes('HISTORICAL-')); assert.ok(!markup.includes('Согласовать версию и дату'));
+});
+
+test('hourly automatic MAX never renders a manual owner checkbox or approval action', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  const target = { ...routeTarget, platform: 'max', route: 'max_browser' };
+  const markup = renderToStaticMarkup(React.createElement(ui.EditorialRoutes, { pending: false,
+    inventory: { targets: [target], variants: [{ ...routeVariant, state: 'review_pending',
+      manual_approval_allowed: false, approval_mode: 'automatic', origin: 'hourly_article_test' }], dispatches: [] },
+    onAction: async () => { throw new Error('Automatic policy must not use manual route approval'); } }));
+  assert.ok(markup.includes('MAX')); assert.ok(!markup.includes('type="checkbox"'));
+  assert.ok(!markup.includes('Согласовать версию и дату')); assert.ok(!markup.includes('Я проверил материал'));
+});
+
+function routeDraftHarness(onAction) {
+  const React = require(path.join(tooling, 'react'));
+  const values = [], effects = [];
+  let index = 0, effectIndex = 0, queued = [];
+  const hooks = { ...React,
+    useState(initial) { const key = index++; if (!(key in values)) values[key] = initial;
+      return [values[key], next => { values[key] = typeof next === 'function' ? next(values[key]) : next; }]; },
+    useEffect(callback, dependencies) { const key = effectIndex++;
+      if (JSON.stringify(effects[key]) !== JSON.stringify(dependencies)) { effects[key] = dependencies; queued.push(callback); } },
+  };
+  const ui = routeUi(hooks);
+  const props = { variant: { ...routeVariant, media_count: 0 }, target: { ...routeTarget, paused: false }, pending: false, onAction };
+  function render() { index = 0; effectIndex = 0; queued = []; const tree = ui.RouteDraft(props);
+    for (const effect of queued) effect(); return tree; }
+  function elements(node, matches) {
+    if (!node || typeof node !== 'object') return [];
+    if (Array.isArray(node)) return node.flatMap(item => elements(item, matches));
+    return [...(matches(node) ? [node] : []), ...elements(node.props?.children, matches)];
+  }
+  const find = (tree, type, property, value) => elements(tree, node => node.type === type && node.props?.[property] === value)[0];
+  return { props, render, find, buttons: tree => elements(tree, node => node.type === 'button') };
+}
+
+test('approval requires successful preflight, owner date and actual checkbox; date/content changes reset consent', async () => {
+  const actions = []; const harness = routeDraftHarness(async action => { actions.push(action); return true; });
+  let tree = harness.render();
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.checked, false);
+  await harness.buttons(tree)[1].props.onClick();
+  assert.equal(actions.length, 0);
+  await harness.buttons(tree)[0].props.onClick(); tree = harness.render();
+  assert.equal(actions[0].action, 'preflight');
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.checked, false);
+  const future = new Date(Date.now() + 4 * 3600000).toISOString().slice(0, 16);
+  harness.find(tree, 'input', 'type', 'datetime-local').props.onChange({ target: { value: future } });
+  tree = harness.render();
+  assert.equal(harness.buttons(tree)[1].props.disabled, true);
+  harness.find(tree, 'input', 'type', 'checkbox').props.onChange({ target: { checked: true } }); tree = harness.render();
+  assert.equal(harness.buttons(tree)[1].props.disabled, false);
+  await harness.buttons(tree)[1].props.onClick();
+  assert.equal(actions[1].action, 'approve'); assert.equal(actions[1].id, routeVariant.id);
+  assert.equal(actions[1].revision, routeVariant.revision); assert.equal(actions[1].content_hash, routeVariant.content_hash);
+  assert.equal(actions[1].due_at, Date.parse(`${future}:00+03:00`) / 1000);
+  tree = harness.render(); assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.checked, false);
+  harness.find(tree, 'input', 'type', 'checkbox').props.onChange({ target: { checked: true } }); tree = harness.render();
+  harness.find(tree, 'input', 'type', 'datetime-local').props.onChange({ target: { value: future } });
+  tree = harness.render(); assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.checked, false);
+  harness.props.variant = { ...harness.props.variant, revision: 3, content_hash: '9'.repeat(64) };
+  harness.render(); tree = harness.render();
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.disabled, true);
+  assert.equal(harness.buttons(tree)[1].props.disabled, true);
+});
+
+test('failed preflight never enables consent or emits approval', async () => {
+  const actions = []; const harness = routeDraftHarness(async action => { actions.push(action); return false; });
+  let tree = harness.render(); await harness.buttons(tree)[0].props.onClick(); tree = harness.render();
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.disabled, true);
+  await harness.buttons(tree)[1].props.onClick();
+  assert.deepEqual(actions.map(item => item.action), ['preflight']);
+});
+
+test('paused target and changed destination binding cannot reuse owner consent', async () => {
+  const actions = []; const harness = routeDraftHarness(async action => { actions.push(action); return true; });
+  let tree = harness.render(); await harness.buttons(tree)[0].props.onClick(); tree = harness.render();
+  const future = new Date(Date.now() + 4 * 3600000).toISOString().slice(0, 16);
+  harness.find(tree, 'input', 'type', 'datetime-local').props.onChange({ target: { value: future } });
+  tree = harness.render(); harness.find(tree, 'input', 'type', 'checkbox').props.onChange({ target: { checked: true } });
+  tree = harness.render();
+  harness.props.target = { ...harness.props.target, paused: true }; tree = harness.render();
+  assert.equal(harness.buttons(tree)[1].props.disabled, true);
+  await harness.buttons(tree)[1].props.onClick(); assert.equal(actions.length, 1);
+  harness.props.target = { ...harness.props.target, paused: false, binding_hash: '8'.repeat(64) };
+  harness.render(); tree = harness.render();
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.checked, false);
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.disabled, true);
+});
+
+// Собственная JPEG fixture: 2x2 синих пикселя, без внешних изображений/запросов.
+const previewJpeg = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDxyiiiv3E8w//Z';
+const previewPayload = variant => ({ variant_id: variant.id, revision: variant.revision,
+  content_hash: variant.content_hash, preflight_only: true,
+  images: [{ data_url: previewJpeg, sha256: '9'.repeat(64), mime: 'image/jpeg', source_mime: 'image/png',
+    width: 2, height: 2, preview: true }] });
+
+test('preview accepts only bounded exact-version JPEG data URLs and rejects stale or malicious payloads', () => {
+  const ui = routeUi(), candidate = { ...routeVariant, media_count: 1 };
+  assert.equal(ui.routePreviewImages(previewPayload(candidate), candidate)[0].data_url, previewJpeg);
+  for (const data_url of ['https://external.example/image.jpg', 'javascript:alert(1)', 'blob:secret',
+    'data:image/svg+xml;base64,PHN2Zy8+', 'data:image/jpeg;base64,PHN2Zy8+']) {
+    const value = previewPayload(candidate); value.images[0].data_url = data_url;
+    assert.throws(() => ui.routePreviewImages(value, candidate), /EDITORIAL_ROUTE_PREVIEW_INVALID/);
+  }
+  const stale = { ...previewPayload(candidate), revision: candidate.revision + 1 };
+  assert.throws(() => ui.routePreviewImages(stale, candidate), /APPROVAL_STALE/);
+  const oversized = previewPayload(candidate); oversized.images[0].data_url = 'data:image/jpeg;base64,/9j/' + 'A'.repeat(1024 * 1024);
+  assert.throws(() => ui.routePreviewImages(oversized, candidate), /EDITORIAL_ROUTE_PREVIEW_INVALID/);
+  assert.throws(() => ui.routePreviewImages({ ...previewPayload(candidate), images: [] }, candidate), /EDITORIAL_ROUTE_PREVIEW_INVALID/);
+});
+
+test('real fixture thumbnail renders independently and never checks consent or preflight automatically', async () => {
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const actions = [], previews = [];
+  const harness = routeDraftHarness(async action => { actions.push(action); return true; });
+  harness.props.variant = { ...harness.props.variant, media_count: 1 };
+  harness.props.onPreview = async variant => { previews.push(variant.id); return previewPayload(variant); };
+  let tree = harness.render();
+  await harness.buttons(tree).find(button => button.props.children === 'Показать изображение').props.onClick();
+  tree = harness.render();
+  assert.equal(previews.length, 1); assert.equal(actions.length, 0);
+  const markup = renderToStaticMarkup(tree);
+  assert.ok(markup.includes('<img src="data:image/jpeg;base64,/9j/'));
+  assert.ok(markup.includes('исходный файл этой версии'));
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.checked, false);
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.disabled, true);
+  const future = new Date(Date.now() + 4 * 3600000).toISOString().slice(0, 16);
+  harness.find(tree, 'input', 'type', 'datetime-local').props.onChange({ target: { value: future } }); tree = harness.render();
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.disabled, true);
+  await harness.buttons(tree).find(button => button.props.children === 'Проверить перед согласованием').props.onClick(); tree = harness.render();
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.disabled, false);
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.checked, false);
+  assert.equal(harness.buttons(tree).find(button => button.props.children === 'Согласовать версию и дату').props.disabled, true);
+  harness.props.variant = { ...harness.props.variant, content_hash: '7'.repeat(64) };
+  harness.render(); tree = harness.render();
+  assert.ok(!renderToStaticMarkup(tree).includes('<img'));
+});
+
+test('stale preview result never renders an image or enables owner approval', async () => {
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const harness = routeDraftHarness(async () => { throw new Error('No approval expected'); });
+  harness.props.variant = { ...harness.props.variant, media_count: 1 };
+  harness.props.onPreview = async variant => ({ ...previewPayload(variant), content_hash: '0'.repeat(64) });
+  let tree = harness.render();
+  await harness.buttons(tree).find(button => button.props.children === 'Показать изображение').props.onClick(); tree = harness.render();
+  const markup = renderToStaticMarkup(tree);
+  assert.ok(!markup.includes('<img')); assert.ok(markup.includes('согласуйте новую версию'));
+  assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.disabled, true);
 });
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'postiz-editorial-'));

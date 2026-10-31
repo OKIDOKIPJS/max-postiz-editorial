@@ -179,10 +179,11 @@ let source = fs.readFileSync(process.argv[1], 'utf8')
  .replace('Set<string>', 'Set').replace(/: string/g, '').replace(/: any/g, '');
 source += '\n globalThis.Guard = MaxBrowserMutationGuard;';
 const hash = 'a'.repeat(64), post = 'post-max';
-async function run(change = {}, ack = 'valid', rows = [{id: post, parentPostId: null}]) {
+const validRow = {id:post,parentPostId:null,state:'DRAFT',group:'group-max',integrationId:'integration-max'};
+async function run(change = {}, ack = 'valid', rows = [validRow]) {
  const calls = [], events = [], headers = {}, request = {method:'POST', path:'/public/v1/posts',
   headers:{'x-max-postiz-expected-hash':hash}, body:{type:'draft',republish:false,
-  posts:[{value:[{id:post,content:'corrected'}]}]}, ...change};
+  posts:[{group:'group-max',integration:{id:'integration-max'},value:[{id:post,content:'corrected'}]}]}, ...change};
  const context = {switchToHttp:()=>({getRequest:()=>request,
   getResponse:()=>({once:(...a)=>events.push(a),setHeader:(k,v)=>headers[k]=v})})};
  const scope = {process:{env:{MAX_POSTIZ_BRIDGE_KEY:'mock-key'}},
@@ -219,11 +220,25 @@ async function run(change = {}, ack = 'valid', rows = [{id: post, parentPostId: 
   assert.equal(result.calls.length,0);
  }
  result = await run({},'valid',[]); assert.equal(result.error,'MAX_BROWSER_CAS_INVALID');
+ for (const change of [{state:'QUEUE'},{group:'wrong-group'},{integrationId:'wrong-integration'},
+  {state:undefined},{group:undefined},{integrationId:undefined}]) {
+  result = await run({},'valid',[{...validRow,...change}]);
+  assert.equal(result.error,'MAX_BROWSER_CAS_INVALID'); assert.equal(result.calls.length,0);
+ }
+ for (const entry of [
+  {integration:{id:'integration-max'},value:[{id:post,content:'corrected'}]},
+  {group:'group-max',value:[{id:post,content:'corrected'}]},
+  {group:'wrong-group',integration:{id:'integration-max'},value:[{id:post,content:'corrected'}]},
+  {group:'group-max',integration:{id:'wrong-integration'},value:[{id:post,content:'corrected'}]},
+ ]) {
+  result = await run({body:{type:'draft',republish:false,posts:[entry]}});
+  assert.equal(result.error,'MAX_BROWSER_CAS_INVALID'); assert.equal(result.calls.length,0);
+ }
  result = await run({headers:{}}); assert.equal(result.error,null);
  assert.equal(result.calls[0].data.expected_hash,undefined); assert.equal(result.events.length,1);
- console.log(JSON.stringify({controls:12,real_mutations:0}));
+ console.log(JSON.stringify({controls:22,real_mutations:0}));
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
     result = subprocess.run([node, "-e", runner, str(source)], capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"controls": 12, "real_mutations": 0}
+    assert json.loads(result.stdout) == {"controls": 22, "real_mutations": 0}

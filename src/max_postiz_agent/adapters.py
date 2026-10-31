@@ -266,6 +266,10 @@ class Delivery:
     external_id: str | None = None
     permalink: str | None = None
     retry_after: float = 0
+    # Новые маршруты явно различают квитанцию API, fixture и независимую сверку.
+    # None сохраняет прежний контракт браузерного MAX без переоценки истории.
+    verified: bool | None = None
+    evidence: dict | None = None
 
 
 # Структура MaxAPI объединяет связанные данные и операции модуля.

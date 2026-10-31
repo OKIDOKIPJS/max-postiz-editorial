@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "postiz": {"approval_guard_verified": false, "max_video_verified": false},
+  "targets": [
+    {"id": "max_test", "profile_id": "test", "platform": "max", "route": "max_browser",
+     "destination": "", "enabled": false, "options": {"max_chars": 3500}},
+    {"id": "telegram_test", "profile_id": "test", "platform": "telegram", "route": "telegram_api",
+     "destination": "", "enabled": false, "options": {"max_chars": 4096,
+       "adapter_mode": "fake", "token_env": "TELEGRAM_BOT_TOKEN", "media_layout": "auto"}},
+    {"id": "vk_test", "profile_id": "test", "platform": "vk", "route": "vk_browser",
+     "destination": "", "enabled": false, "options": {"max_chars": 16384,
+       "profile_dir": "data/vk-browser", "channel": "chrome", "headless": true,
+       "operation_timeout_seconds": 180, "dom_contract_verified": false,
+       "media_contract_verified": false}},
+    {"id": "pikabu_test", "profile_id": "test", "platform": "pikabu", "route": "pikabu_browser",
+     "destination": "", "enabled": false, "options": {"max_chars": 15000,
+       "profile_dir": "data/pikabu-browser",
+       "channel": "chrome", "headless": true, "operation_timeout_seconds": 180,
+       "dom_contract_verified": false}}
+  ],
+  "tasks": []
+}

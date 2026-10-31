@@ -54,14 +54,16 @@ export class EditorialController {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
   }
 
-  private async forward(request: EditorialRequest, route: 'state' | 'settings' | 'control', method: string, body?: unknown) {
+  private async forward(request: EditorialRequest, route: 'state' | 'settings' | 'control' | 'routes' | 'route-action', method: string, body?: unknown) {
     const identity = this.authorize(request, method !== 'GET');
     let url: URL;
     const key = process.env.EDITORIAL_INTERNAL_KEY;
+    const port = process.env.EDITORIAL_INTERNAL_PORT || '8092';
     try {
       url = new URL(process.env.EDITORIAL_INTERNAL_URL || '');
       if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', 'host.docker.internal'].includes(url.hostname) ||
-          url.port !== '8092' || url.pathname !== '/internal/editorial' || url.username || url.password || url.search || url.hash || !key || key.length < 32) {
+          !['8092', '18092'].includes(port) || url.port !== port || url.pathname !== '/internal/editorial' ||
+          url.username || url.password || url.search || url.hash || !key || key.length < 32) {
         throw new Error();
       }
     } catch { this.fail('EDITORIAL_NOT_CONFIGURED', 503); }
@@ -100,6 +102,9 @@ export class EditorialController {
   @Get('/settings')
   settings(@Req() request: EditorialRequest) { return this.forward(request, 'settings', 'GET'); }
 
+  @Get('/routes')
+  routes(@Req() request: EditorialRequest) { return this.forward(request, 'routes', 'GET'); }
+
   // Nginx использует только эту проверку сессии для закрытого окна входа в MAX.
   @Get('/browser-authorize')
   @HttpCode(204)
@@ -125,5 +130,29 @@ export class EditorialController {
     return this.forward(request, 'control', 'POST', {
       action: body.action, revision: body.revision,
     });
+  }
+
+  // Только перечисленные операции над сохранёнными объектами. URL, token,
+  // cookie, текст публикации и произвольные команды от браузера не принимаем.
+  @Post('/route-action')
+  routeAction(@Req() request: EditorialRequest, @Body() body: any) {
+    this.authorize(request, true);
+    if (!body || typeof body !== 'object' || Array.isArray(body) ||
+        !['inspect', 'preflight', 'preview', 'approve', 'pause', 'resume', 'reconcile'].includes(body.action) ||
+        typeof body.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(body.id)) {
+      this.fail('EDITORIAL_ROUTE_ACTION_INVALID', 422);
+    }
+    const approval = body.action === 'approve';
+    const keys = approval ? ['action', 'id', 'revision', 'content_hash', 'due_at'] : ['action', 'id'];
+    if (Object.keys(body).length !== keys.length || Object.keys(body).some(key => !keys.includes(key)) ||
+        (approval && (!this.revision(body.revision) || typeof body.content_hash !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(body.content_hash) || typeof body.due_at !== 'number' ||
+          !Number.isSafeInteger(body.due_at) || body.due_at <= Date.now() / 1000))) {
+      this.fail('EDITORIAL_ROUTE_ACTION_INVALID', 422);
+    }
+    return this.forward(request, 'route-action', 'POST', approval ? {
+      action: body.action, id: body.id, revision: body.revision,
+      content_hash: body.content_hash, due_at: body.due_at,
+    } : { action: body.action, id: body.id });
   }
 }

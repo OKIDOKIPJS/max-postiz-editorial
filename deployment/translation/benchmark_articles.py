@@ -241,7 +241,13 @@ class BenchmarkGatewayTranslator(DedicatedTranslator):
     """Тот же segment adapter; дополнительные model aliases разрешены только стенду."""
 
     def __init__(self, route, transport):
-        self.model, self.url = route["model"], route["base_url"].rstrip("/")
+        # load_plan уже проверил и заморозил фактические model/base_url.
+        # Alias остаётся исключением только стенда; остальные поля совпадают
+        # с DedicatedTranslator для того же config и его лимита по умолчанию.
+        config = {"model": route["model"], "base_url": route["base_url"]}
+        self.model, self.url = config["model"], config["base_url"].rstrip("/")
+        self.segment_chars = config.get("segment_chars", 1400)
+        self.config_hash = fingerprint(config)
         self.client = httpx.Client(timeout=600, trust_env=False, transport=transport, follow_redirects=False)
         self._cached_source = self._cached_result = None
 
