@@ -12,9 +12,12 @@
 запускает `python scripts/check_ci_postgres.py`: пропущенный обязательный тест
 не считается успехом. CI создаёт два отдельных временных PostgreSQL 17 service,
 без подключения к рабочей редакции.
-PostgreSQL job выполняет весь `python scripts/check.py --postgres` в собственной
-`.venv` с четырьмя locks и Node/Chrome. Загружаются только верхние канонические
-JUnit/JSON/stage logs; вложенные временные fixtures в артефакт не включаются.
+Канонический CI matrix параллельно выполняет оба полных режима: `python
+scripts/check.py` и `python scripts/check.py --postgres`. У каждого свой checkout,
+`.venv`, четыре locks и Node/Chrome; обычный режим очищает PG-переменные перед pytest.
+PG identity preflight и gate обязательных backend cases относятся к PG-режиму.
+Загружаются только верхние канонические JUnit/JSON/stage logs в раздельные артефакты;
+вложенные временные fixtures в них не включаются.
 
 Для локальной интеграционной приёмки предусмотрен явный контракт
 `MAX_POSTIZ_PG_TEST_CONTRACT=monitor-main-integration-v1`: только loopback

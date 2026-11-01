@@ -262,7 +262,7 @@ let source = fs.readFileSync(process.argv[1], 'utf8')
  .replace('context: ExecutionContext', 'context').replace(': Promise<boolean>', '')
  .replace('Set<string>', 'Set').replace(/: string/g, '').replace(/: any/g, '');
 source += '\n globalThis.Guard = MaxBrowserMutationGuard;';
-const hash = 'a'.repeat(64), post = 'post-max';
+const hash = 'a'.repeat(64), post = 'post-max', group = 'group-max', integrationId = 'integration-max';
 const validRow = {id:post,parentPostId:null,state:'DRAFT',group:'group-max',integrationId:'integration-max'};
 async function run(change = {}, ack = 'valid', rows = [validRow]) {
  const calls = [], events = [], headers = {}, request = {method:'POST', path:'/public/v1/posts',

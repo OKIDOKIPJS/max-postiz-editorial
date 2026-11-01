@@ -119,9 +119,13 @@ jobs:
           retention-days: 7
 
   postgres-tests:
-    name: PostgreSQL integration tests
+    name: Canonical full checks (${{ matrix.mode }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [normal, postgres]
     services:
       postgres:
         image: postgres:17
@@ -179,11 +183,16 @@ jobs:
       - name: Install Chrome and browser dependencies
         run: python -m playwright install --with-deps chrome
       - name: Verify the two owned PostgreSQL identities without mutation
+        if: matrix.mode == 'postgres'
         run: python scripts/check_ci_postgres.py
+      - name: Run canonical full checks without PostgreSQL
+        if: matrix.mode == 'normal'
+        run: python scripts/check.py
       - name: Run canonical full checks with PostgreSQL
+        if: matrix.mode == 'postgres'
         run: python scripts/check.py --postgres
       - name: Require route and monitor PostgreSQL cases with zero skips
-        if: always()
+        if: always() && matrix.mode == 'postgres'
         run: |
           python - <<'PY'
           import subprocess
@@ -198,11 +207,11 @@ jobs:
               check=True,
           )
           PY
-      - name: Save PostgreSQL test report
+      - name: Save canonical check report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: postgres-report
+          name: canonical-${{ matrix.mode }}-report
           # Только канонический run, без его временных pytest-данных.
           path: |
             data/check-runs/*/report.json

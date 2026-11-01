@@ -135,6 +135,9 @@ def test_workflow_matches_strict_fixture_contracts_and_runs_canonical_full_check
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
     jobs = workflow["jobs"]
     job = jobs["postgres-tests"]
+    assert job["name"] == "Canonical full checks (${{ matrix.mode }})"
+    assert job["strategy"] == {"fail-fast": False, "matrix": {"mode": ["normal", "postgres"]}}
+    assert jobs["required"]["needs"].count("postgres-tests") == 1
     assert job["env"][CONTRACT_ENV] == CI_CONTRACT
     for service, role, port in (("postgres", "routes", 55448), ("monitor-postgres", "monitor", 55449)):
         spec = endpoint_spec(role, job["env"]["TEST_DATABASE_URL" if role == "routes" else "MONITOR_OWNED_PG_TEST_URL"], ROOT,
@@ -161,19 +164,30 @@ def test_workflow_matches_strict_fixture_contracts_and_runs_canonical_full_check
     assert "python -m pip install --no-deps --no-build-isolation -e ." in install
     assert named["Install Chrome and browser dependencies"]["run"] == "python -m playwright install --with-deps chrome"
     assert named["Verify the two owned PostgreSQL identities without mutation"]["run"] == "python scripts/check_ci_postgres.py"
+    assert named["Verify the two owned PostgreSQL identities without mutation"]["if"] == "matrix.mode == 'postgres'"
+    assert named["Run canonical full checks without PostgreSQL"]["run"] == "python scripts/check.py"
+    assert named["Run canonical full checks without PostgreSQL"]["if"] == "matrix.mode == 'normal'"
     assert named["Run canonical full checks with PostgreSQL"]["run"] == "python scripts/check.py --postgres"
+    assert named["Run canonical full checks with PostgreSQL"]["if"] == "matrix.mode == 'postgres'"
+    for mode in job["strategy"]["matrix"]["mode"]:
+        selected = [step for step in steps if step.get("name", "").startswith("Run canonical full checks")
+                    and step.get("if") == f"matrix.mode == '{mode}'"]
+        assert len(selected) == 1
     assert not any("python -m pytest" in step.get("run", "") for step in steps)
     gate = named["Require route and monitor PostgreSQL cases with zero skips"]
-    assert gate["if"] == "always()"
+    assert gate["if"] == "always() && matrix.mode == 'postgres'"
     ordered = [step.get("name") for step in steps]
     required_order = ["Create checkout-owned virtual environment", "Install pinned dependencies",
         "Install Chrome and browser dependencies", "Verify the two owned PostgreSQL identities without mutation",
-        "Run canonical full checks with PostgreSQL", "Require route and monitor PostgreSQL cases with zero skips",
-        "Save PostgreSQL test report"]
+        "Run canonical full checks without PostgreSQL", "Run canonical full checks with PostgreSQL",
+        "Require route and monitor PostgreSQL cases with zero skips", "Save canonical check report"]
     assert [ordered.index(name) for name in required_order] == sorted(ordered.index(name) for name in required_order)
     assert steps.index(python) < ordered.index(required_order[0]) and steps.index(node) < ordered.index(required_order[0])
-    upload = named["Save PostgreSQL test report"]
+    upload = named["Save canonical check report"]
     assert upload["if"] == "always()"
+    assert upload["with"]["name"] == "canonical-${{ matrix.mode }}-report"
+    assert len({upload["with"]["name"].replace("${{ matrix.mode }}", mode)
+                for mode in job["strategy"]["matrix"]["mode"]}) == 2
     assert upload["with"]["path"].splitlines() == ["data/check-runs/*/report.json", "data/check-runs/*/tests.xml", "data/check-runs/*/*.log"]
     assert upload["with"]["if-no-files-found"] == "error"
     for name in ("quality", "python-tests", "postgres-tests"):

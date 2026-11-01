@@ -1,5 +1,31 @@
 # История версий
 
+## 0.13.3 — 2026-11-01: проверка разрешённых повторных конфликтов
+
+- На дереве с main 0.12.3 и latest PR #2 проверены CAS, benchmark raw-config parity,
+  history/image policies и MAX readiness/readback: 324 passed, 1 Windows symlink
+  skip, одно известное Starlette/httpx warning. Все 22 embedded CAS-контроля прошли.
+- Согласованы fixtures после обеих веток; новые main media/production проверки
+  и все monitor tests сохранены. Whole Ruff, ограниченный formatter и diff check
+  прошли. Итоговые canonical normal/PG и платформенные CI ожидаются для нового SHA;
+  остановленные прогоны старого дерева не засчитываются как успешные.
+
+## 0.13.3 — 2026-11-01: канонические проверки обновлённого дерева
+
+- После интеграции main 0.12.3 оба обязательных режима scripts/check.py выполняются
+  параллельными CI matrix jobs с собственными .venv, четырьмя locks и Chrome/Node.
+  Обычный режим удаляет PG-переменные; PG-режим требует два отдельных PG17 instance
+  и все 10 backend cases без skips. Прежние coverage/Linux и четыре Windows shards
+  сохранены, CI required ждёт также весь canonical matrix. Артефакты раздельны.
+- Target CI helper: 27 passed. На новом дереве main/monitor privacy + обе namespace
+  регрессии: 108 passed, 6 Windows symlink skips. Все шесть Node suites: 139 passed,
+  0 skips. Независимые ревью сохранения security/worker/Node контрактов завершены.
+- При формальном CAS-прогоне устранены оставшиеся после merge имена JS-fixture:
+  group/integrationId привязаны к той же точной строке DRAFT. Все 22 проверки
+  остаются обязательными; production CAS guard не меняется.
+- Эти целевые результаты не заменяют свежий полный CI для итогового SHA.
+  Сервер, действующий MAX-профиль, БД и очереди не используются для проверки.
+
 ## 0.13.3 — 2026-11-01: повторная интеграция после обновления main
 
 - Во время проверки main обновился до 4d9149f (PR #20, 0.12.3). Включён полный
