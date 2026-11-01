@@ -659,7 +659,7 @@ def reconcile(settings, chat_id, request_id):
         return {"state": "unknown"}
     # Удерживаем контекст ресурсов или транзакции до завершения этого блока.
     with session(settings) as page:
-        ensure_channel(page, settings, chat_id)
+        ensure_channel(page, settings, chat_id, require_publish=False)
         found = _loaded_receipt(page, state)
         # Обрабатываем ветвь при условии: found.
         if found:
@@ -824,7 +824,7 @@ def _perform_publish(settings, payload, path, state, *, authorize_before_click):
                     page.screenshot(path=str(path.with_suffix(".before-reload.png")))
                     state["phase"] = "receipt_reload"
                     page.reload(wait_until="domcontentloaded")
-                    ensure_channel(page, settings, chat_id, navigate=False)
+                    ensure_channel(page, settings, chat_id, navigate=False, require_publish=False)
                     found = _loaded_receipt(page, state)
                     # Обрабатываем ветвь при условии: found.
                     if found:

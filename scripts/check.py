@@ -168,7 +168,11 @@ class Checks:
         log = self.directory / (name + ".log")
         print(f"[RUN] {name}", flush=True)
         started = time.monotonic()
-        result = {"name": name, "log": log.relative_to(self.root).as_posix()}
+        result = {
+            "name": name,
+            "log": log.relative_to(self.root).as_posix(),
+            "timeout_seconds": timeout,
+        }
         try:
             with log.open("w", encoding="utf-8") as stream:
                 completed = subprocess.run(
@@ -262,6 +266,7 @@ def run(root: Path, *, postgres: bool) -> int:
                 "-o",
                 "faulthandler_timeout=120",
             ],
+            timeout=7200,
         )
         if xml.is_file():
             try:

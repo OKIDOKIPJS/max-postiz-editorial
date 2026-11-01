@@ -12,10 +12,11 @@ from .config import AgentError, inside
 ORIGIN = "https://web.max.ru"
 COMPOSER = '[contenteditable][role="textbox"][aria-placeholder="Пост"]'
 _CHANNEL_READY_TIMEOUT_MS = 30_000
-_CHANNEL_READY = """({url, title, composer}) => {
+_CHANNEL_READY = """({url, title, composer, requirePublish}) => {
   if (location.href !== url) return 'wrong_channel';
   const headings = document.querySelectorAll('#main-header-title');
   if (headings.length !== 1 || headings[0].innerText.trim() !== title) return false;
+  if (requirePublish === false) return 'ready';
   const editors = document.querySelectorAll(composer);
   if (editors.length !== 1) return false;
   const editor = editors[0], box = editor.getBoundingClientRect();
@@ -124,7 +125,8 @@ def session(settings, *, visible=False):
 
 
 # Сверяем URL, точное название и доступ к целевому каналу.
-def ensure_channel(page, settings, chat_id, *, navigate=True):
+def ensure_channel(page, settings, chat_id, *, navigate=True, require_publish=True):
+    """Чтение подтверждает адресата; отправка дополнительно требует готовый редактор."""
     expected = channel_name(settings, chat_id)
     address = ORIGIN + "/" + chat_id
     budget = min(_CHANNEL_READY_TIMEOUT_MS,
@@ -140,10 +142,11 @@ def ensure_channel(page, settings, chat_id, *, navigate=True):
     # Чужой адрес не пережидаем и не заменяем повторной навигацией.
     if page.url != address:
         raise AgentError("BROWSER_WRONG_CHANNEL")
-    arguments = {"url": address, "title": "Окно чата с " + expected, "composer": COMPOSER}
+    arguments = {"url": address, "title": "Окно чата с " + expected, "composer": COMPOSER,
+                 "requirePublish": require_publish}
     try:
-        # Название и права появляются не одновременно при старте MAX. Ждём их
-        # вместе в одном ограниченном бюджете, не меняя редактор или профиль.
+        # До Send ждём и название, и права в одном бюджете. Сверка уже
+        # существующего сообщения не требует права создать следующее.
         result = page.wait_for_function(_CHANNEL_READY, arg=arguments, polling=100,
             timeout=max(1, int((deadline - time.monotonic()) * 1000)))
         state = result.json_value()

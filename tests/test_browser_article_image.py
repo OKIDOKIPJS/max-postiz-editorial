@@ -544,6 +544,60 @@ def test_lazy_oneme_photo_after_reload_confirms_first_send_and_never_sends_twice
     assert page.evaluate("events.filter(event=>event==='send').length") == 1
 
 
+def test_post_send_reload_confirms_existing_image_without_publish_composer(
+        illustrated, image_page, monkeypatch):
+    image_page.add_init_script("""document.addEventListener('DOMContentLoaded', () => {
+      if(JSON.parse(localStorage.getItem('posts') || '[]').length)
+        document.querySelector('[contenteditable]').remove();
+    })""")
+
+    @contextmanager
+    def opened(*_args):
+        yield image_page
+
+    monkeypatch.setattr(browser_worker, "session", opened)
+    result = browser_worker.publish(illustrated.settings, illustrated.payload)
+    assert result["state"] == "confirmed"
+    assert result["image_proof"]["image_before_caption"] is True
+    assert result["image_proof"]["title_proof"]["title_bold"] is True
+    assert result["image_proof"]["title_proof"]["body_unbold"] is True
+    assert image_page.locator("[contenteditable]").count() == 0
+    assert image_page.evaluate("events").count("send") == 1
+    assert browser_worker.publish(illustrated.settings, illustrated.payload) == result
+    assert image_page.evaluate("events").count("send") == 1
+
+
+def test_unknown_image_reconcile_reads_existing_post_without_publish_composer(
+        illustrated, receipt_state, image_page, monkeypatch):
+    from html import escape
+
+    image_page.goto("https://web.max.ru/-123", wait_until="domcontentloaded")
+    image_page.evaluate("""post => {
+      localStorage.setItem('posts', JSON.stringify([post]));
+      localStorage.setItem('events', '[]');
+    }""", {"text": CAPTION, "html": "<b>" + escape(TITLE) + "</b>" + escape(CAPTION[len(TITLE):])})
+    image_page.add_init_script("""document.addEventListener('DOMContentLoaded', () => {
+      document.querySelector('[contenteditable]').remove();
+    })""")
+    state = {**receipt_state, "chat_id": "-123", "state": "unknown", "before_count": 0,
+             "send_started": True}
+    path = browser_worker.ledger_path(illustrated.settings, state["request_id"])
+    browser_worker.save(path, state)
+
+    @contextmanager
+    def opened(*_args):
+        yield image_page
+
+    monkeypatch.setattr(browser_worker, "session", opened)
+    result = browser_worker.reconcile(illustrated.settings, "-123", state["request_id"])
+    assert result["state"] == "confirmed"
+    assert result["image_proof"]["image_before_caption"] is True
+    assert result["image_proof"]["title_proof"]["title_bold"] is True
+    assert result["image_proof"]["title_proof"]["body_unbold"] is True
+    assert image_page.evaluate("events").count("send") == 0
+    assert json.loads(path.read_text(encoding="utf-8"))["state"] == "confirmed"
+
+
 def test_real_browser_image_is_uploaded_before_caption_and_receipt_survives_reload(illustrated, image_page, monkeypatch):
     @contextmanager
     def opened(*_args):

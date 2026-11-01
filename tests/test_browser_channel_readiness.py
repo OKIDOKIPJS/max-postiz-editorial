@@ -86,24 +86,29 @@ def test_login_wrong_heading_missing_permission_or_ambiguous_header_fail_without
     "http://web.max.ru/-123", "https://other.invalid/-123", "https://web.max.ru/-456",
     "https://web.max.ru/-123?other=1", "https://web.max.ru/-123#other",
 ])
-def test_noncanonical_address_is_rejected_before_any_dom_wait_or_navigation(channel, address):
+@pytest.mark.parametrize("require_publish", [True, False])
+def test_noncanonical_address_is_rejected_before_any_dom_wait_or_navigation(
+        channel, address, require_publish):
     settings, page, requests = channel
     page.route("**/*", lambda request: request.fulfill(body=html(), content_type="text/html"))
     page.goto(address, timeout=1000)
     before = list(requests)
     with pytest.raises(AgentError, match="^BROWSER_WRONG_CHANNEL$"):
-        browser_runtime.ensure_channel(page, settings, "-123", navigate=False)
+        browser_runtime.ensure_channel(page, settings, "-123", navigate=False,
+                                       require_publish=require_publish)
     assert requests == before and page.evaluate("window.sendCalls") == 0
 
 
 @pytest.mark.parametrize("status,code", [(429, "BROWSER_CHANNEL_RATE_LIMITED"),
                                         (403, "BROWSER_CHANNEL_UNAVAILABLE"),
                                         (503, "BROWSER_CHANNEL_UNAVAILABLE")])
-def test_http_rate_limit_or_channel_error_never_reloads_or_retries(channel, status, code):
+@pytest.mark.parametrize("require_publish", [True, False])
+def test_http_rate_limit_or_channel_error_never_reloads_or_retries(
+        channel, status, code, require_publish):
     settings, page, requests = channel
     route(page, html(), status=status)
     with pytest.raises(AgentError, match="^" + code + "$"):
-        browser_runtime.ensure_channel(page, settings, "-123")
+        browser_runtime.ensure_channel(page, settings, "-123", require_publish=require_publish)
     unchanged(page, requests)
 
 
@@ -133,4 +138,55 @@ def test_last_immediate_check_rejects_change_after_readiness(channel, monkeypatc
     monkeypatch.setattr(page, "wait_for_function", changed)
     with pytest.raises(AgentError, match="^" + code + "$"):
         browser_runtime.ensure_channel(page, settings, "-123")
+    unchanged(page, requests)
+
+
+@pytest.mark.parametrize("content", [
+    html(editor=False),
+    html(editor_attributes='style="display:none"'),
+    html(editor_attributes='aria-disabled="true"'),
+    html(script="document.querySelector('[contenteditable]').contentEditable='false'"),
+], ids=["missing", "hidden", "disabled", "not_editable"])
+def test_read_identity_does_not_require_or_change_publish_composer(channel, content):
+    settings, page, requests = channel
+    route(page, content)
+    browser_runtime.ensure_channel(page, settings, "-123", require_publish=False)
+    unchanged(page, requests)
+
+
+@pytest.mark.parametrize("content,code", [
+    (html(heading="", editor=False), "BROWSER_LOGIN_OR_CHANNEL_REQUIRED"),
+    (html(heading="Окно чата с Другой", editor=False), "BROWSER_WRONG_CHANNEL"),
+    (html(editor=False, script="document.body.insertAdjacentHTML('afterbegin','<h2 id=main-header-title>Окно чата с Тест</h2>')"),
+     "BROWSER_LOGIN_OR_CHANNEL_REQUIRED"),
+], ids=["login", "wrong_header", "ambiguous_header"])
+def test_read_identity_still_rejects_login_or_wrong_header(channel, monkeypatch, content, code):
+    settings, page, requests = channel
+    monkeypatch.setattr(browser_runtime, "_CHANNEL_READY_TIMEOUT_MS", 150)
+    route(page, content)
+    with pytest.raises(AgentError, match="^" + code + "$"):
+        browser_runtime.ensure_channel(page, settings, "-123", require_publish=False)
+    unchanged(page, requests)
+
+
+@pytest.mark.parametrize("mutation,code", [
+    ("document.querySelector('h2').innerText='Окно чата с Другой'", "BROWSER_WRONG_CHANNEL"),
+    ("history.replaceState(null,'','/-456')", "BROWSER_WRONG_CHANNEL"),
+    ("document.body.insertAdjacentHTML('afterbegin','<h2 id=main-header-title>Окно чата с Тест</h2>')",
+     "BROWSER_LOGIN_OR_CHANNEL_REQUIRED"),
+])
+def test_read_identity_last_check_rejects_changed_or_ambiguous_channel(
+        channel, monkeypatch, mutation, code):
+    settings, page, requests = channel
+    route(page, html(editor=False))
+    wait = page.wait_for_function
+
+    def changed(*args, **kwargs):
+        result = wait(*args, **kwargs)
+        page.evaluate(mutation)
+        return result
+
+    monkeypatch.setattr(page, "wait_for_function", changed)
+    with pytest.raises(AgentError, match="^" + code + "$"):
+        browser_runtime.ensure_channel(page, settings, "-123", require_publish=False)
     unchanged(page, requests)

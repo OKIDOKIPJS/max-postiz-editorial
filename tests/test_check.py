@@ -143,6 +143,65 @@ def test_unified_check_exit_code_reflects_real_test_result(checkout, monkeypatch
     assert report["live_delivery_checked"] is False
 
 
+@pytest.mark.parametrize(
+    "suite_seconds, expected",
+    [(3601, 0), (7201, 1)],
+    ids=["long_complete_suite", "suite_exceeds_bounded_budget"],
+)
+def test_full_suite_budget_preserves_long_success_and_bounded_timeout(
+    checkout, monkeypatch, suite_seconds, expected
+):
+    clock = SimpleNamespace(now=0.0)
+    executed = {}
+    monkeypatch.setattr(check.time, "monotonic", lambda: clock.now)
+
+    def execute(command, **kwargs):
+        stage = Path(kwargs["stdout"].name).stem
+        executed[stage] = kwargs["timeout"]
+        xml = next((arg.split("=", 1)[1] for arg in command if arg.startswith("--junitxml=")), None)
+        duration = suite_seconds if "pytest" in command else 0.1
+        clock.now += min(duration, kwargs["timeout"])
+        if duration > kwargs["timeout"]:
+            raise check.subprocess.TimeoutExpired(command, kwargs["timeout"])
+        if xml:
+            Path(xml).write_text(
+                '<testsuites><testsuite><testcase name="virtual_complete_suite" '
+                f'time="{suite_seconds}"/></testsuite></testsuites>'
+            )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(check.subprocess, "run", execute)
+    assert check.run(checkout, postgres=False) == expected
+    report = json.loads(
+        next((checkout / "data/check-runs").glob("*/report.json")).read_text(encoding="utf-8")
+    )
+    assert report["status"] == ("passed" if expected == 0 else "failed")
+    assert list(executed) == [
+        "dependencies",
+        "lint",
+        "format",
+        "javascript-dashboard",
+        "javascript-app",
+        "browser",
+        "tests",
+        "diff",
+    ]
+    stages = {stage["name"]: stage for stage in report["stages"]}
+    assert all(stage["timeout_seconds"] == executed[name] for name, stage in stages.items())
+    assert executed["tests"] == 7200 and executed["browser"] == 60
+    assert all(
+        budget == 3600 for name, budget in executed.items() if name not in {"tests", "browser"}
+    )
+    assert all(stage["status"] == "passed" for name, stage in stages.items() if name != "tests")
+    assert stages["tests"]["seconds"] == min(suite_seconds, 7200)
+    if expected == 0:
+        assert stages["tests"]["status"] == "passed" and report["tests"]["passed"] == 1
+    else:
+        assert stages["tests"]["status"] == "failed" and stages["tests"]["exit_code"] != 0
+        assert stages["tests"]["error"] == "TimeoutExpired"
+        assert "tests" not in report
+
+
 def test_lint_failure_does_not_hide_other_checks(checkout, monkeypatch):
     executed = []
 
