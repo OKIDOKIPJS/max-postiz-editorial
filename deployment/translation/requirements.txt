@@ -1,6 +1,6 @@
 # Isolated CPU conversion/OPUS environment; do not install into the Hub environment.
 ctranslate2==4.8.3
-transformers==4.57.6
+transformers==5.10.1
 torch==2.14.1+cpu
 sentencepiece==0.2.2
 huggingface-hub==0.36.2
