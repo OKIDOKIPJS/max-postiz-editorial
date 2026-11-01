@@ -19,6 +19,7 @@ from max_postiz_agent.vk_browser import VKBrowser, dom_contract, prepare
 from max_postiz_agent.vk_media import derivative_proof, upload_binding
 from test_vk_browser import browser as browser, page as page
 from test_vk_media import image_case as image_case
+from vk_browser_test_clock import semantic_fence_clock as semantic_fence_clock
 
 
 NASA_URLS = ["https://nssdc.gsfc.nasa.gov/planetary/factsheet/earthfact.html",
@@ -288,7 +289,7 @@ def native_site(image_case):
         server.server_close()
 
 
-def test_real_native_image_upload_preview_original_two_reloads_and_no_repeat(native_site, page):
+def test_real_native_image_upload_preview_original_two_reloads_and_no_repeat(native_site, page, semantic_fence_clock):
     root, options, snapshot, state, origin = native_site
     page.context.route("**/*", lambda route: route.continue_() if route.request.url.startswith(origin + "/") else route.abort())
     payload = {"destination": "123456", "request_id": "native-image-full", "snapshot": snapshot}
@@ -305,7 +306,40 @@ def test_real_native_image_upload_preview_original_two_reloads_and_no_repeat(nat
     assert state == before
 
 
-def test_real_native_wrong_public_asset_is_unknown_and_never_reuploaded(native_site, page):
+@pytest.mark.parametrize("delayed_rep", [0, 1])
+def test_native_preview_waits_for_each_representation_to_decode(native_site, page, monkeypatch, delayed_rep, semantic_fence_clock):
+    root, options, snapshot, state, origin = native_site
+    page.context.route("**/*", lambda route: route.continue_() if route.request.url.startswith(origin + "/") else route.abort())
+    decoded, representations = [], []
+    page.expose_function("fixturePreviewDecoded", lambda: decoded.append(delayed_rep))
+    story_disabled = worker._wait_story_disabled
+
+    def delay_one_representation(*args, **kwargs):
+        result = story_disabled(*args, **kwargs)
+        selector = args[1]["preview_images"]
+        representations.append(page.locator(selector).count())
+        assert representations == [2]
+        page.evaluate("""({selector,index})=>{
+          const image=document.querySelectorAll(selector)[index];
+          Object.defineProperty(image,'complete',{configurable:true,get:()=>false});
+          setTimeout(()=>{delete image.complete;window.fixturePreviewDecoded();},400);
+        }""", {"selector": selector, "index": delayed_rep})
+        return result
+
+    monkeypatch.setattr(worker, "_wait_story_disabled", delay_one_representation)
+    payload = {"destination": "123456", "request_id": "native-image-delayed-" + str(delayed_rep), "snapshot": snapshot}
+    result = worker.run_publish(page, root, options, payload, lambda: None, origin=origin, fixture=True)
+    assert result["state"] == "confirmed", {"failure_code": result["evidence"].get("failure_code"), "result": result}
+    assert decoded == [delayed_rep] and representations == [2]
+    assert result["verified"] is False and options["operation_timeout_seconds"] == 10
+    assert state["uploads"] == state["publishes"] == 1 and state["viewer_before_publish"] == 0
+    assert state["photo_views"] == 2 and len(result["evidence"]["proof"]["reloads"]) == 2
+    before = deepcopy(state)
+    assert worker.run_publish(page, root, options, payload, lambda: None, origin=origin, fixture=True) == result
+    assert state == before
+
+
+def test_real_native_wrong_public_asset_is_unknown_and_never_reuploaded(native_site, page, semantic_fence_clock):
     root, options, snapshot, state, origin = native_site
     state["wrong_public_asset"] = True
     page.context.route("**/*", lambda route: route.continue_() if route.request.url.startswith(origin + "/") else route.abort())
@@ -318,7 +352,7 @@ def test_real_native_wrong_public_asset_is_unknown_and_never_reuploaded(native_s
     assert state == before
 
 
-def test_real_native_cross_asset_hidden_anchor_cannot_validate_visible_other_photo(native_site, page):
+def test_real_native_cross_asset_hidden_anchor_cannot_validate_visible_other_photo(native_site, page, semantic_fence_clock):
     root, options, snapshot, state, origin = native_site
     state["cross_asset"] = True
     options["dom_contract"]["post_images"] = '[data-testid="body-photo"]'
@@ -333,7 +367,7 @@ def test_real_native_cross_asset_hidden_anchor_cannot_validate_visible_other_pho
 
 
 @pytest.mark.parametrize("change", ["caption", "crop", "url", "pause"])
-def test_real_native_change_during_preview_read_prevents_publish(native_site, page, monkeypatch, change):
+def test_real_native_change_during_preview_read_prevents_publish(native_site, page, monkeypatch, change, semantic_fence_clock):
     root, options, snapshot, state, origin = native_site
     page.context.route("**/*", lambda route: route.continue_() if route.request.url.startswith(origin + "/") else route.abort())
     read = worker._cdn_bytes
@@ -355,7 +389,12 @@ def test_real_native_change_during_preview_read_prevents_publish(native_site, pa
     monkeypatch.setattr(worker, "_cdn_bytes", cdn)
     payload = {"destination": "123456", "request_id": "native-preview-" + change, "snapshot": snapshot}
     result = worker.run_publish(page, root, options, payload, authorize, origin=origin, fixture=True)
-    assert flags["mutated"] is True and result["state"] == "unknown"
+    assert flags["mutated"] is True and result["state"] == "unknown", {
+        "failure_code": result["evidence"].get("failure_code"),
+        "journal_state": result["evidence"].get("journal_state"),
+        "uploads": state["uploads"], "publishes": state["publishes"],
+        "photo_views": state["photo_views"], "mutated": flags["mutated"],
+    }
     assert state["uploads"] == 1 and state["publishes"] == state["photo_views"] == 0
     before = deepcopy(state)
     assert worker.run_publish(page, root, options, payload, lambda: None, origin=origin, fixture=True)["state"] == "unknown"

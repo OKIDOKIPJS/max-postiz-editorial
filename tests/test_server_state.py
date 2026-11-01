@@ -92,6 +92,53 @@ def test_settings_revision_is_independent_from_worker_heartbeat(cycle):
         store.settings(settings, store.read()["revision"], "postiz:owner")
 
 
+@pytest.mark.parametrize("blocker", [None, "target", "sending", "unknown", "dispatch_owner",
+                                    "dispatch_lease", "bridge_owner", "bridge_lease", "preparation"])
+def test_prepare_only_resume_is_fenced_and_never_resumes_targets(cycle, blocker):
+    from sqlalchemy import select
+    from max_postiz_agent.hub_models import BridgePost, Dispatch, Target, TargetApproval
+    from max_postiz_agent.server_models import EditorialPreparationClaim
+
+    old, core, article, _, calls, *_ = cycle
+    record = old.prepare(article)
+    store = ServerState(core)
+    initial = store.initialize()
+    with core.db.session.begin() as session:
+        for target in session.scalars(select(Target)):
+            target.paused = True
+        if blocker == "target":
+            session.get(Target, "max").paused = False
+        if blocker in {"sending", "unknown", "dispatch_owner", "dispatch_lease"}:
+            approval = TargetApproval(variant_id=record["variant_id"], revision=1,
+                snapshot_hash="a" * 64, scheduled_at=1, actor="test")
+            session.add(approval)
+            session.flush()
+            session.add(Dispatch(variant_id=record["variant_id"], approval_id=approval.id,
+                revision=1, snapshot_hash="a" * 64, snapshot={}, due_at=1,
+                state=blocker if blocker in {"sending", "unknown"} else "pending",
+                owner="owner" if blocker == "dispatch_owner" else None,
+                lease_until=1 if blocker == "dispatch_lease" else 0))
+        if blocker in {"bridge_owner", "bridge_lease"}:
+            session.add(BridgePost(post_id="test", integration_id="test", group_id="test", target_id="max",
+                variant_id=record["variant_id"], remote_hash="a" * 64, remote_state="DRAFT", due_at=1,
+                mutation_owner="owner" if blocker == "bridge_owner" else None,
+                mutation_until=1 if blocker == "bridge_lease" else 0))
+        if blocker == "preparation":
+            session.add(EditorialPreparationClaim(control_revision=initial["revision"], active_key="models",
+                                                 state="preparing"))
+    if blocker:
+        with pytest.raises(AgentError, match="MONITOR_COPY_TARGETS_NOT_PAUSED" if blocker == "target"
+                           else "ARTICLE_RECONCILIATION_REQUIRED"):
+            store.control("start", initial["revision"], "monitor-owner", prepare_only=True)
+        assert store.read()["paused"] is True and store.read()["revision"] == initial["revision"]
+    else:
+        value = store.control("start", initial["revision"], "monitor-owner", prepare_only=True)
+        assert value["paused"] is False and value["revision"] == initial["revision"] + 1
+        with core.db.session() as session:
+            assert all(target.paused for target in session.scalars(select(Target)))
+    assert calls == []
+
+
 @pytest.fixture
 def api(cycle, monkeypatch):
     _, core, *_ = cycle

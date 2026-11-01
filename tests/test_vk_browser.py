@@ -4,11 +4,16 @@ import hashlib
 import html
 import io
 import json
+import os
+import re
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
+from xml.etree import ElementTree
 
 import pytest
 from PIL import Image
@@ -16,6 +21,7 @@ from PIL import Image
 from max_postiz_agent import vk_browser_worker as worker
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.vk_browser import OBSERVED_DOM, VKBrowser, dom_contract, prepare, wall_url
+from vk_browser_test_clock import semantic_fence_clock as semantic_fence_clock
 
 pytest_plugins = ["test_four_platform_hub"]
 
@@ -33,7 +39,7 @@ SELECTORS = {
 
 
 @pytest.fixture
-def sample(tmp_path):
+def sample(tmp_path, request):
     output = io.BytesIO()
     Image.new("RGB", (640, 480), "navy").save(output, format="PNG")
     raw = output.getvalue()
@@ -44,7 +50,8 @@ def sample(tmp_path):
                 "destination": OWNER, "media": [{"path": "approved.png", "mime": "image/png",
                 "sha256": hashlib.sha256(raw).hexdigest()}], "metadata": {}}
     payload = {"action": "publish", "destination": OWNER, "snapshot": snapshot, "request_id": "vk-fixture"}
-    return SimpleNamespace(root=tmp_path, raw=raw, options=options, snapshot=snapshot, payload=payload)
+    return SimpleNamespace(root=tmp_path, raw=raw, options=options, snapshot=snapshot, payload=payload,
+                           user_properties=request.node.user_properties)
 
 
 def post_html(state, text, ident, *, readback=False):
@@ -108,6 +115,19 @@ document.getElementById('publish').onclick=async()=>{
 };
 window.clicks=0;window.fills=0;window.opens=0;window.nexts=0;
 """
+    if getattr(state, "preview_photo_delay_ms", 0) or getattr(state, "preview_photo_invalid", False):
+        code = code.replace(
+            "document.getElementById('preview-images').innerHTML=document.getElementById('uploaded').innerHTML;",
+            "document.getElementById('preview-images').innerHTML=document.getElementById('uploaded').innerHTML.replace('/photo.png','/photo.png?preview-load=1');")
+    preview_change = getattr(state, "preview_wait_change", None)
+    if preview_change:
+        mutation = {
+            "account": "document.querySelector('[data-testid=header-profile-menu-button]').href='/id999999';",
+            "text": "document.getElementById('preview-text').textContent='Unapproved changed preview';",
+            "image": "document.querySelector('#preview-images img').src='/changed-preview.png';",
+        }[preview_change]
+        code += ("new MutationObserver(()=>setTimeout(()=>{" + mutation
+                 + "},50)).observe(document.getElementById('preview-images'),{childList:true});")
     if any(getattr(state, name, 0) for name in (
             "editor_mount_delay_ms", "next_ready_delay_ms", "story_aria_delay_ms")):
         code += r"""
@@ -194,7 +214,7 @@ def local_vk(sample):
     state = SimpleNamespace(destination=OWNER, raw=sample.raw, uploads=0, publishes=0, posts=[],
                             gets=[], wrong_owner=False, corrupt_readback=False, bad_photo=False,
                             drop_reply=False, redirect_wrong_wall=False, post_author_override=None,
-                            personal=False, stories=0, publish_readiness=[])
+                            personal=False, stories=0, publish_readiness=[], preview_completions=[])
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -202,13 +222,22 @@ def local_vk(sample):
 
         def do_GET(self):
             state.gets.append(self.path)
+            preview_done = None
             if state.redirect_wrong_wall and self.path == "/id" + OWNER:
                 self.send_response(302)
                 self.send_header("Location", "/id999999")
                 self.end_headers()
                 return
-            if self.path.split("?", 1)[0] == "/photo.png":
-                raw = b"wrong photo" if state.bad_photo else state.raw
+            if self.path.split("?", 1)[0] in {"/photo.png", "/changed-preview.png"}:
+                if self.path == "/photo.png?preview-load=1":
+                    preview_done = threading.Event()
+                    state.preview_completions.append(preview_done)
+                    time.sleep(getattr(state, "preview_photo_delay_ms", 0) / 1000)
+                    raw = b"undecodable preview" if getattr(state, "preview_photo_invalid", False) else state.raw
+                elif self.path == "/changed-preview.png":
+                    raw = state.changed_preview_raw
+                else:
+                    raw = b"wrong photo" if state.bad_photo else state.raw
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
             else:
@@ -217,7 +246,11 @@ def local_vk(sample):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.wfile.write(raw)
+            finally:
+                if preview_done is not None:
+                    preview_done.set()
 
         def do_POST(self):
             raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -236,6 +269,9 @@ def local_vk(sample):
                 if state.drop_reply:
                     self.close_connection = True
                     return
+                delay = getattr(state, "publish_response_delay_seconds", 0)
+                if delay:
+                    time.sleep(delay)
                 result = {"html": post_html(state, text, 51)}
             else:
                 self.send_error(404)
@@ -276,54 +312,192 @@ def page(browser):
 
 
 def run(page, sample, state, authorize=lambda: None):
-    result = worker.run_publish(page, sample.root, sample.options, sample.payload, authorize,
-                                origin=state.origin, fixture=True)
-    if result.get("state") != "confirmed":
-        # Assertion rewriting abbreviates the result dictionary. Keep only
-        # stable synthetic-fixture metadata for a failing CI's captured stdout.
+    result, completed = None, False
+    try:
+        result = worker.run_publish(page, sample.root, sample.options, sample.payload, authorize,
+                                    origin=state.origin, fixture=True)
+        completed = True
+        return result
+    finally:
+        _record_fixture_diagnostics(sample, state, result, None if completed else sys.exc_info()[1])
+
+
+def _record_fixture_diagnostics(sample, state, result, raised):
+    """Record only safe fixture fields; reporting must not alter an operation outcome."""
+    try:
+        states = {"intent", "editor_open_intent", "fill_intent", "upload_intent", "uploaded",
+                  "next_intent", "story_disable_intent", "click_intent", "readback_pending",
+                  "confirmed", "failed", "unknown"}
+        error_types = {"AgentError", "TimeoutError", "Error", "OSError", "ValueError",
+                       "TypeError", "RuntimeError", "AssertionError", "FileNotFoundError"}
         try:
-            journal = json.loads(worker._path(sample.root, sample.payload["request_id"]).read_text(encoding="utf-8"))
-        except (AgentError, OSError, ValueError, TypeError):
+            _, journal = worker._read(sample.root, sample.payload["request_id"])
+        except Exception:
             journal = {}
         journal = journal if isinstance(journal, dict) else {}
+        result = result if isinstance(result, dict) else {}
         evidence = result.get("evidence")
         evidence = evidence if isinstance(evidence, dict) else {}
-        private_error = journal.get("private_error")
-        private_error = private_error if isinstance(private_error, dict) else {}
-        diagnostic = {
-            "failure_code": evidence.get("failure_code"), "journal_failure_code": journal.get("failure_code"),
-            "result_state": result.get("state"), "journal_state": journal.get("state"),
-            "last_action_intent": journal.get("last_action_intent"), "clicks": journal.get("clicks"),
-            "exception_type": private_error.get("type"),
-            "fixture_publishes": getattr(state, "publishes", None), "fixture_uploads": getattr(state, "uploads", None),
-        }
-        print("VK_FIXTURE_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True))
-    return result
+        error = journal.get("private_error")
+        error = error if isinstance(error, dict) else {}
+        code = journal.get("failure_code") or evidence.get("failure_code") or getattr(raised, "code", None)
+        stage = journal.get("last_action_intent")
+        status = result.get("state") or journal.get("state")
+        record = {"fixture": True, "outcome": "raised" if raised is not None else "returned",
+                  "state": status if isinstance(status, str) and status in states else None,
+                  "last_action_intent": stage if isinstance(stage, str) and stage in states else None,
+                  "failure_code": code if isinstance(code, str) and re.fullmatch(
+                      r"(?:VK_BROWSER|TARGET|EDITORIAL)_[A-Z0-9_]{1,96}", code) else None,
+                  "private_error_type": error.get("type") if isinstance(error.get("type"), str)
+                      and error["type"] in error_types else None,
+                  "raised_error_type": type(raised).__name__ if raised is not None
+                      and type(raised).__name__ in error_types else None}
+        for key, value in (("clicks", journal.get("clicks")), ("uploads", state.uploads),
+                           ("publishes", state.publishes)):
+            record[key] = value if type(value) is int and 0 <= value <= 100000 else None
+        message = error.get("message")
+        context = re.match(
+            r"^(Locator\.(?:click|fill|set_input_files|uncheck|wait_for)|"
+            r"Page\.(?:goto|reload|wait_for_function)|Frame\.wait_for_function): "
+            r"Timeout ([0-9]{1,6})ms exceeded", message[:256]) if isinstance(message, str) else None
+        if context and 1 <= int(context[2]) <= 180000:
+            record.update(operation=context[1], timeout_ms=int(context[2]))
+        sample.user_properties.append(("vk_browser_diagnostics", json.dumps(record, sort_keys=True)))
+    except Exception:
+        # The original return or exception wins even if fixture diagnostics fail.
+        return None
 
 
-def test_fixture_failure_diagnostic_preserves_result_and_journal_without_private_payload(sample, monkeypatch, capsys):
-    secret = "synthetic-private-value-must-not-be-logged"
-    result = {"state": "unknown", "evidence": {"failure_code": "VK_BROWSER_OPERATION_UNKNOWN", "private": secret}}
-    journal = worker._path(sample.root, sample.payload["request_id"])
-    journal.parent.mkdir(parents=True)
-    journal.write_text(json.dumps({"state": "unknown", "failure_code": "VK_BROWSER_OPERATION_UNKNOWN",
-        "last_action_intent": "fill_intent", "clicks": 0, "snapshot": {"body": secret},
-        "private_error": {"type": "TimeoutError", "message": secret}}), encoding="utf-8")
-    before = journal.read_bytes()
-    monkeypatch.setattr(worker, "run_publish", lambda *args, **kwargs: result)
-    state = SimpleNamespace(origin="http://127.0.0.1:1", publishes=0, uploads=0)
-    assert run(None, sample, state) is result
-    output = capsys.readouterr().out
-    assert secret not in output
-    diagnostic = json.loads(output.removeprefix("VK_FIXTURE_DIAGNOSTIC "))
-    assert diagnostic == {"failure_code": "VK_BROWSER_OPERATION_UNKNOWN", "journal_failure_code": "VK_BROWSER_OPERATION_UNKNOWN",
-        "result_state": "unknown", "journal_state": "unknown", "last_action_intent": "fill_intent", "clicks": 0,
-        "exception_type": "TimeoutError", "fixture_publishes": 0, "fixture_uploads": 0}
-    assert journal.read_bytes() == before
-    journal.write_text("[]", encoding="utf-8")
-    assert run(None, sample, state) is result
-    assert json.loads(capsys.readouterr().out.removeprefix("VK_FIXTURE_DIAGNOSTIC "))["journal_state"] is None
-    assert journal.read_bytes() == b"[]"
+def publish_diagnostics(sample, state, result):
+    """Report synthetic fixture phase failures without dumping snapshot text."""
+    details = {"failure_code": result["evidence"].get("failure_code"),
+               "journal_state": result["evidence"].get("journal_state")}
+    try:
+        _, journal = worker._read(sample.root, sample.payload["request_id"])
+        details.update(last_action_intent=journal.get("last_action_intent"),
+                       private_error=journal.get("private_error"))
+    except (AgentError, OSError, ValueError) as exc:
+        details["diagnostic_error"] = type(exc).__name__
+    details.update(uploads=state.uploads, publishes=state.publishes,
+                   publish_readiness=state.publish_readiness, result=result)
+    return details
+
+
+def test_fixture_diagnostics_are_serialized_to_junit_without_private_fields(tmp_path):
+    child = tmp_path / "test_diagnostic_case.py"
+    child.write_text(r'''
+from types import SimpleNamespace
+import pytest
+from test_vk_browser import sample as sample, run, worker
+
+SECRET = "diagnostic-private-fixture-canary"
+RAW_TEXT = "raw-snapshot-text-fixture-canary"
+
+@pytest.mark.parametrize("mode", ["unknown", "confirmed", "raised", "malicious"])
+def test_operation(sample, monkeypatch, mode):
+    sample.snapshot["body"] = RAW_TEXT
+    sample.options["private"] = SECRET
+    expected = {"state": "confirmed" if mode == "confirmed" else "unknown",
+                "evidence": {"failure_code": "VK_BROWSER_OPERATION_UNKNOWN"},
+                "raw_journal": SECRET}
+    journal = {"state": "unknown", "last_action_intent": "upload_intent", "clicks": 0,
+               "failure_code": "VK_BROWSER_OPERATION_UNKNOWN",
+               "snapshot": {"text": RAW_TEXT}, "credentials": SECRET,
+               "private_error": {"type": "TimeoutError", "message":
+                   "Locator.set_input_files: Timeout 1000ms exceeded.\nCall log: https://user:"
+                   + SECRET + "@private.invalid/" + RAW_TEXT}}
+    local = SimpleNamespace(origin="http://" + SECRET + "@private.invalid", uploads=0, publishes=0)
+    if mode == "malicious":
+        journal.update(state=SECRET, last_action_intent=SECRET, failure_code=SECRET,
+                       clicks=float("nan"), private_error={"type": SECRET, "message": SECRET})
+        local.uploads = local.publishes = SECRET
+    monkeypatch.setattr(worker, "_read", lambda *args: (None, journal))
+    planned_error = RuntimeError(SECRET)
+    def operation(*args, **kwargs):
+        if mode == "raised":
+            raise planned_error
+        return expected
+    monkeypatch.setattr(worker, "run_publish", operation)
+    if mode == "raised":
+        with pytest.raises(RuntimeError) as actual:
+            run(None, sample, local)
+        assert actual.value is planned_error
+    else:
+        assert run(None, sample, local) is expected
+    assert "user_properties" not in sample.options
+    assert "user_properties" not in sample.payload
+    assert sample.payload["snapshot"] is sample.snapshot
+''', encoding="utf-8")
+    config = tmp_path / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+    junit = tmp_path / "diagnostics.xml"
+    env = dict(os.environ)
+    for key in ("TEST_DATABASE_URL", "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_CURRENT_TEST"):
+        env.pop(key, None)
+    env.update(PYTHONPATH=str(Path(__file__).resolve().parent), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    completed = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", "-m", "pytest", "-c", str(config), str(child),
+         "-q", "--basetemp=" + str(tmp_path / "child-state"), "--junitxml=" + str(junit)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=30, check=False)
+    (tmp_path / "child-output.log").write_text(completed.stdout + completed.stderr, encoding="utf-8")
+    assert completed.returncode == 0, "Isolated diagnostic pytest failed; inspect child-output.log"
+    raw = junit.read_text(encoding="utf-8")
+    assert "diagnostic-private-fixture-canary" not in raw
+    assert "raw-snapshot-text-fixture-canary" not in raw
+    assert "private.invalid" not in raw and "Call log:" not in raw
+    cases = list(ElementTree.parse(junit).getroot().iter("testcase"))  # noqa: S314 -- local pytest report
+    assert len(cases) == 4 and all(case.find("failure") is None and case.find("error") is None for case in cases)
+    for case in cases:
+        properties = [json.loads(prop.get("value")) for prop in case.findall("./properties/property")
+                      if prop.get("name") == "vk_browser_diagnostics"]
+        assert len(properties) == 1
+        details = properties[0]
+        assert details["fixture"] is True
+        assert details["outcome"] == ("raised" if "raised" in case.get("name") else "returned")
+        if "malicious" in case.get("name"):
+            assert details["failure_code"] is details["last_action_intent"] is details["private_error_type"] is None
+            assert details["clicks"] is details["uploads"] is details["publishes"] is None
+            assert "operation" not in details and "timeout_ms" not in details
+        else:
+            assert details["failure_code"] == "VK_BROWSER_OPERATION_UNKNOWN"
+            assert details["last_action_intent"] == "upload_intent"
+            assert details["private_error_type"] == "TimeoutError"
+            assert details["operation"] == "Locator.set_input_files" and details["timeout_ms"] == 1000
+
+
+@pytest.mark.parametrize("fault", ["read", "serialize"])
+@pytest.mark.parametrize("raised", [False, True])
+def test_fixture_diagnostic_failure_does_not_change_return_or_original_exception(
+        sample, monkeypatch, fault, raised):
+    expected = {"state": "unknown", "evidence": {"failure_code": "VK_BROWSER_OPERATION_UNKNOWN"}}
+    planned_error = RuntimeError("Original operation error")
+    local = SimpleNamespace(origin="http://127.0.0.1", uploads=0, publishes=0)
+    attempts = []
+
+    def operation(*args, **kwargs):
+        if raised:
+            raise planned_error
+        return expected
+
+    def diagnostic_failure(*args, **kwargs):
+        attempts.append(True)
+        raise OSError("Fixture diagnostic storage failed")
+
+    monkeypatch.setattr(worker, "run_publish", operation)
+    monkeypatch.setattr(worker, "_read", lambda *args: (None, {}))
+    with monkeypatch.context() as scoped:
+        if fault == "read":
+            scoped.setattr(worker, "_read", diagnostic_failure)
+        else:
+            scoped.setattr(json, "dumps", diagnostic_failure)
+        if raised:
+            with pytest.raises(RuntimeError) as actual:
+                run(None, sample, local)
+            assert actual.value is planned_error
+        else:
+            assert run(None, sample, local) is expected
+    assert attempts == [True]
 
 
 def personal_wall(sample, state):
@@ -389,7 +563,10 @@ def test_background_create_changes_are_ignored_only_inside_visible_composer(samp
 
 
 def test_native_background_draft_update_does_not_block_exact_guarded_form(
-        sample, local_vk, page, monkeypatch):
+        sample, local_vk, page, semantic_fence_clock, monkeypatch):
+    # This positive DOM contract is not a one-second HTTP performance test.
+    # The worker's separate fresh-authorization fence remains unchanged.
+    sample.options["operation_timeout_seconds"] = 5
     personal_wall(sample, local_vk)
     original, changed = worker._all_preview_media, False
 
@@ -402,14 +579,18 @@ def test_native_background_draft_update_does_not_block_exact_guarded_form(
 
     monkeypatch.setattr(worker, '_all_preview_media', background_update)
     result = run(page, sample, local_vk)
-    assert result['state'] == 'confirmed', result
-    assert changed and local_vk.publishes == 1 and local_vk.stories == local_vk.uploads == 0
     _, journal = worker._read(sample.root, sample.payload['request_id'])
+    diagnostic = {"failure_code": journal.get("failure_code"),
+        "error_type": journal.get("private_error", {}).get("type"),
+        "last_action_intent": journal.get("last_action_intent"),
+        "clicks": journal.get("clicks", 0), "publishes": local_vk.publishes}
+    assert result['state'] == 'confirmed', diagnostic
+    assert changed and local_vk.publishes == 1 and local_vk.stories == local_vk.uploads == 0
     assert journal['worker_code_sha256'] == worker.WORKER_SOURCE_SHA256
     assert journal['last_action_intent'] == 'click_intent' and journal['clicks'] == 1
 
 
-def test_personal_settings_exact_native_spacing_and_story_disabled_before_one_post(sample, local_vk, page):
+def test_personal_settings_exact_native_spacing_and_story_disabled_before_one_post(sample, local_vk, page, semantic_fence_clock):
     personal_wall(sample, local_vk)
     result = run(page, sample, local_vk)
     assert result["state"] == "confirmed", result
@@ -425,6 +606,36 @@ def test_personal_settings_exact_native_spacing_and_story_disabled_before_one_po
     assert local_vk.gets == before and local_vk.publishes == 1
 
 
+@pytest.mark.parametrize("budget,expected", [(1, "unknown"), (5, "confirmed")])
+def test_persisted_publish_with_delayed_response_respects_result_budget_without_resending(
+        sample, local_vk, page, semantic_fence_clock, budget, expected):
+    personal_wall(sample, local_vk)
+    sample.options["operation_timeout_seconds"] = budget
+    local_vk.publish_response_delay_seconds = 1.5
+    result = run(page, sample, local_vk)
+    _, journal = worker._read(sample.root, sample.payload["request_id"])
+    diagnostic = {"failure_code": journal.get("failure_code"),
+        "error_type": journal.get("private_error", {}).get("type"),
+        "last_action_intent": journal.get("last_action_intent"),
+        "clicks": journal.get("clicks", 0), "publishes": local_vk.publishes}
+    assert result["state"] == expected, diagnostic
+    assert local_vk.publishes == len(local_vk.posts) == 1
+    assert local_vk.stories == local_vk.uploads == 0
+    assert journal["clicks"] == 1 and journal["last_action_intent"] == "click_intent"
+    if budget == 1:
+        assert result["evidence"]["failure_code"] == "VK_BROWSER_PUBLISH_RESULT_UNKNOWN"
+        assert journal["state"] == "unknown" and result["evidence"]["proof"] is None
+        # Even after the original response becomes visible, the unknown journal
+        # remains authoritative until a separate read-only reconciliation.
+        page.wait_for_function("document.querySelectorAll('[data-testid=post]').length===1", timeout=5000)
+    else:
+        assert len(result["evidence"]["proof"]["reloads"]) == 2
+        assert journal["state"] == "confirmed"
+    before = list(local_vk.gets)
+    assert run(page, sample, local_vk) == result
+    assert local_vk.gets == before and local_vk.publishes == 1
+
+
 def _old_rich_post(markup):
     return ('<article data-testid="post"><a data-testid="post-header-title" href="/id' + OWNER
             + '">Автор</a><span data-testid="post_text" style="white-space:pre-wrap">' + markup
@@ -432,7 +643,7 @@ def _old_rich_post(markup):
             + '_17">Раньше</a></article>')
 
 
-def test_unrelated_unsupported_rich_history_does_not_block_one_exact_post_or_reload(sample, local_vk, page):
+def test_unrelated_unsupported_rich_history_does_not_block_one_exact_post_or_reload(sample, local_vk, page, semantic_fence_clock):
     personal_wall(sample, local_vk)
     local_vk.old_rich_posts = _old_rich_post(
         '<strong>Другой старый пост</strong><div><img src="/photo.png">Постороннее описание.</div>')
@@ -449,7 +660,7 @@ def test_unrelated_unsupported_rich_history_does_not_block_one_exact_post_or_rel
 
 @pytest.mark.parametrize("decoration", ["none", "hidden_suffix", "hidden_interleaved"])
 def test_potential_matching_unsupported_history_still_blocks_before_editor(
-        sample, local_vk, page, decoration):
+        sample, local_vk, page, semantic_fence_clock, decoration):
     personal_wall(sample, local_vk)
     text = prepare(sample.root, sample.options, OWNER, sample.snapshot)["text"]
     if decoration == "none":
@@ -471,7 +682,7 @@ def test_potential_matching_unsupported_history_still_blocks_before_editor(
     assert local_vk.gets == before and local_vk.publishes == 0
 
 
-def test_matching_unsupported_target_on_independent_reload_is_unknown_never_confirmed(sample, local_vk, page):
+def test_matching_unsupported_target_on_independent_reload_is_unknown_never_confirmed(sample, local_vk, page, semantic_fence_clock):
     personal_wall(sample, local_vk)
     local_vk.rich_readback = True
     result = run(page, sample, local_vk)
@@ -526,7 +737,7 @@ def test_history_prefilter_refuses_unbounded_raw_text_instead_of_skipping_it(pag
      "VK_BROWSER_UNAPPROVED_MEDIA"),
 ])
 def test_personal_settings_unapproved_identity_mode_or_media_prevent_click(
-        sample, local_vk, page, monkeypatch, change, code):
+        sample, local_vk, page, semantic_fence_clock, monkeypatch, change, code):
     personal_wall(sample, local_vk)
     settings = worker._personal_settings
     changed = False
@@ -556,7 +767,7 @@ def test_personal_contract_cannot_authorize_a_community_wall(sample, local_vk):
 @pytest.mark.parametrize("href", ["https://unapproved.example.test/", "javascript:alert(1)",
                                   "https://vk.ru/away.php?to=https%3A%2F%2Fscience.example.test%2Fa"])
 def test_text_only_preview_unapproved_link_preserving_every_character_never_sends(
-        sample, local_vk, page, monkeypatch, href):
+        sample, local_vk, page, semantic_fence_clock, monkeypatch, href):
     personal_wall(sample, local_vk)
     sample.snapshot["body"] = "Полный научный текст без внешних ссылок."
     final = worker._final_snapshot
@@ -578,7 +789,7 @@ def test_text_only_preview_unapproved_link_preserving_every_character_never_send
 
 @pytest.mark.parametrize("source", ["literal_body", "frozen_sources"])
 def test_approved_text_link_is_allowed_without_broadening_author_or_permalink_scope(
-        sample, local_vk, page, monkeypatch, source):
+        sample, local_vk, page, semantic_fence_clock, monkeypatch, source):
     personal_wall(sample, local_vk)
     href = "https://science.example.test/a"
     if source == "frozen_sources":
@@ -601,7 +812,7 @@ def test_approved_text_link_is_allowed_without_broadening_author_or_permalink_sc
     assert all(item["text_links"] == [] for item in result["evidence"]["proof"]["reloads"])
 
 
-def test_unapproved_native_post_link_is_unknown_with_known_id_and_no_resend(sample, local_vk, page):
+def test_unapproved_native_post_link_is_unknown_with_known_id_and_no_resend(sample, local_vk, page, semantic_fence_clock):
     personal_wall(sample, local_vk)
     local_vk.post_body_link_href = "https://unapproved.example.test/"
     result = run(page, sample, local_vk)
@@ -617,7 +828,7 @@ def test_unapproved_native_post_link_is_unknown_with_known_id_and_no_resend(samp
 
 
 def test_personal_story_revoke_after_durable_intent_never_unchecks_or_publishes(
-        sample, local_vk, page, monkeypatch):
+        sample, local_vk, page, semantic_fence_clock, monkeypatch):
     personal_wall(sample, local_vk)
     save = worker._save
     revoked = False
@@ -641,7 +852,7 @@ def test_personal_story_revoke_after_durable_intent_never_unchecks_or_publishes(
     assert run(page, sample, local_vk, authorize)["state"] == "unknown"
 
 
-def test_personal_story_reenabled_by_last_authorizer_prevents_click(sample, local_vk, page):
+def test_personal_story_reenabled_by_last_authorizer_prevents_click(sample, local_vk, page, semantic_fence_clock):
     personal_wall(sample, local_vk)
 
     def authorize():
@@ -655,7 +866,7 @@ def test_personal_story_reenabled_by_last_authorizer_prevents_click(sample, loca
     assert local_vk.publishes == local_vk.stories == 0
 
 
-def test_personal_already_disabled_story_is_never_toggled(sample, local_vk, page, monkeypatch):
+def test_personal_already_disabled_story_is_never_toggled(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     personal_wall(sample, local_vk)
     settings = worker._personal_settings
     save = worker._save
@@ -679,7 +890,7 @@ def test_personal_already_disabled_story_is_never_toggled(sample, local_vk, page
     assert local_vk.publishes == 1 and local_vk.stories == 0
 
 
-def test_personal_story_refuses_to_disable_never_clicks_or_retries(sample, local_vk, page, monkeypatch):
+def test_personal_story_refuses_to_disable_never_clicks_or_retries(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     personal_wall(sample, local_vk)
     settings = worker._personal_settings
     installed = False
@@ -706,7 +917,7 @@ def test_personal_story_refuses_to_disable_never_clicks_or_retries(sample, local
      "VK_BROWSER_ACCOUNT_MISMATCH"),
 ])
 def test_personal_last_authorizer_mutation_never_changes_wrong_editor_or_story(
-        sample, local_vk, page, phase, change, code):
+        sample, local_vk, page, semantic_fence_clock, phase, change, code):
     personal_wall(sample, local_vk)
 
     def authorize():
@@ -741,7 +952,7 @@ def test_native_spacing_parser_rejects_unproven_or_hidden_content(page, markup):
 
 @pytest.mark.parametrize("markup", ['<div>Новая </div><div>звезда</div>',
                                   '<div>Новая звезда<div><br style="display:none"></div></div>'])
-def test_unproven_native_block_structure_never_clicks_publish(sample, local_vk, page, monkeypatch, markup):
+def test_unproven_native_block_structure_never_clicks_publish(sample, local_vk, page, semantic_fence_clock, monkeypatch, markup):
     personal_wall(sample, local_vk)
     final = worker._final_snapshot
 
@@ -756,7 +967,7 @@ def test_unproven_native_block_structure_never_clicks_publish(sample, local_vk, 
     assert local_vk.publishes == local_vk.stories == 0
 
 
-def test_native_post_author_single_tracking_query_preserves_numeric_identity(sample, local_vk, page):
+def test_native_post_author_single_tracking_query_preserves_numeric_identity(sample, local_vk, page, semantic_fence_clock):
     personal_wall(sample, local_vk)
     local_vk.post_author_tracking = "?trackcode=Native_Abc-123"
     result = run(page, sample, local_vk)
@@ -810,7 +1021,7 @@ def test_numeric_owner_and_wall_binding_only(sample, destination, valid):
             wall_url(destination, sample.options)
 
 
-def test_full_native_fixture_upload_next_single_click_two_reload_and_replay(sample, local_vk, page):
+def test_full_native_fixture_upload_next_single_click_two_reload_and_replay(sample, local_vk, page, semantic_fence_clock):
     result = run(page, sample, local_vk)
     assert result["state"] == "confirmed", result
     assert result["verified"] is False and result["evidence"]["fixture"] is True
@@ -824,14 +1035,14 @@ def test_full_native_fixture_upload_next_single_click_two_reload_and_replay(samp
     assert local_vk.uploads == local_vk.publishes == 1
 
 
-def test_wrong_owner_fails_before_editor_or_upload(sample, local_vk, page):
+def test_wrong_owner_fails_before_editor_or_upload(sample, local_vk, page, semantic_fence_clock):
     local_vk.wrong_owner = True
     result = run(page, sample, local_vk)
     assert result["state"] == "failed" and result["evidence"]["failure_code"] == "VK_BROWSER_ACCOUNT_MISMATCH"
     assert local_vk.uploads == local_vk.publishes == 0
 
 
-def test_lost_publish_reply_is_unknown_and_never_reuploads_or_reclicks(sample, local_vk, page):
+def test_lost_publish_reply_is_unknown_and_never_reuploads_or_reclicks(sample, local_vk, page, semantic_fence_clock):
     local_vk.drop_reply = True
     result = run(page, sample, local_vk)
     assert result["state"] == "unknown", result
@@ -840,7 +1051,7 @@ def test_lost_publish_reply_is_unknown_and_never_reuploads_or_reclicks(sample, l
     assert local_vk.publishes == local_vk.uploads == 1
 
 
-def test_wrong_recipient_after_next_never_clicks_publish(sample, local_vk, page, monkeypatch):
+def test_wrong_recipient_after_next_never_clicks_publish(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     final = worker._final_snapshot
 
     def wrong_recipient(*args, **kwargs):
@@ -853,7 +1064,7 @@ def test_wrong_recipient_after_next_never_clicks_publish(sample, local_vk, page,
     assert local_vk.uploads == 1 and local_vk.publishes == 0
 
 
-def test_pause_after_image_get_prevents_send(sample, local_vk, page, monkeypatch):
+def test_pause_after_image_get_prevents_send(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     image_read = worker._image_proof
     paused = []
 
@@ -874,7 +1085,7 @@ def test_pause_after_image_get_prevents_send(sample, local_vk, page, monkeypatch
     assert local_vk.uploads == 1
 
 
-def test_dom_change_during_image_get_prevents_send(sample, local_vk, page, monkeypatch):
+def test_dom_change_during_image_get_prevents_send(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     image_read = worker._image_proof
 
     def mutate_after_read(*args, **kwargs):
@@ -888,7 +1099,7 @@ def test_dom_change_during_image_get_prevents_send(sample, local_vk, page, monke
     assert result["evidence"]["failure_code"] == "VK_BROWSER_PREVIEW_TEXT_MISMATCH"
 
 
-def test_changed_snapshot_cannot_reuse_durable_request(sample, local_vk, page):
+def test_changed_snapshot_cannot_reuse_durable_request(sample, local_vk, page, semantic_fence_clock):
     assert run(page, sample, local_vk)["state"] == "confirmed"
     sample.snapshot["body"] += " Новое содержание."
     with pytest.raises(AgentError, match="VK_BROWSER_JOURNAL_CONFLICT"):
@@ -896,20 +1107,20 @@ def test_changed_snapshot_cannot_reuse_durable_request(sample, local_vk, page):
     assert local_vk.uploads == local_vk.publishes == 1
 
 
-def test_fixture_journal_cannot_be_promoted_to_live_verified(sample, local_vk, page):
+def test_fixture_journal_cannot_be_promoted_to_live_verified(sample, local_vk, page, semantic_fence_clock):
     assert run(page, sample, local_vk)["state"] == "confirmed"
     with pytest.raises(AgentError, match="VK_BROWSER_JOURNAL_CONFLICT"):
         worker.reconcile(page, sample.root, sample.options, OWNER, sample.payload["request_id"])
 
 
-def test_image_changed_after_approval_fails_before_browser_mutation(sample, local_vk, page):
+def test_image_changed_after_approval_fails_before_browser_mutation(sample, local_vk, page, semantic_fence_clock):
     (sample.root / "approved.png").write_bytes(b"changed")
     with pytest.raises(AgentError, match="VK_BROWSER_IMAGE_HASH_CHANGED"):
         run(page, sample, local_vk)
     assert local_vk.uploads == local_vk.publishes == 0
 
 
-def test_missing_journal_claim_never_reopens_existing_request(sample, local_vk, page):
+def test_missing_journal_claim_never_reopens_existing_request(sample, local_vk, page, semantic_fence_clock):
     path = worker._path(sample.root, sample.payload["request_id"])
     path.parent.mkdir(parents=True)
     path.write_text("{partial", encoding="utf-8")
@@ -918,7 +1129,7 @@ def test_missing_journal_claim_never_reopens_existing_request(sample, local_vk, 
     assert local_vk.uploads == local_vk.publishes == 0
 
 
-def test_readback_mismatch_keeps_known_native_id_for_read_only_reconciliation(sample, local_vk, page, monkeypatch):
+def test_readback_mismatch_keeps_known_native_id_for_read_only_reconciliation(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     readback = worker._readback
 
     def mismatch(*args, **kwargs):
@@ -936,7 +1147,7 @@ def test_readback_mismatch_keeps_known_native_id_for_read_only_reconciliation(sa
     assert local_vk.uploads == local_vk.publishes == 1
 
 
-def test_community_wall_keeps_authenticated_account_separate_from_recipient(sample, local_vk, page):
+def test_community_wall_keeps_authenticated_account_separate_from_recipient(sample, local_vk, page, semantic_fence_clock):
     local_vk.destination = "-456789"
     sample.snapshot["destination"] = sample.payload["destination"] = local_vk.destination
     result = run(page, sample, local_vk)
@@ -944,30 +1155,84 @@ def test_community_wall_keeps_authenticated_account_separate_from_recipient(samp
     assert local_vk.uploads == local_vk.publishes == 1
 
 
-def test_plain_text_only_is_one_native_post_without_upload(sample, local_vk, page):
+def test_plain_text_only_is_one_native_post_without_upload(sample, local_vk, page, semantic_fence_clock):
     sample.snapshot["media"] = []
     sample.options["media_contract_verified"] = False
     result = run(page, sample, local_vk)
     assert result["state"] == "confirmed" and local_vk.publishes == 1 and local_vk.uploads == 0
 
 
-def test_full_long_article_and_unicode_title_survive_native_flow_without_truncation(sample, local_vk, page):
+def test_full_long_article_and_unicode_title_survive_native_flow_without_truncation(sample, local_vk, page, semantic_fence_clock):
     sample.snapshot["title"] = "🔭 Космическое открытие"
     sample.snapshot["body"] = "Полный научный текст с точными наблюдениями. " * 60 + "\n\nИсточник: https://science.example.test/a"
     expected = sample.snapshot["title"] + "\n\n" + sample.snapshot["body"]
     result = run(page, sample, local_vk)
-    assert result["state"] == "confirmed" and local_vk.posts == [(expected, 51)]
+    assert result["state"] == "confirmed" and local_vk.posts == [(expected, 51)], publish_diagnostics(sample, local_vk, result)
     assert len(expected) > 2500 and result["evidence"]["proof"]["title_format"] == "plain"
 
 
-def test_wrong_wall_redirect_is_blocked_before_editor_mutation(sample, local_vk, page):
+@pytest.mark.parametrize("long_article", [False, True])
+def test_preview_photo_decode_is_awaited_within_existing_budget_before_one_publish(
+        sample, local_vk, page, semantic_fence_clock, long_article):
+    local_vk.preview_photo_delay_ms = 400
+    if long_article:
+        sample.snapshot["title"] = "🔭 Космическое открытие"
+        sample.snapshot["body"] = "Полный научный текст с точными наблюдениями. " * 60
+    expected = sample.snapshot["title"] + "\n\n" + sample.snapshot["body"]
+    result = run(page, sample, local_vk)
+    assert result["state"] == "confirmed", publish_diagnostics(sample, local_vk, result)
+    assert result["external_id"] == OWNER + "_51" and result["verified"] is False
+    assert len(result["evidence"]["proof"]["reloads"]) == 2
+    assert local_vk.posts == [(expected, 51)] and local_vk.uploads == local_vk.publishes == 1
+    assert local_vk.preview_completions and all(done.wait(2) for done in local_vk.preview_completions)
+    assert sample.options["operation_timeout_seconds"] == 1
+
+
+def test_permanently_undecodable_preview_blocks_publish_and_never_reopens_unknown(sample, local_vk, page, semantic_fence_clock):
+    local_vk.preview_photo_invalid = True
+    result = run(page, sample, local_vk)
+    assert result["state"] == "unknown", publish_diagnostics(sample, local_vk, result)
+    assert result["evidence"]["failure_code"] == "VK_BROWSER_IMAGE_NOT_READY"
+    assert result["external_id"] is None and result["evidence"]["clicks"] == 0
+    assert local_vk.uploads == 1 and local_vk.publishes == 0 and not local_vk.publish_readiness
+    before = list(local_vk.gets)
+    repeated = run(page, sample, local_vk)
+    assert repeated["state"] == "unknown" and repeated["external_id"] is None
+    assert local_vk.gets == before and local_vk.uploads == 1 and local_vk.publishes == 0
+    assert sample.options["operation_timeout_seconds"] == 1
+
+
+@pytest.mark.parametrize("change,code", [
+    ("account", "VK_BROWSER_ACCOUNT_MISMATCH"),
+    ("text", "VK_BROWSER_PREVIEW_TEXT_MISMATCH"),
+    ("image", "VK_BROWSER_IMAGE_READBACK_MISMATCH"),
+])
+def test_preview_ready_wait_does_not_approve_changed_account_text_or_photo(
+        sample, local_vk, page, semantic_fence_clock, change, code):
+    local_vk.preview_photo_delay_ms = 400
+    local_vk.preview_wait_change = change
+    output = io.BytesIO()
+    Image.new("RGB", (640, 480), "red").save(output, format="PNG")
+    local_vk.changed_preview_raw = output.getvalue()
+    result = run(page, sample, local_vk)
+    assert result["state"] == "unknown", publish_diagnostics(sample, local_vk, result)
+    assert result["evidence"]["failure_code"] == code, publish_diagnostics(sample, local_vk, result)
+    assert result["external_id"] is None and result["evidence"]["clicks"] == 0
+    assert local_vk.uploads == 1 and local_vk.publishes == 0 and not local_vk.publish_readiness
+    assert all(done.wait(2) for done in local_vk.preview_completions)
+    before = list(local_vk.gets)
+    assert run(page, sample, local_vk)["state"] == "unknown"
+    assert local_vk.gets == before and local_vk.uploads == 1 and local_vk.publishes == 0
+
+
+def test_wrong_wall_redirect_is_blocked_before_editor_mutation(sample, local_vk, page, semantic_fence_clock):
     local_vk.redirect_wrong_wall = True
     result = run(page, sample, local_vk)
     assert result["state"] == "failed" and result["evidence"]["failure_code"] == "VK_BROWSER_WALL_MISMATCH"
     assert local_vk.uploads == local_vk.publishes == 0
 
 
-def test_image_bytes_must_match_frozen_sha_before_publish(sample, local_vk, page, monkeypatch):
+def test_image_bytes_must_match_frozen_sha_before_publish(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     image_read = worker._image_proof
 
     def wrong_bytes(*args, **kwargs):
@@ -980,7 +1245,7 @@ def test_image_bytes_must_match_frozen_sha_before_publish(sample, local_vk, page
     assert local_vk.uploads == 1 and local_vk.publishes == 0
 
 
-def test_lease_loss_during_durable_click_claim_prevents_click(sample, local_vk, page, monkeypatch):
+def test_lease_loss_during_durable_click_claim_prevents_click(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     save = worker._save
     expired = []
 
@@ -1028,7 +1293,7 @@ def test_inspection_waits_for_native_spa_editor_after_account_header(sample, loc
     assert page.evaluate("window.opens") == 0 and local_vk.uploads == local_vk.publishes == 0
 
 
-def test_publication_waits_for_native_spa_editor(sample, local_vk, page):
+def test_publication_waits_for_native_spa_editor(sample, local_vk, page, semantic_fence_clock):
     local_vk.create_delay_ms = 350
     result = run(page, sample, local_vk)
     assert result["state"] == "confirmed", result
@@ -1044,7 +1309,7 @@ def test_publication_waits_for_native_spa_editor(sample, local_vk, page):
     (("editor", "next", "story"), "absent"),
 ])
 def test_personal_spa_transitions_wait_before_one_currently_authorized_publish(
-        sample, local_vk, page, transitions, next_mode):
+        sample, local_vk, page, semantic_fence_clock, transitions, next_mode):
     personal_wall(sample, local_vk)
     for name in transitions:
         setattr(local_vk, {"editor": "editor_mount_delay_ms", "next": "next_ready_delay_ms",
@@ -1080,7 +1345,7 @@ def test_personal_spa_transitions_wait_before_one_currently_authorized_publish(
 
 @pytest.mark.parametrize("transition", ["editor", "next", "story"])
 def test_pause_during_personal_spa_wait_prevents_publish_and_repeat(
-        sample, local_vk, page, transition):
+        sample, local_vk, page, semantic_fence_clock, transition):
     personal_wall(sample, local_vk)
     setattr(local_vk, {"editor": "editor_mount_delay_ms", "next": "next_ready_delay_ms",
                       "story": "story_aria_delay_ms"}[transition], 300)
@@ -1153,7 +1418,7 @@ def test_personal_text_profile_does_not_enable_media_or_unverified_dom(sample):
         dom_contract({"dom_contract_profile": "unknown"})
 
 
-def test_pause_during_final_dom_guard_is_checked_before_native_publish(sample, local_vk, page, monkeypatch):
+def test_pause_during_final_dom_guard_is_checked_before_native_publish(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     final = worker._final_snapshot
     revoked = False
     journal = worker._path(sample.root, sample.payload["request_id"])
@@ -1190,7 +1455,33 @@ def test_slow_fresh_authorization_expires_before_native_publish(sample, local_vk
     assert local_vk.publishes == 0
 
 
-def test_native_story_label_is_clicked_without_forcing_hidden_input(sample, local_vk, page):
+@pytest.mark.parametrize("phase,elapsed", [("authorize", 1.0), ("authorize", 1.25), ("final_stamp", 0.9995)])
+def test_injected_authorization_clock_expiry_prevents_native_action(monkeypatch, phase, elapsed):
+    current, actions = [10.0], []
+    stamps = []
+
+    def stamp(*_):
+        stamps.append(True)
+        if phase == "final_stamp" and len(stamps) == 3:
+            current[0] += elapsed
+        return "same-state"
+
+    monkeypatch.setattr(worker, "_mutation_stamp", stamp)
+    monkeypatch.setattr(worker, "_context", lambda *_a, **_k: None)
+
+    def authorize():
+        actions.append("authorize")
+        if phase == "authorize":
+            current[0] += elapsed
+
+    with pytest.raises(AgentError, match="VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED"):
+        worker._mutate(None, {}, {}, authorize, lambda: actions.append("check"),
+            lambda timeout: actions.append("native"), origin="https://vk.ru", _clock=lambda: current[0])
+    assert actions == ["check", "authorize"]
+    assert len(stamps) == (3 if phase == "final_stamp" else 2)
+
+
+def test_native_story_label_is_clicked_without_forcing_hidden_input(sample, local_vk, page, semantic_fence_clock):
     personal_wall(sample, local_vk)
     local_vk.native_story_label = True
     sample.options["dom_contract"]["story_toggle_label"] = "#native-story-label"
@@ -1250,6 +1541,7 @@ def test_native_actions_do_not_issue_unbounded_locator_queries_after_sql_fence(s
     original_mutate, original_one = worker._mutate, worker._one
     fenced = False
     late_queries = []
+    action_budgets = []
 
     def mutate(page, plan, selectors, authorize, check, action, *, origin):
         nonlocal fenced
@@ -1259,8 +1551,12 @@ def test_native_actions_do_not_issue_unbounded_locator_queries_after_sql_fence(s
             authorize()
             fenced = True
 
+        def timed_action(timeout):
+            action_budgets.append(timeout)
+            return action(timeout)
+
         try:
-            return original_mutate(page, plan, selectors, fresh, check, action, origin=origin)
+            return original_mutate(page, plan, selectors, fresh, check, timed_action, origin=origin)
         finally:
             fenced = False
 
@@ -1275,6 +1571,7 @@ def test_native_actions_do_not_issue_unbounded_locator_queries_after_sql_fence(s
     result = run(page, sample, local_vk)
     assert result["state"] == "confirmed", result
     assert late_queries == []
+    assert action_budgets and all(type(value) is int and 1 <= value <= 1000 for value in action_budgets)
     assert local_vk.publishes == 1
 
 
@@ -1590,7 +1887,7 @@ def test_reconcile_requires_exact_frozen_database_snapshot_before_worker(sample,
     assert result.evidence["failure_code"] == expected
 
 
-def test_native_fixture_result_remains_unverified_through_adapter(sample, local_vk, page, monkeypatch):
+def test_native_fixture_result_remains_unverified_through_adapter(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     native = run(page, sample, local_vk)
     assert native["state"] == "confirmed"
     adapter = VKBrowser(sample.root, sample.options)
@@ -1599,7 +1896,7 @@ def test_native_fixture_result_remains_unverified_through_adapter(sample, local_
     assert result.state == "confirmed" and result.verified is False and result.evidence["fixture"] is True
 
 
-def test_pause_during_upload_claim_prevents_upload_and_never_reopens(sample, local_vk, page, monkeypatch):
+def test_pause_during_upload_claim_prevents_upload_and_never_reopens(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     save = worker._save
     paused = []
 
@@ -1620,7 +1917,7 @@ def test_pause_during_upload_claim_prevents_upload_and_never_reopens(sample, loc
     assert local_vk.uploads == local_vk.publishes == 0 and local_vk.gets == before
 
 
-def test_click_journal_write_failure_cannot_send_or_retry_upload(sample, local_vk, page, monkeypatch):
+def test_click_journal_write_failure_cannot_send_or_retry_upload(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     save = worker._save
 
     def fail_click_claim(path, journal, state, **fields):
@@ -1635,7 +1932,7 @@ def test_click_journal_write_failure_cannot_send_or_retry_upload(sample, local_v
     assert local_vk.uploads == 1 and local_vk.publishes == 0
 
 
-def test_unknown_without_native_post_id_reconcile_does_not_speculate_or_mutate(sample, local_vk, page):
+def test_unknown_without_native_post_id_reconcile_does_not_speculate_or_mutate(sample, local_vk, page, semantic_fence_clock):
     local_vk.drop_reply = True
     result = run(page, sample, local_vk)
     assert result["state"] == "unknown" and result["external_id"] is None
@@ -1649,7 +1946,7 @@ def test_unknown_without_native_post_id_reconcile_does_not_speculate_or_mutate(s
 @pytest.mark.parametrize("reload_pass", [1, 2])
 @pytest.mark.parametrize("change", ["image_url", "image_count", "extra_attachment", "account", "wall_context", "text", "post_recipient", "post_author"])
 def test_readback_rechecks_complete_post_after_image_get_on_each_reload(
-        sample, local_vk, page, monkeypatch, change, reload_pass):
+        sample, local_vk, page, semantic_fence_clock, monkeypatch, change, reload_pass):
     image_read = worker._image_proof
     readback_passes = []
 
@@ -1687,7 +1984,7 @@ def test_readback_rechecks_complete_post_after_image_get_on_each_reload(
     monkeypatch.setattr(worker, "_image_proof", read_old_image_then_swap)
     result = run(page, sample, local_vk)
     assert result["state"] == "unknown" and result["verified"] is False
-    assert result["external_id"] == OWNER + "_51"
+    assert result["external_id"] == OWNER + "_51", publish_diagnostics(sample, local_vk, result)
     assert result["evidence"]["proof"] is None
     assert len(readback_passes) == reload_pass
     assert local_vk.uploads == local_vk.publishes == 1
@@ -1699,7 +1996,7 @@ def test_readback_rechecks_complete_post_after_image_get_on_each_reload(
 
 
 @pytest.mark.parametrize("community", [False, True])
-def test_identical_post_on_correct_wall_from_wrong_author_is_unknown(sample, local_vk, page, community):
+def test_identical_post_on_correct_wall_from_wrong_author_is_unknown(sample, local_vk, page, semantic_fence_clock, community):
     if community:
         local_vk.destination = "-456789"
         sample.snapshot["destination"] = sample.payload["destination"] = local_vk.destination
@@ -1714,7 +2011,7 @@ def test_identical_post_on_correct_wall_from_wrong_author_is_unknown(sample, loc
     assert local_vk.uploads == local_vk.publishes == 1
 
 
-def test_preview_publishing_identity_is_checked_before_send(sample, local_vk, page, monkeypatch):
+def test_preview_publishing_identity_is_checked_before_send(sample, local_vk, page, semantic_fence_clock, monkeypatch):
     final = worker._final_snapshot
 
     def wrong_author(*args, **kwargs):
@@ -1767,7 +2064,7 @@ def test_title_is_deduplicated_only_at_exact_line_boundary(sample, title, body, 
     assert prepare(sample.root, sample.options, OWNER, sample.snapshot)["text"] == expected
 
 
-def test_confirmed_journal_reconciliation_performs_two_new_wall_reads(sample, local_vk, page):
+def test_confirmed_journal_reconciliation_performs_two_new_wall_reads(sample, local_vk, page, semantic_fence_clock):
     initial = run(page, sample, local_vk)
     assert initial["state"] == "confirmed"
     before = local_vk.gets.count("/id" + OWNER)
@@ -1781,7 +2078,8 @@ def test_confirmed_journal_reconciliation_performs_two_new_wall_reads(sample, lo
 
 
 @pytest.mark.parametrize("change", ["deleted", "text", "author", "photo"])
-def test_confirmed_journal_never_substitutes_old_proof_for_changed_live_post(sample, local_vk, page, change):
+def test_confirmed_journal_never_substitutes_old_proof_for_changed_live_post(
+        sample, local_vk, page, semantic_fence_clock, change):
     initial = run(page, sample, local_vk)
     assert initial["state"] == "confirmed"
     if change == "deleted":
@@ -1807,7 +2105,7 @@ def test_confirmed_journal_never_substitutes_old_proof_for_changed_live_post(sam
 
 
 @pytest.mark.parametrize("flag", [None, False, "true"])
-def test_unverified_image_flow_stops_before_editor_upload_or_journal(sample, local_vk, page, flag):
+def test_unverified_image_flow_stops_before_editor_upload_or_journal(sample, local_vk, page, semantic_fence_clock, flag):
     if flag is None:
         sample.options.pop("media_contract_verified")
     else:

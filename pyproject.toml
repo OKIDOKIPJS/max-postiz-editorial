@@ -26,6 +26,7 @@ hub-agent = "max_postiz_agent.hub_cli:main"
 max-agent = "max_postiz_agent.server_cli:main"
 editorial-agent = "max_postiz_agent.server_cli:main"
 platform-agent = "max_postiz_agent.routes_cli:main"
+monitor-agent = "max_postiz_agent.monitor_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -49,3 +50,7 @@ ignore = ["S101", "S603", "S607"]
 "src/max_postiz_agent/api.py" = ["B008"]
 "src/max_postiz_agent/hub_api.py" = ["B008"]
 "tests/*" = ["S105", "S106"]
+
+[tool.max-postiz.check]
+# Остальные 213 файлов требуют отдельной миграции форматирования.
+format-paths = ["scripts/check.py", "tests/test_check.py"]

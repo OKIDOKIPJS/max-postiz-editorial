@@ -9,9 +9,7 @@ from max_postiz_agent.article_sources import policy_for_article, policy_for_reco
 from max_postiz_agent.article_attribution import ILLUSTRATED_PRESENTATION_CONTRACTS
 from max_postiz_agent.article_cycle import HourlyArticleCycle
 from max_postiz_agent.config import AgentError, fingerprint
-from test_article_sources import URLS, configured_sources
-
-pytest_plugins = ["test_article_sources"]
+from test_article_sources import URLS, configured_sources, base_policy as base_policy
 
 
 @pytest.mark.parametrize('source_id', ['nasa_svs_articles', 'noirlab_iotw', 'esahubble_potw'])

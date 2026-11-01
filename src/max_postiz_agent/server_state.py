@@ -16,6 +16,37 @@ from .server_models import EditorialControl, EditorialLedger
 CONTROL_ID = "main"
 LEDGER_ID = "hourly"
 WORKER_LOCK = 599916633322113
+CONFIGURATION_LOCK = 599916633322114
+
+
+def fence_editorial_configuration(session):
+    """Сериализация проверки настроек и приобретения lease, без снятия паузы."""
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": CONFIGURATION_LOCK})
+    else:
+        # SQLite locks even a zero-row UPDATE. Legacy installs may not yet have
+        # Control(main), but cannot race its creation with a new bridge lease.
+        session.execute(update(EditorialControl).where(EditorialControl.id == CONTROL_ID)
+                        .values(revision=EditorialControl.revision))
+
+
+def _assert_configuration_quiescent(session):
+    from .hub_models import BridgePost, Dispatch, Target
+    from .server_models import EditorialPreparationClaim
+    if any(target.paused is not True for target in session.scalars(select(Target).with_for_update())):
+        raise AgentError("MONITOR_COPY_TARGETS_NOT_PAUSED", 409)
+    dispatch = session.scalar(select(Dispatch).where(
+        Dispatch.state.in_({"sending", "unknown"}) | Dispatch.owner.is_not(None)
+        | (Dispatch.lease_until != 0) | Dispatch.lease_until.is_(None)).with_for_update())
+    bridge = session.scalar(select(BridgePost).where(
+        BridgePost.mutation_owner.is_not(None) | (BridgePost.mutation_until != 0)
+        | BridgePost.mutation_until.is_(None)).with_for_update())
+    claim = session.scalar(select(EditorialPreparationClaim).where(
+        EditorialPreparationClaim.active_key.is_not(None)
+        | EditorialPreparationClaim.state.in_({"selecting", "preparing", "running", "unknown",
+                                               "blocked_unknown", "failed"})).with_for_update())
+    if dispatch is not None or bridge is not None or claim is not None:
+        raise AgentError("ARTICLE_RECONCILIATION_REQUIRED", 409)
 
 
 def default_settings():
@@ -121,10 +152,12 @@ class ServerState:
             previous = row.runtime.get(channel, {})
             row.runtime = {**row.runtime, channel: {**previous, **details, "phase": phase, "heartbeat_at": now()}}
 
-    def control(self, action, revision, actor):
-        if action not in {"start", "pause"}:
+    def control(self, action, revision, actor, *, prepare_only=False):
+        if action not in {"start", "pause"} or type(prepare_only) is not bool or prepare_only and action != "start":
             raise AgentError("EDITORIAL_CONTROL_INVALID", 422)
         with self.core.db.session.begin() as session:
+            if prepare_only:
+                fence_editorial_configuration(session)
             row = session.scalar(select(EditorialControl).where(
                 EditorialControl.id == CONTROL_ID).with_for_update())
             if row is None or row.revision != revision:
@@ -135,17 +168,25 @@ class ServerState:
                 self.core._assert_current_route_runtime()
             row.paused, row.revision = action == "pause", row.revision + 1
             row.updated_at, row.updated_by = now(), actor
+            if prepare_only:
+                session.flush()
+                _assert_configuration_quiescent(session)
             if row.paused:
                 from .hub_models import Target
                 for target in session.scalars(select(Target).with_for_update()):
                     target.paused = True
             self.core.db.audit(session, actor, "editorial_control", CONTROL_ID,
-                               action_requested=action, revision=row.revision)
+                               action_requested=action, revision=row.revision,
+                               **({"prepare_only": True} if prepare_only else {}))
         return self.read()
 
-    def settings(self, value, revision, actor):
+    def settings(self, value, revision, actor, *, require_quiescent=False):
         value = validate_settings(value)
+        if type(require_quiescent) is not bool:
+            raise AgentError("EDITORIAL_SETTINGS_INVALID", 422)
         with self.core.db.session.begin() as session:
+            if require_quiescent:
+                fence_editorial_configuration(session)
             row = session.scalar(select(EditorialControl).where(
                 EditorialControl.id == CONTROL_ID).with_for_update())
             if row is None or row.revision != revision:
@@ -154,8 +195,12 @@ class ServerState:
                 raise AgentError("EDITORIAL_PAUSE_BEFORE_SETTINGS", 409)
             row.settings, row.revision = value, row.revision + 1
             row.updated_at, row.updated_by = now(), actor
+            if require_quiescent:
+                session.flush()
+                _assert_configuration_quiescent(session)
             self.core.db.audit(session, actor, "editorial_settings", CONTROL_ID,
-                               revision=row.revision, settings_hash=fingerprint(value))
+                               revision=row.revision, settings_hash=fingerprint(value),
+                               **({"quiescent_required": True} if require_quiescent else {}))
         return self.read()
 
     @contextmanager

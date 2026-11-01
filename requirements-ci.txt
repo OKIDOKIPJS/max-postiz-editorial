@@ -1,5 +1,5 @@
-# Dependabot-visible union of runtime, development and browser CI dependencies.
-# Keep exact versions synchronized with the three requirements*.lock inputs.
+# Dependabot-visible union of runtime, development, browser and deployment dependencies.
+# Keep exact versions synchronized with the four requirements*.lock inputs.
 alembic==1.20.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
@@ -43,6 +43,7 @@ pyproject_hooks==1.3.3
 pytest==9.1.1
 pytest-cov==7.1.0
 python-multipart==0.0.32
+PyYAML==6.0.3
 referencing==0.37.0
 rpds-py==2026.9.1
 ruff==0.16.10

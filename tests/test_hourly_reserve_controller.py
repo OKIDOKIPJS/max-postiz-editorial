@@ -197,14 +197,6 @@ def exercise_inflight(value, monkeypatch):
 @pytest.fixture
 def postgres_reserve(reserve_controller, monkeypatch):
     """Отдельная схема реального PG; рабочая БД не затрагивается."""
-    from pathlib import Path
-    if not os.getenv("TEST_DATABASE_URL"):
-        path = Path(__file__).resolve().parents[1] / "data/reserve-20261026/test-db.local.env"
-        if path.is_file():
-            for line in path.read_text(encoding="utf-8-sig").splitlines():
-                key, separator, value = line.partition("=")
-                if key.strip() == "TEST_DATABASE_URL" and separator:
-                    monkeypatch.setenv("TEST_DATABASE_URL", value.strip().strip('"').strip("'"))
     url = os.getenv("TEST_DATABASE_URL")
     if not url:
         pytest.skip("TEST_DATABASE_URL is not configured")

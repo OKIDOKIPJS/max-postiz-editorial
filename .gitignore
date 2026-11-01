@@ -28,6 +28,7 @@ config/image_sources.json
 config/comfy/workflow.json
 
 config/image_channels.json
+config/monitor.json
 
 config/holidays.json
 config/reddit_intake.json

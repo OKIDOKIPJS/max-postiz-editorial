@@ -51,7 +51,10 @@ def verify_created(page, settings, identity, chat_id, receipt):
 
 
 # Создаём канал и сверяем его фактическое появление.
-def create_channel(settings, name, description='', *, bind_channel=False, recover_chat_id=None):
+def create_channel(settings, name, description='', *, bind_channel=False, recover_chat_id=None,
+                   authorize_before_create=None):
+    if authorize_before_create is not None and (bind_channel or not callable(authorize_before_create)):
+        raise AgentError('BROWSER_CONFIG_CHANGED')
     # Обрабатываем ветвь при условии: settings.app['max']['adapter_mode'] != 'browser'.
     if settings.app['max']['adapter_mode'] != 'browser':
         raise AgentError('BROWSER_MODE_NOT_ENABLED')
@@ -100,7 +103,10 @@ def create_channel(settings, name, description='', *, bind_channel=False, recove
         if not button.is_enabled():
             raise AgentError('BROWSER_CHANNEL_CREATE_UNAVAILABLE')
         # Обрабатываем ветвь при условии: Settings.load(settings.root).hash != settings.hash.
-        if Settings.load(settings.root).hash != settings.hash:
+        if authorize_before_create is not None:
+            if bind_channel or authorize_before_create() is not True:
+                raise AgentError('BROWSER_CONFIG_CHANGED')
+        elif Settings.load(settings.root).hash != settings.hash:
             raise AgentError('BROWSER_CONFIG_CHANGED')
         # A crash or timeout after this record must never cause a second creation click.
         result = {'state': 'creating', **identity}

@@ -10,6 +10,7 @@ LOCK_FILES = (
     "requirements.lock",
     "requirements-dev.lock",
     "requirements-browser.lock",
+    "requirements-deployment.lock",
 )
 CI_MANIFEST = "requirements-ci.txt"
 # Только отдельный пакет с точной версией: без ranges, URL, extras, markers и -r.

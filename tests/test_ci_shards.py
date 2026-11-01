@@ -154,6 +154,33 @@ def test_wrapper_propagates_actual_pytest_exit_status(tmp_path, outcome, expecte
     assert saved["full_collection_hash"] == collection_hash(saved["full_nodeids"])
 
 
+def test_wrapper_imports_checkout_scripts_without_pythonpath_from_another_cwd(tmp_path):
+    repository = tmp_path / "synthetic-checkout"
+    scripts, tests = repository / "scripts", repository / "tests"
+    scripts.mkdir(parents=True)
+    tests.mkdir()
+    wrapper = scripts / "ci_pytest_shard.py"
+    wrapper.write_bytes(WRAPPER.read_bytes())
+    (scripts / "helper.py").write_text("VALUE = 'trusted-checkout-helper'\n", encoding="utf-8")
+    fixture = tests / "test_import.py"
+    fixture.write_text("from scripts.helper import VALUE\n\ndef test_import_from_checkout():\n"
+                       "    assert VALUE == 'trusted-checkout-helper'\n", encoding="utf-8")
+    receipt = repository / ".test-state/receipt.json"
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONUTF8="1")
+    result = subprocess.run([sys.executable, str(wrapper), "--shard-index", "0", "--shard-count", "1",
+        "--shard-receipt", str(receipt), "--rootdir", str(repository), "--confcutdir", str(repository),
+        str(fixture), "-q"], cwd=tmp_path, env=environment, capture_output=True,
+        text=True, encoding="utf-8", timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    saved = json.loads(receipt.read_text(encoding="utf-8"))
+    assert saved["exit_code"] == saved["tests_failed"] == 0 and saved["collection_completed"] is True
+    assert saved["total_count"] == saved["selected_count"] == 1
+    assert saved["full_nodeids"] == saved["selected_nodeids"] == ["tests/test_import.py::test_import_from_checkout"]
+    assert saved["full_collection_hash"] == collection_hash(saved["full_nodeids"])
+
+
 def test_wrapper_imports_project_namespace_helpers_like_python_m_pytest(tmp_path):
     project = tmp_path / "namespace-project"
     scripts = project / "scripts"
@@ -198,3 +225,42 @@ def test_wrapper_imports_project_namespace_helpers_like_python_m_pytest(tmp_path
     assert saved["full_nodeids"] == saved["selected_nodeids"] == nodeids
     assert saved["full_collection_hash"] == collection_hash(nodeids)
     assert (saved["total_count"], saved["selected_count"], saved["deselected_count"]) == (1, 1, 0)
+
+
+def test_actual_monitor_browser_collection_is_stable_across_fresh_processes(tmp_path):
+    allowed = {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP", "HOME", "USERPROFILE",
+               "LOCALAPPDATA", "APPDATA", "COMSPEC", "PATHEXT"}
+    environment = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    environment.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONUTF8="1")
+    receipts = []
+    for attempt in range(2):
+        receipt = tmp_path / f"collection-{attempt}.json"
+        # Collect the real module at independent import times; never run a browser fixture.
+        completed = subprocess.run(
+            [sys.executable, str(WRAPPER), "--shard-index", "0", "--shard-count", "4",
+             "--shard-receipt", str(receipt), "--collect-only", "-q",
+             "tests/test_monitor_browser.py"],
+            cwd=ROOT, env=environment, capture_output=True, text=True, encoding="utf-8",
+            timeout=60, check=False,
+        )
+        (tmp_path / f"collection-{attempt}.log").write_text(
+            completed.stdout + completed.stderr, encoding="utf-8")
+        assert completed.returncode == 0, "Actual monitor-browser collection failed; inspect collection log"
+        saved = json.loads(receipt.read_text(encoding="utf-8"))
+        assert saved["collection_completed"] and saved["exit_code"] == saved["tests_failed"] == 0
+        assert saved["full_collection_hash"] == collection_hash(saved["full_nodeids"])
+        expected = [nodeid for nodeid in saved["full_nodeids"]
+                    if int.from_bytes(hashlib.sha256(nodeid.encode("utf-8")).digest(), "big") % 4 == 0]
+        assert saved["selected_nodeids"] == expected
+        assert saved["total_count"] == len(saved["full_nodeids"]) > 11
+        assert saved["selected_count"] == len(expected)
+        assert sum("::test_unstable_identity_time_or_reply_is_not_exported[" in nodeid
+                   for nodeid in saved["full_nodeids"]) == 7
+        assert sum("::test_ambiguous_or_hidden_dom_fails_closed[" in nodeid
+                   for nodeid in saved["full_nodeids"]) == 4
+        receipts.append(saved)
+    first, second = receipts
+    assert first["full_collection_hash"] == second["full_collection_hash"], (
+        "Actual monitor-browser node IDs changed between independent imports")
+    assert first["full_nodeids"] == second["full_nodeids"]
+    assert first["selected_nodeids"] == second["selected_nodeids"]

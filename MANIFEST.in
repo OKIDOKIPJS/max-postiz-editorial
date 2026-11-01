@@ -15,6 +15,8 @@ recursive-include scripts *.py *.ps1 *.sh *.cjs
 recursive-include docs *.md *.json *.png
 recursive-include docs *.jpg
 include tests/conftest.py
+include tests/pg_test_contract.py
+include tests/vk_browser_test_clock.py
 recursive-include tests/fixtures *.json
 include tests/workstation-power-mocks.ps1
 recursive-include deployment *.py *.yaml *.yml *.md
@@ -22,6 +24,7 @@ recursive-include deployment *.json *.ts *.tsx *.cjs *.png Dockerfile .dockerign
 recursive-include deployment *.css
 recursive-include deployment Dockerfile.*
 recursive-include deployment *.sh *.service
+recursive-include deployment *.service.example
 recursive-include deployment *.conf
 recursive-include deployment *.path *.rules
 include deployment/translation/candle_t5_worker.rs

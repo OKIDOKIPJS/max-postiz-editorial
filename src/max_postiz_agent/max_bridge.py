@@ -443,6 +443,14 @@ class MaxBridge:
             self.sync(force=True)
         owner = release or uid()
         with self.core.db.session.begin() as s:
+            if not release:
+                # Настройки и новое право редактора сериализуются одним fence.
+                # Пауза не запрещает правку DRAFT; require_running здесь не нужен.
+                from .server_models import EditorialControl
+                from .server_state import CONTROL_ID, fence_editorial_configuration
+                fence_editorial_configuration(s)
+                s.scalar(select(EditorialControl).where(
+                    EditorialControl.id == CONTROL_ID).with_for_update())
             links = list(s.scalars(select(BridgePost).where((BridgePost.post_id.in_(identifiers)) | (BridgePost.group_id.in_(identifiers))).order_by(BridgePost.variant_id)))
             if compare and (len(links) != 1 or links[0].post_id != expected_post_id):
                 raise AgentError("BRIDGE_MUTATION_CAS_INVALID", 409)

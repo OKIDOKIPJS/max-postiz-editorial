@@ -55,7 +55,7 @@ export class EditorialController {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
   }
 
-  private async forward(request: EditorialRequest, route: 'state' | 'settings' | 'control' | 'routes' | 'route-action' | 'route-setup' | 'route-admin', method: string, body?: unknown, query = '') {
+  private async forward(request: EditorialRequest, route: 'state' | 'settings' | 'control' | 'routes' | 'route-action' | 'route-setup' | 'route-admin' | 'monitor' | 'monitor-preview', method: string, body?: unknown, query = '') {
     const identity = this.authorize(request, method !== 'GET');
     let url: URL;
     const key = process.env.EDITORIAL_INTERNAL_KEY;
@@ -280,6 +280,20 @@ export class EditorialController {
 
   @Get('/settings')
   settings(@Req() request: EditorialRequest) { return this.forward(request, 'settings', 'GET'); }
+
+  @Get('/monitor')
+  monitor(@Req() request: EditorialRequest) {
+    this.authorize(request, false);
+    if (Object.keys(request.query || {}).length) this.fail('INPUT_INVALID', 422);
+    return this.forward(request, 'monitor', 'GET');
+  }
+
+  @Get('/monitor-preview')
+  monitorPreview(@Req() request: EditorialRequest) {
+    this.authorize(request, false);
+    if (Object.keys(request.query || {}).length) this.fail('INPUT_INVALID', 422);
+    return this.forward(request, 'monitor-preview', 'GET');
+  }
 
   @Get('/routes')
   routes(@Req() request: EditorialRequest) {

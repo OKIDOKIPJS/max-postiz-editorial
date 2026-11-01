@@ -91,10 +91,10 @@ def main(argv=None):
     receipt = ShardReceipt(args.shard_index, args.shard_count, path, pytest_args)
     receipt.write()
     # Direct script execution starts at scripts/, unlike python -m pytest.
-    # Keep the caller's project root importable for namespace helpers as well.
-    working_directory = str(Path.cwd())
-    if not sys.path or sys.path[0] != working_directory:
-        sys.path.insert(0, working_directory)
+    # Keep the trusted checkout first and the caller's project namespace next,
+    # without adding the same root twice when invoked from the checkout.
+    import_roots = (str(Path(__file__).resolve().parents[1]), str(Path.cwd().resolve()))
+    sys.path[:] = list(dict.fromkeys((*import_roots, *sys.path)))
     # Failed tests, collection errors, interrupts and no-tests exit codes remain failures.
     result = int(pytest.main(pytest_args, plugins=[receipt]))
     # Usage errors can happen before pytest_sessionfinish is called.

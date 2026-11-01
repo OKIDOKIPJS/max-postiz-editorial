@@ -22,7 +22,9 @@ pytest_plugins = ["test_four_platform_hub"]
 
 
 @pytest.fixture
-def original_core(four_hub):
+def original_core(four_hub, monkeypatch):
+    # SQLite-копия не наследует endpoint реальных PG tests из общего запуска.
+    monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
     root = four_hub.settings.root
     mark_isolated(root, root.parent / "separate-source-reference")
     return four_hub
@@ -252,3 +254,14 @@ def test_cli_create_requires_flag_and_prints_no_text_or_approval(original_core, 
     assert result["approval_created"] is False and result["state"] == "review_pending"
     assert supplied["title"] not in output and supplied["body"] not in output
     assert counts(original_core)["hub_approvals"] == 0 and counts(original_core)["hub_dispatches"] == 0
+
+
+def test_cli_rejects_explicit_database_override_after_sqlite_fixture(original_core, monkeypatch, capsys):
+    root = original_core.settings.root
+    monkeypatch.setenv("TEST_DATABASE_URL", "postgresql+psycopg://fixture:synthetic@127.0.0.1:55450/editorial_hub_tests")
+    monkeypatch.setattr("max_postiz_agent.routes_cli.build", lambda _root: pytest.fail("Invalid endpoint reached build"))
+    before = counts(original_core)
+    assert main(["--root", str(root), "create-original", "telegram", "--file", str(root / "data/input.json"),
+                 "--attest-original"]) == 1
+    assert json.loads(capsys.readouterr().out)["code"] == "ISOLATED_DATABASE_REQUIRED"
+    assert counts(original_core) == before

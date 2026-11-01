@@ -76,6 +76,50 @@ def fake_gateway(calls, *, cold=None, failure=None):
     return lambda: httpx.MockTransport(handle)
 
 
+@pytest.mark.parametrize("route_id", ["hy_glossary", "madlad400_3b", "translategemma"])
+def test_gateway_adapter_preflights_both_fields_without_model_request(bench, inputs, route_id):
+    route = plan(bench, inputs)["routes"][route_id]
+    calls = []
+    adapter = bench.BenchmarkGatewayTranslator(route, fake_gateway(calls)())
+    try:
+        with pytest.raises(AgentError, match="TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT") as failed:
+            adapter.generate_text(json.dumps({"source_untrusted": {"title": "Title", "body": "X" * 1401}}))
+        evidence = failed.value.preflight_evidence
+        assert evidence["model"] == route["model"] and evidence["segment_chars"] == 1400
+        assert evidence["config_hash"] == fingerprint({
+            "model": route["model"], "base_url": route["base_url"],
+        })
+        assert evidence["no_model_requests"] is True and not calls
+    finally:
+        adapter.client.close()
+
+
+@pytest.mark.parametrize("base_url", ["http://127.0.0.1:9100", "http://127.0.0.1:9100/"])
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_gateway_proof_matches_production_raw_config_before_any_http(bench, base_url, field):
+    config = {"model": bench.HY_MODEL, "base_url": base_url}
+    calls = []
+    transport = fake_gateway(calls)
+    production = bench.DedicatedTranslator(config, transport=transport())
+    adapter = bench.BenchmarkGatewayTranslator(config, transport())
+    try:
+        assert adapter.config_hash == production.config_hash == fingerprint(config)
+        assert adapter.url == production.url == base_url.rstrip("/")
+        assert adapter.segment_chars == production.segment_chars == 1400
+        source = {"title": "Title", "body": "Source"}
+        source[field] = "X" * 1401
+        for translator in (production, adapter):
+            with pytest.raises(AgentError, match="TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT") as failed:
+                translator.generate_text(json.dumps({"source_untrusted": source}))
+            evidence = failed.value.preflight_evidence
+            assert evidence["config_hash"] == production.config_hash
+            assert evidence["model"] == bench.HY_MODEL and evidence["segment_chars"] == 1400
+            assert evidence["no_model_requests"] is True and not calls
+    finally:
+        adapter.client.close()
+        production.client.close()
+
+
 def test_dry_run_reports_all_80_tasks_and_real_segment_count_without_http_or_output(bench, inputs, capsys):
     root, corpus, routes, _, _ = inputs
     output = root / "data/report.local.jsonl"

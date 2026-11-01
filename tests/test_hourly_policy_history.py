@@ -7,9 +7,7 @@ import pytest
 from max_postiz_agent.article_cycle import HourlyArticleCycle
 from max_postiz_agent.article_sources import policy_for_record, registered_policies
 from max_postiz_agent.config import AgentError, fingerprint
-from test_article_sources import URLS, configured_sources
-
-pytest_plugins = ["test_article_sources"]
+from test_article_sources import URLS, base_policy as base_policy, configured_sources
 
 
 def save(settings, policy):

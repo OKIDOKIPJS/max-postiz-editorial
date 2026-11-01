@@ -9,19 +9,18 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from max_postiz_agent.adapters import Delivery
-from max_postiz_agent.cli import load_env
 from max_postiz_agent.config import Settings
 from max_postiz_agent.config import AgentError
 from max_postiz_agent.db import Database, uid
 from max_postiz_agent.hub import HubService
-from conftest import ROOT, write_topic
+from conftest import write_topic
 from test_hub import approve, variants
 
 
 @pytest.fixture
 def pg_hub(project):
     # Use a dedicated database and a random isolated schema, never the runtime schema.
-    load_env(ROOT)
+    # Только явное тестовое окружение; runtime .env.local здесь не читаем.
     url = os.getenv("TEST_DATABASE_URL")
     if not url:
         pytest.skip("TEST_DATABASE_URL is not configured")
