@@ -162,7 +162,7 @@ def _download(url, destination, claim_path, *, transport=None):
                     batch = ranges[offset:offset + 2]
                     futures = [executor.submit(part, a, b, etag, total) for a, b in batch]
                     results = [future.result() for future in futures]
-                    for (a, _), (raw, _, _) in zip(batch, results):
+                    for (a, _), (raw, _, _) in zip(batch, results, strict=True):
                         output.write(raw)
                         pieces.append({'start': a, 'bytes': len(raw), 'sha256': _sha(raw)})
         output.flush()

@@ -126,7 +126,8 @@ def test_fallback_source_reaches_http_as_bounded_complete_words_with_unchanged_e
     calls=[]
     body='Tiny introduction. '+('ordinary measured values ' * 65)+'https://science.example.test/item-17'
     def translate(request):
-        value=json.loads(request.content);calls.append(value['text'])
+        value=json.loads(request.content)
+        calls.append(value['text'])
         return httpx.Response(200,json={'model':MADLAD_MODEL,'complete':True,
             'text':value['text'],'metrics':metrics()})
     translator=DedicatedTranslator({'model':MADLAD_MODEL,'base_url':'http://127.0.0.1:8094','segment_chars':600},

@@ -7,7 +7,9 @@ import pytest
 from max_postiz_agent.article_cycle import HourlyArticleCycle
 from max_postiz_agent.article_sources import policy_for_record, registered_policies
 from max_postiz_agent.config import AgentError, fingerprint
-from test_article_sources import URLS, base_policy, configured_sources  # noqa: F401
+from test_article_sources import URLS, configured_sources
+
+pytest_plugins = ["test_article_sources"]
 
 
 def save(settings, policy):
@@ -49,19 +51,28 @@ def test_archive_cannot_replace_pinned_permissions_or_presentation(tmp_path, bas
     settings.root = tmp_path
     old = dict(base_policy)
     current = {**base_policy, 'max_source_age_hours': 43800}
-    if change == 'wrong_target': old['target_id'] = 'other'
-    if change == 'wrong_rights': old['rights_evidence'] = 'https://untrusted.invalid/'
-    if change == 'wrong_marker': old.update(presentation_contract='article-illustrated-v1', presentation_owner_instruction='Original owner quote')
+    if change == 'wrong_target':
+        old['target_id'] = 'other'
+    if change == 'wrong_rights':
+        old['rights_evidence'] = 'https://untrusted.invalid/'
+    if change == 'wrong_marker':
+        old.update(presentation_contract='article-illustrated-v1', presentation_owner_instruction='Original owner quote')
     path = save(settings, old)
     record = {'source_id': 'nasa_svs_articles', 'url': 'https://svs.gsfc.nasa.gov/12345/', 'policy_hash': fingerprint(old)}
-    if change == 'tamper': path.write_text('{}')
-    if change == 'duplicate_key': path.write_text('{"enabled":true,"enabled":false}')
-    if change == 'oversize': path.write_bytes(b'x' * (64 * 1024 + 1))
+    if change == 'tamper':
+        path.write_text('{}')
+    if change == 'duplicate_key':
+        path.write_text('{"enabled":true,"enabled":false}')
+    if change == 'oversize':
+        path.write_bytes(b'x' * (64 * 1024 + 1))
     if change == 'symlink':
         other = tmp_path / 'other.json'
-        other.write_bytes(path.read_bytes());path.unlink()
-        try: path.symlink_to(other)
-        except OSError: pytest.skip('Symlink privilege unavailable on this host')
+        other.write_bytes(path.read_bytes())
+        path.unlink()
+        try:
+            path.symlink_to(other)
+        except OSError:
+            pytest.skip('Symlink privilege unavailable on this host')
     with pytest.raises(AgentError, match='ARTICLE_POLICY_HISTORY_INVALID'):
         policy_for_record(current, settings, record)
 

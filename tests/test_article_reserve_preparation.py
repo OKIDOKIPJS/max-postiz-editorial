@@ -495,26 +495,40 @@ def test_preflight_classification_never_waives_other_routes_unknowns_or_changed_
     value = reserve
     claim, original, error, calls = captured_preflight(value, monkeypatch)
     path = value.core.settings.root / original["quality_trace"]
-    if damage == "old_generic": error = AgentError("TRANSLATION_UNSPLITTABLE_INPUT")
-    elif damage == "code_only": error = AgentError("TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT")
-    elif damage == "alien_model": error.preflight_evidence["model"] = "hy-mt2-7b-q8"
-    elif damage == "unknown_requests": error.preflight_evidence["no_model_requests"] = False
-    elif damage == "proof_source": error.preflight_evidence["source_hash"] = "0" * 64
-    elif damage == "proof_config": error.preflight_evidence["config_hash"] = "0" * 64
-    elif damage == "failed_field": error.preflight_evidence["failed_field"] = "title"
-    elif damage == "config": (value.core.settings.root / "config/translation.json").write_text("{}")
-    elif damage == "input": (value.core.settings.root / original["input_file"]).write_bytes(b"{}")
+    if damage == "old_generic":
+        error = AgentError("TRANSLATION_UNSPLITTABLE_INPUT")
+    elif damage == "code_only":
+        error = AgentError("TRANSLATION_PREFLIGHT_UNSPLITTABLE_INPUT")
+    elif damage == "alien_model":
+        error.preflight_evidence["model"] = "hy-mt2-7b-q8"
+    elif damage == "unknown_requests":
+        error.preflight_evidence["no_model_requests"] = False
+    elif damage == "proof_source":
+        error.preflight_evidence["source_hash"] = "0" * 64
+    elif damage == "proof_config":
+        error.preflight_evidence["config_hash"] = "0" * 64
+    elif damage == "failed_field":
+        error.preflight_evidence["failed_field"] = "title"
+    elif damage == "config":
+        (value.core.settings.root / "config/translation.json").write_text("{}")
+    elif damage == "input":
+        (value.core.settings.root / original["input_file"]).write_bytes(b"{}")
     elif damage.startswith("trace_"):
         events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-        if damage == "trace_returned": events.insert(1, {**events[0], "phase": "translation_returned", "raw": "unexpected"})
-        elif damage == "trace_error": events[1]["error"] = "TRANSLATION_SERVICE_UNAVAILABLE"
-        else: events[0]["at"] = events[1]["at"] + 1
+        if damage == "trace_returned":
+            events.insert(1, {**events[0], "phase": "translation_returned", "raw": "unexpected"})
+        elif damage == "trace_error":
+            events[1]["error"] = "TRANSLATION_SERVICE_UNAVAILABLE"
+        else:
+            events[0]["at"] = events[1]["at"] + 1
         path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8")
-    elif damage == "claim": claim = {**claim, "token": "changed"}
+    elif damage == "claim":
+        claim = {**claim, "token": "changed"}
     elif damage == "blocked_claim":
         with value.core.db.session.begin() as session:
             session.get(EditorialPreparationClaim, claim["id"]).state = "blocked_unknown"
-    elif damage == "factory": value.cycle.quality_factory = lambda: None
+    elif damage == "factory":
+        value.cycle.quality_factory = lambda: None
     elif damage in {"native_binding", "native_attempt"}:
         with value.core.db.session.begin() as session:
             action = "article_reserve_preparation_binding" if damage == "native_binding" else "hourly_article_prepare_attempt"
@@ -522,8 +536,10 @@ def test_preflight_classification_never_waives_other_routes_unknowns_or_changed_
     else:
         ledger = value.cycle._load()
         record = value.cycle._record(ledger, original["id"])
-        if damage == "repair": record["automatic_repair_attempts"] = [{"state": "failed"}]
-        else: record["postiz_id"] = "unexpected"
+        if damage == "repair":
+            record["automatic_repair_attempts"] = [{"state": "failed"}]
+        else:
+            record["postiz_id"] = "unexpected"
         value.cycle._save(ledger)
     before = copy.deepcopy(value.cycle._load())
     with pytest.raises(AgentError):
@@ -661,7 +677,8 @@ def test_semantic_eligibility_cancel_preserves_true_machine_verdict_raw_variant_
     from max_postiz_agent.server_models import EditorialPreparationClaim
     value = request.getfixturevalue("reserve_pg" if backend == "postgres" else "reserve")
     claim, record, calls = accepted_mass_candidate(value, monkeypatch, close_claim=not active)
-    trace = value.core.settings.root / record["quality_trace"]; raw = trace.read_bytes()
+    trace = value.core.settings.root / record["quality_trace"]
+    raw = trace.read_bytes()
     with value.core.db.session() as s:
         before = copy.deepcopy(s.get(Variant, record["variant_id"]).metadata_json)
         body = s.get(Variant, record["variant_id"]).body
@@ -672,10 +689,13 @@ def test_semantic_eligibility_cancel_preserves_true_machine_verdict_raw_variant_
     assert trace.read_bytes() == raw and final["preparation_attempts"] == record["preparation_attempts"]
     assert len(calls) == 1 and not value.writes
     with value.core.db.session() as s:
-        v = s.get(Variant, record["variant_id"]); p = s.get(EditorialPreparationClaim, claim["id"])
+        v = s.get(Variant, record["variant_id"])
+        p = s.get(EditorialPreparationClaim, claim["id"])
         assert v.body == body and v.metadata_json == before and before["machine_review_evidence"]["review"]["approved"] is True
-        if active: assert p.state == "rejected" and p.active_key is None
-        else: assert {k: getattr(p, k) for k in closed} == closed
+        if active:
+            assert p.state == "rejected" and p.active_key is None
+        else:
+            assert {k: getattr(p, k) for k in closed} == closed
         a = s.query(Audit).filter_by(entity=record["id"], action="reserve_semantic_publication_ineligible").one()
         assert a.details["machine_verdict_preserved"] is True and a.details["model_calls"] == 0
         assert s.query(Dispatch).count() == s.query(TargetApproval).count() == s.query(RemoteDraft).count() == 0
@@ -688,20 +708,28 @@ def test_semantic_disqualification_cannot_waive_unknown_or_stale_binding(reserve
     claim, record, calls = accepted_mass_candidate(value, monkeypatch, close_claim=True)
     if damage in {"trace", "input"}:
         name = record["quality_trace"] if damage == "trace" else record["input_file"]
-        path = value.core.settings.root / name; path.write_bytes(path.read_bytes() + b" ")
+        path = value.core.settings.root / name
+        path.write_bytes(path.read_bytes() + b" ")
     elif damage == "claim":
-        with value.core.db.session.begin() as s: s.get(EditorialPreparationClaim, claim["id"]).state = "blocked_unknown"
+        with value.core.db.session.begin() as s:
+            s.get(EditorialPreparationClaim, claim["id"]).state = "blocked_unknown"
     elif damage == "snapshot":
         with value.core.db.session.begin() as s:
-            v = s.get(Variant, record["variant_id"]); v.metadata_json = {**v.metadata_json, "changed": True}
+            v = s.get(Variant, record["variant_id"])
+            v.metadata_json = {**v.metadata_json, "changed": True}
     else:
-        ledger = value.cycle._load(); r = value.cycle._record(ledger, record["id"])
-        if damage == "unknown": r["model_result_unknown"] = True
-        elif damage == "repair": r["automatic_repair_attempts"] = [{"state": "correcting"}]
-        else: r["postiz_id"] = "unexpected"
+        ledger = value.cycle._load()
+        r = value.cycle._record(ledger, record["id"])
+        if damage == "unknown":
+            r["model_result_unknown"] = True
+        elif damage == "repair":
+            r["automatic_repair_attempts"] = [{"state": "correcting"}]
+        else:
+            r["postiz_id"] = "unexpected"
         value.cycle._save(ledger)
     before = copy.deepcopy(value.cycle._load())
-    with pytest.raises(AgentError): value.store.disqualify_semantic_ready(record["id"], cycle=value.cycle)
+    with pytest.raises(AgentError):
+        value.store.disqualify_semantic_ready(record["id"], cycle=value.cycle)
     assert value.cycle._load() == before and len(calls) == 1 and not value.writes
 
 
@@ -720,10 +748,12 @@ def test_fresh_mass_inversion_is_rejected_before_claim_can_become_available_read
 def test_ready_cleanup_precedes_capacity_and_preserves_another_pending_dispatch_and_good_stock(reserve_controller, monkeypatch):
     from max_postiz_agent.server_models import EditorialControl, PublicationSlot
     value = reserve_controller
-    value.controller.prepare_once(); value.controller.run_once()
+    value.controller.prepare_once()
+    value.controller.run_once()
     extra = {**value.article, "url": value.article["url"].rstrip("/") + "/extra-ready/",
              "original": value.article["original"] + " Additional observations are retained in the complete report."}
-    extra_claim = value.store.begin_preparation(); good = value.cycle.prepare(extra, reserve_claim=extra_claim)
+    extra_claim = value.store.begin_preparation()
+    good = value.cycle.prepare(extra, reserve_claim=extra_claim)
     value.store.finish_preparation(extra_claim, "quality_ready")
     claim, bad, calls = accepted_mass_candidate(value, monkeypatch, close_claim=True)
     with value.core.db.session.begin() as s:
@@ -735,7 +765,8 @@ def test_ready_cleanup_precedes_capacity_and_preserves_another_pending_dispatch_
         pending_before = {k: copy.deepcopy(getattr(pending, k)) for k in ("id", "state", "snapshot", "due_at", "attempts")}
         slot = s.query(PublicationSlot).filter_by(dispatch_id=pending.id).one()
         slot_before = {k: copy.deepcopy(getattr(slot, k)) for k in ("id", "record_id", "due_at", "state", "token")}
-    writes = copy.deepcopy(value.writes); value.controller._refilling = False
+    writes = copy.deepcopy(value.writes)
+    value.controller._refilling = False
     value.controller.selector = lambda *_args, **_kwargs: None
     assert value.controller.prepare_once()["phase"] == "no_source"
     records = value.cycle._load()["records"]
@@ -743,7 +774,8 @@ def test_ready_cleanup_precedes_capacity_and_preserves_another_pending_dispatch_
     assert value.cycle._record({"records": records}, good["id"])["state"] == "quality_ready"
     assert value.writes == writes and len(calls) == 1
     with value.core.db.session() as s:
-        d = s.get(Dispatch, pending_before["id"]); slot = s.get(PublicationSlot, slot_before["id"])
+        d = s.get(Dispatch, pending_before["id"])
+        slot = s.get(PublicationSlot, slot_before["id"])
         assert {k: getattr(d, k) for k in pending_before} == pending_before
         assert {k: getattr(slot, k) for k in slot_before} == slot_before
 
@@ -753,7 +785,8 @@ def test_sender_skips_owned_ready_candidate_before_closed_validation_then_produc
     value = reserve_controller
     claim, record, calls = accepted_mass_candidate(value, monkeypatch, close_claim=False)
     owned = copy.deepcopy(value.store.active_preparation())
-    trace = value.core.settings.root / record["quality_trace"]; raw = trace.read_bytes()
+    trace = value.core.settings.root / record["quality_trace"]
+    raw = trace.read_bytes()
     assert value.controller.run_once()["phase"] == "reserve_empty"
     assert value.store.active_preparation() == owned and trace.read_bytes() == raw
     with value.core.db.session() as s:

@@ -1,5 +1,34 @@
 # История версий
 
+## 0.11.7 — 2026-11-01: GitHub CI и защита main
+
+- Добавлены обязательные проверки GitHub Actions: Ruff, совместимость зависимостей,
+  сборка wheel/sdist, полный pytest с Chrome на Windows/Linux, отдельная одноразовая
+  PostgreSQL 17 и пять Node suites Postiz на обеих ОС. Агрегатор `CI required`
+  отклоняет failed/cancelled/skipped jobs; Actions закреплены по точным commit SHA,
+  token имеет только чтение, JUnit/coverage сохраняются на семь дней.
+- Node tooling отделён от OpenCode runtime и закреплён lock-файлом. CAS guard
+  компилируется только во временной копии с проверкой source/compiled SHA;
+  все suites обязательны, пропуски запрещены. Нормализация LF воспроизводит Git
+  blobs на Windows, не переписывая исходники и не обращаясь к Docker/серверу.
+- Добавлены Dependabot для Python, npm и Actions, а также декларативный ruleset:
+  PR, успешный `CI required` именно от GitHub Actions, актуальная база, CodeQL,
+  запрет force push/удаления main и обязательное закрытие обсуждений. Для одного
+  владельца не требуется чужой approving review; bypass не предусмотрен.
+- В GitHub включены Dependabot alerts/security updates, Secret scanning,
+  Push protection и CodeQL Python/JavaScript/TypeScript. Первый CodeQL baseline
+  завершился успешно и сохранил 45 открытых alerts (2 critical, 42 high, 1 medium).
+  Они не подавлялись и требуют отдельного разбора; успешный scan не означает
+  отсутствие уязвимостей. CodeQL merge protection оценивает находки PR diff.
+- Исправлены 55 нарушений существующего Ruff без ослабления правил: многооператорные
+  строки тестов, регистрация pytest fixtures, явная строгость zip и имя неиспользуемого
+  значения при сохранении обязательного чтения `payload["chat_id"]`.
+- Локально: зависимости установлены в отдельную .venv; pip check и wheel/sdist
+  прошли; Node 89 passed, 0 failed/skipped; CAS 81 mocked checks; npm audit tooling
+  не нашёл уязвимостей. Полные GitHub jobs и применение ruleset проверяются отдельно.
+  Версия runtime-пакета не менялась; работающая VM, её БД, очереди, публикации,
+  модели и существующие локальные checkout не изменялись.
+
 ## 0.11.7 — 2026-10-30: установка, закрытие старого unknown и фактическая доставка
 
 - Итоговый код прошёл изолированную Linux/PostgreSQL qa-v25: 745 passed в 23

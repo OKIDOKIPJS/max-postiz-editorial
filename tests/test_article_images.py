@@ -663,7 +663,8 @@ def test_rotated_exif_does_not_pass_without_byte_preserving_orientation(illustra
     value = illustration
     output = io.BytesIO()
     image = Image.new("RGB", (1600, 900), "navy")
-    exif = image.getexif(); exif[274] = 6
+    exif = image.getexif()
+    exif[274] = 6
     image.save(output, format="JPEG", exif=exif)
     transport, calls, _ = download(value, raw=output.getvalue())
     with pytest.raises(AgentError, match="ARTICLE_IMAGE_QUALITY_REQUIRED"):
