@@ -741,19 +741,27 @@ test('delivery labels require persistent evidence kinds and never promote fixtur
 });
 
 test('historical fixture badge survives a target changing to live and has no publication link', () => {
-  const React = require(path.join(tooling, 'react'));
   const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
   const ui = routeUi();
+  const anchors = node => !node || typeof node !== 'object' ? [] : Array.isArray(node)
+    ? node.flatMap(anchors) : [...(node.type === 'a' ? [node] : []), ...anchors(node.props?.children)];
+  const dispatch = { id: 'fixture-history', target_id: 'vk_target', title: 'Local fixture', state: 'published',
+    due_at: 1867111200, verified: true, evidence_kind: 'fixture', attempts: 1,
+    snapshot_hash: 'e'.repeat(64), permalink: 'https://vk.ru/wall123456_51' };
   for (const adapter_mode of ['fixture', 'browser', 'live']) {
-    const markup = renderToStaticMarkup(React.createElement(ui.EditorialRoutes, { pending: false,
-      inventory: { targets: [{ ...routeTarget, adapter_mode, route: 'vk_browser' }], variants: [], dispatches: [{
-        id: 'fixture-history', target_id: 'vk_target', title: 'Local fixture', state: 'published',
-        due_at: 1867111200, verified: true, evidence_kind: 'fixture', attempts: 1,
-        snapshot_hash: 'e'.repeat(64), permalink: 'https://vk.ru/wall123456_51' }] }, onAction: async () => true }));
+    const tree = ui.EditorialRoutes({ pending: false,
+      inventory: { targets: [{ ...routeTarget, adapter_mode, route: 'vk_browser' }], variants: [], dispatches: [dispatch] },
+      onAction: async () => true });
+    const markup = renderToStaticMarkup(tree);
     assert.ok(markup.includes('Локальная проверка; живая доставка не проверена'));
     assert.ok(!markup.includes('API-квитанция')); assert.ok(!markup.includes('Доставка подтверждена'));
-    assert.ok(!markup.includes('Открыть публикацию')); assert.ok(!markup.includes('https://vk.ru/wall123456_51'));
+    assert.ok(!markup.includes('Открыть публикацию'));
+    assert.deepEqual(anchors(tree).map(anchor => anchor.props.href), []);
   }
+  const verified = ui.EditorialRoutes({ pending: false,
+    inventory: { targets: [{ ...routeTarget, adapter_mode: 'live', route: 'vk_browser' }], variants: [],
+      dispatches: [{ ...dispatch, evidence_kind: 'independent_readback' }] }, onAction: async () => true });
+  assert.deepEqual(anchors(verified).map(anchor => anchor.props.href), [dispatch.permalink]);
 });
 
 test('historical recipient comes only from the dispatch snapshot after target destination changes', () => {

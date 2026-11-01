@@ -3,6 +3,7 @@
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 import pytest
@@ -13,6 +14,7 @@ from max_postiz_agent.adapters import Delivery
 from max_postiz_agent.db import Database, uid
 from max_postiz_agent.hub import HubService
 from max_postiz_agent.hub_models import Dispatch
+from pg_test_contract import CONTRACT_ENV, endpoint_spec, verify_identity
 
 pytest_plugins = ["test_four_platform_hub"]
 
@@ -20,11 +22,21 @@ pytest_plugins = ["test_four_platform_hub"]
 @pytest.fixture
 def postgres_routes(four_hub):
     url = os.getenv("TEST_DATABASE_URL", "")
-    parsed = urlsplit(url)
-    if (not url or parsed.hostname not in {"127.0.0.1", "localhost"}
-            or parsed.port != 55448 or parsed.path != "/editorial_hub_tests"):
-        pytest.skip("Dedicated copy-local PostgreSQL 55448 is not configured")
+    explicit = os.getenv(CONTRACT_ENV)
+    contract = endpoint_spec("routes", url, Path(__file__).resolve().parents[1]) if explicit else None
+    if contract is None:
+        parsed = urlsplit(url)
+        if (not url or parsed.hostname not in {"127.0.0.1", "localhost"}
+                or parsed.port != 55448 or parsed.path != "/editorial_hub_tests"):
+            pytest.skip("Dedicated copy-local PostgreSQL 55448 is not configured")
     admin = create_engine(url)
+    if contract is not None:
+        try:
+            with admin.connect() as connection:
+                verify_identity(connection, contract)
+        except Exception:
+            admin.dispose()
+            raise
     schema = "routes_test_" + uid().replace("-", "")
     with admin.begin() as connection:
         connection.execute(text('CREATE SCHEMA "' + schema + '"'))

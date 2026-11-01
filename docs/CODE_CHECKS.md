@@ -1,5 +1,31 @@
 # Проверка и исправление кода
 
+## Интеграция 0.13.3, 1 ноября 2026
+
+Код включает main с обновлёнными dependency pins, исправления 0.11.11,
+четыре маршрута и мониторинг. Используйте новую `.venv` текущего checkout;
+окружения соседних копий и рабочего сервера обновлять не требуется.
+
+`python scripts/check.py` очищает также переменные выделенных PG-проверок.
+`python scripts/check.py --postgres` с явно заданным отдельным тестовым URL
+проверяет полный набор. Новые route/monitor PostgreSQL-контракты дополнительно
+запускает `python scripts/check_ci_postgres.py`: пропущенный обязательный тест
+не считается успехом. CI создаёт два отдельных временных PostgreSQL 17 service,
+без подключения к рабочей редакции.
+
+Для локальной интеграционной приёмки предусмотрен явный контракт
+`MAX_POSTIZ_PG_TEST_CONTRACT=monitor-main-integration-v1`: только loopback
+55450/55451, БД `editorial_hub_tests`, разные system identifiers, точные labels
+`codex-max-integration-routes-qa` / `codex-max-integration-monitor-qa` и каталоги
+`data/postgres-qa-routes/cluster` / `data/postgres-qa-monitor/cluster` этого checkout.
+URL задаются через `TEST_DATABASE_URL` и `MONITOR_OWNED_PG_TEST_URL` и не печатаются.
+По этому контракту единая команда дополнительно требует минимум один route
+и девять monitor PG-cases без skips. Прежние локальные guards сохранены;
+обычный `--postgres` не получает разрешения на произвольные новые endpoints.
+
+Проверки используют синтетические данные. Обновление исходников, успешный build
+и тесты не являются установкой на сервер или доказательством живой публикации.
+
 ## Установленная версия 31 октября 2026
 
 0.11.10 установлена на рабочую VM, API/package metadata и runtime127

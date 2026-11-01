@@ -13,6 +13,7 @@ recursive-include scripts *.py *.ps1 *.sh
 recursive-include docs *.md *.json *.png
 recursive-include docs *.jpg
 include tests/conftest.py
+include tests/pg_test_contract.py
 recursive-include tests/fixtures *.json
 include tests/workstation-power-mocks.ps1
 recursive-include deployment *.py *.yaml *.yml *.md

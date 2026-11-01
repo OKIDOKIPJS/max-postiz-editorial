@@ -8,6 +8,7 @@ import copy
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 import pytest
@@ -22,6 +23,7 @@ from max_postiz_agent.server_models import EditorialControl, EditorialLedger, Ed
 from max_postiz_agent.server_state import (
     CONFIGURATION_LOCK, CONTROL_ID, LEDGER_ID, ServerState, fence_editorial_configuration,
 )
+from pg_test_contract import CONTRACT_ENV, endpoint_spec, verify_identity
 
 pytest_plugins = ["test_max_bridge"]
 
@@ -29,17 +31,27 @@ pytest_plugins = ["test_max_bridge"]
 @pytest.fixture
 def owned_pg_bridge(bridge):
     url = os.getenv("MONITOR_OWNED_PG_TEST_URL", "")
-    if not url:
+    explicit = os.getenv(CONTRACT_ENV)
+    if not url and not explicit:
         pytest.skip("Owned monitor PostgreSQL QA is not configured")
-    parsed = urlsplit(url)
-    if (parsed.scheme != "postgresql+psycopg" or parsed.hostname != "127.0.0.1"
-            or parsed.port != 55449 or parsed.path != "/editorial_hub_tests"
-            or parsed.query or parsed.fragment):
-        pytest.fail("Owned QA endpoint does not match the dedicated loopback test cluster")
+    contract = endpoint_spec("monitor", url, Path(__file__).resolve().parents[1]) if explicit else None
+    if contract is None:
+        parsed = urlsplit(url)
+        if (parsed.scheme != "postgresql+psycopg" or parsed.hostname != "127.0.0.1"
+                or parsed.port != 55449 or parsed.path != "/editorial_hub_tests"
+                or parsed.query or parsed.fragment):
+            pytest.fail("Owned QA endpoint does not match the dedicated loopback test cluster")
     admin = create_engine(url, pool_pre_ping=True)
-    with admin.connect() as connection:
-        assert connection.scalar(text("SELECT current_setting('cluster_name')")) == "codex-max-monitor-qa"
-        assert 170000 <= int(connection.scalar(text("SHOW server_version_num"))) < 180000
+    try:
+        with admin.connect() as connection:
+            if contract is not None:
+                verify_identity(connection, contract)
+            else:
+                assert connection.scalar(text("SELECT current_setting('cluster_name')")) == "codex-max-monitor-qa"
+                assert 170000 <= int(connection.scalar(text("SHOW server_version_num"))) < 180000
+    except Exception:
+        admin.dispose()
+        raise
     schema = "monitor_configuration_" + uid().replace("-", "")
     with admin.begin() as connection:
         connection.execute(text('CREATE SCHEMA "' + schema + '"'))

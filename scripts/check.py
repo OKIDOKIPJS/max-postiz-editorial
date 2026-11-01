@@ -44,7 +44,12 @@ def test_environment(environ: dict[str, str], *, postgres: bool) -> dict[str, st
     for key in ("DATABASE_URL", "PYTHONPATH", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
         env.pop(key, None)
     if not postgres:
-        env.pop("TEST_DATABASE_URL", None)
+        for key in (
+            "TEST_DATABASE_URL",
+            "MONITOR_OWNED_PG_TEST_URL",
+            "MAX_POSTIZ_PG_TEST_CONTRACT",
+        ):
+            env.pop(key, None)
     env.update(PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     return env
 
@@ -159,6 +164,27 @@ def junit_summary(path: Path) -> dict:
     }
 
 
+def owned_postgres_summary(path: Path) -> dict:
+    """Явный новый PG-контракт не может стать зелёным через пропуски его тестов."""
+    cases = list(ET.parse(path).getroot().iter("testcase"))  # noqa: S314 -- локальный pytest
+    groups = {}
+    for name, minimum in (
+        ("test_route_dispatch_postgres", 1),
+        ("test_monitor_configuration_postgres", 9),
+    ):
+        selected = [case for case in cases if case.get("classname", "").split(".")[-1] == name]
+        passed = sum(
+            not any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+            for case in selected
+        )
+        if len(selected) < minimum or passed != len(selected):
+            raise ValueError(
+                "Required isolated route/monitor PostgreSQL cases missing or not passed"
+            )
+        groups[name] = {"total": len(selected), "passed": passed}
+    return groups
+
+
 class Checks:
     def __init__(self, root: Path, directory: Path, env: dict[str, str]):
         self.root, self.directory, self.env = root, directory, env
@@ -237,6 +263,11 @@ def run(root: Path, *, postgres: bool) -> int:
             "javascript-" + Path(asset).stem,
             [shutil.which("node"), "--check", "src/max_postiz_agent/" + asset],
         )
+    owned_preflight = None
+    if postgres and env.get("MAX_POSTIZ_PG_TEST_CONTRACT"):
+        owned_preflight = checks.stage(
+            "owned-postgres-preflight", python + ["scripts/check_ci_postgres.py"], timeout=60
+        )
     browser = checks.stage(
         "browser",
         python
@@ -252,7 +283,9 @@ def run(root: Path, *, postgres: bool) -> int:
         timeout=60,
     )
     xml = directory / "tests.xml"
-    if browser["status"] == "passed":
+    if browser["status"] == "passed" and (
+        owned_preflight is None or owned_preflight["status"] == "passed"
+    ):
         temporary = directory / "pytest"
         tests = checks.stage(
             "tests",
@@ -271,6 +304,8 @@ def run(root: Path, *, postgres: bool) -> int:
         if xml.is_file():
             try:
                 summary = report["tests"] = junit_summary(xml)
+                if postgres and env.get("MAX_POSTIZ_PG_TEST_CONTRACT"):
+                    report["owned_postgres_tests"] = owned_postgres_summary(xml)
                 if (
                     summary["failed"]
                     or summary["errors"]
@@ -286,15 +321,23 @@ def run(root: Path, *, postgres: bool) -> int:
                         error="Failed/empty test suite or PostgreSQL tests skipped",
                     )
                 print("Tests: " + json.dumps(summary, ensure_ascii=False), flush=True)
-            except (ET.ParseError, OSError):
-                tests.update(status="failed", exit_code=1, error="Invalid pytest report")
+            except (ET.ParseError, OSError, ValueError):
+                tests.update(
+                    status="failed",
+                    exit_code=1,
+                    error="Invalid pytest report or incomplete isolated PostgreSQL coverage",
+                )
         elif tests["status"] == "passed":
             tests.update(status="failed", exit_code=1, error="Missing pytest report")
         if tests.get("error"):
             print("[FAILED] tests validation: " + tests["error"], flush=True)
     else:
         checks.results.append(
-            {"name": "tests", "status": "blocked", "error": "Chrome preflight failed"}
+            {
+                "name": "tests",
+                "status": "blocked",
+                "error": "Chrome or owned PostgreSQL preflight failed",
+            }
         )
     checks.stage("diff", [shutil.which("git"), "diff", "--check"])
     report.update(

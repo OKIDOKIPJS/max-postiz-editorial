@@ -47,6 +47,8 @@ def test_local_mode_does_not_forward_runtime_or_test_database_or_pytest_override
         "PATH": "tools",
         "DATABASE_URL": "runtime-private",
         "TEST_DATABASE_URL": "test-private",
+        "MONITOR_OWNED_PG_TEST_URL": "owned-test-private",
+        "MAX_POSTIZ_PG_TEST_CONTRACT": "monitor-main-integration-v1",
         "PYTHONPATH": "other-checkout",
         "PYTEST_ADDOPTS": "--collect-only",
         "PYTEST_PLUGINS": "injected",
@@ -67,6 +69,53 @@ def test_postgres_mode_forwards_only_explicit_test_url():
 
 def test_contracts_verify_current_checkout_and_all_locks(checkout):
     assert check.contracts(checkout) == {"package_version": "1.2.3", "locked_dependencies": 1}
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "skipped", "failure", "error"])
+def test_owned_postgres_report_requires_both_suites_without_skips(tmp_path, damage):
+    cases = ['<testcase classname="tests.test_route_dispatch_postgres" name="claim"/>']
+    for index in range(9):
+        marker = "" if damage not in {"skipped", "failure", "error"} or index else f"<{damage}/>"
+        cases.append(
+            '<testcase classname="tests.test_monitor_configuration_postgres" '
+            f'name="fence_{index}">{marker}</testcase>'
+        )
+    if damage == "missing":
+        cases.pop()
+    path = tmp_path / "junit.xml"
+    path.write_text("<testsuites><testsuite>" + "".join(cases) + "</testsuite></testsuites>")
+    if damage is None:
+        assert check.owned_postgres_summary(path) == {
+            "test_route_dispatch_postgres": {"total": 1, "passed": 1},
+            "test_monitor_configuration_postgres": {"total": 9, "passed": 9},
+        }
+    else:
+        with pytest.raises(ValueError, match="PostgreSQL cases missing or not passed"):
+            check.owned_postgres_summary(path)
+
+
+def test_owned_postgres_identity_failure_blocks_all_pytest_before_database_mutations(
+    checkout, monkeypatch
+):
+    monkeypatch.setenv("MAX_POSTIZ_PG_TEST_CONTRACT", "monitor-main-integration-v1")
+    monkeypatch.setenv("TEST_DATABASE_URL", "explicit-test-database")
+    monkeypatch.setattr(check, "postgres_ready", lambda url: None)
+    executed = []
+
+    def execute(command, **kwargs):
+        stage = Path(kwargs["stdout"].name).stem
+        executed.append(stage)
+        assert "pytest" not in command
+        return SimpleNamespace(returncode=int(stage == "owned-postgres-preflight"))
+
+    monkeypatch.setattr(check.subprocess, "run", execute)
+    assert check.run(checkout, postgres=True) == 1
+    assert "owned-postgres-preflight" in executed and "tests" not in executed
+    report = json.loads(next((checkout / "data/check-runs").glob("*/report.json")).read_text())
+    assert report["status"] == "failed"
+    assert (
+        next(stage for stage in report["stages"] if stage["name"] == "tests")["status"] == "blocked"
+    )
 
 
 @pytest.mark.parametrize(

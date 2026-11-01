@@ -53,6 +53,10 @@ function main() {
     const fixtureAdapter = path.join(temporary, 'adapter');
     fs.mkdirSync(fixtureAdapter);
     for (const entry of fs.readdirSync(adapter, { withFileTypes: true })) {
+      if (entry.isFile() && path.extname(entry.name) === '.png') {
+        fs.copyFileSync(path.join(adapter, entry.name), path.join(fixtureAdapter, entry.name), fs.constants.COPYFILE_EXCL);
+        continue;
+      }
       if (!entry.isFile() || !(entry.name.startsWith('Dockerfile') ||
           ['.cjs', '.ts', '.tsx', '.json', '.css'].includes(path.extname(entry.name)))) continue;
       fs.writeFileSync(path.join(fixtureAdapter, entry.name),
@@ -66,6 +70,7 @@ function main() {
       'test-editorial-contract.cjs',
       'test-provider-reliability-build.cjs',
       'test-provider-unavailable.cjs',
+      'test-production-build.cjs',
     ];
     assert.deepEqual(fs.readdirSync(adapter).filter(name => /^test-.*\.cjs$/.test(name)).sort(),
       [...suites].sort(), 'Update the CI runner when adding a Node contract suite');

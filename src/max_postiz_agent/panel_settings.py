@@ -69,7 +69,7 @@ def workflow_target(root, app):
     protected = {"config/app.json", "config/sources.json", "config/image_sources.json",
                  PROFILE_FILE, "config/holidays.json", "config/publishing.json",
                  "config/reddit_intake.json", "config/translation.json",
-                 "config/translation-service.json", "config/opencode.private.json",
+                 "config/translation-service.json", "config/opencode.private.json", "config/monitor.json",
                  app["topic_path"], app["sources_path"]}
     protected_targets = {Path(root).resolve() / name for name in protected}
     for name in protected:

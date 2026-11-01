@@ -43,16 +43,40 @@ def project_path(service, value):
 # Приватность зависит от настроенных каталогов, а не от их расположения под data/.
 def private_roots(root, app, purpose="file"):
     # Стандартный каталог остаётся приватным и после переноса активного профиля.
-    paths = ["data/max-browser", app.get("max", {}).get("browser", {}).get("profile_dir")]
+    paths = ["data/max-browser", app.get("max", {}).get("browser", {}).get("profile_dir"),
+             "data/monitor", "data/monitor-browser", "data/vk-browser", "data/pikabu-browser",
+             "config/monitor.json"]
     if purpose != "private":
         paths.extend(["data/opencode", app.get("opencode", {}).get("isolated_state_dir"), "data/private-imports"])
-    return tuple(dict.fromkeys(inside(root, value) for value in paths if value))
+    # Профиль отключённого адресата тоже содержит авторизацию. Читаем только
+    # текущую конфигурацию маршрутов, не содержимое профилей или monitor runtime.
+    try:
+        publishing = inside(root, "config/publishing.json")
+        if publishing.exists():
+            if not publishing.is_file() or publishing.stat().st_size > 1024 * 1024:
+                raise ValueError
+            document = parse_json(publishing.read_text(encoding="utf-8-sig"))
+            if not isinstance(document, dict) or not isinstance(document.get("targets"), list):
+                raise ValueError
+            for target in document["targets"]:
+                if not isinstance(target, dict) or not isinstance(target.get("options", {}), dict):
+                    raise ValueError
+                profile = target.get("options", {}).get("profile_dir")
+                if profile is not None:
+                    if not isinstance(profile, str) or not profile:
+                        raise ValueError
+                    paths.append(profile)
+        return tuple(dict.fromkeys(inside(root, value) for value in paths if value))
+    except (AgentError, OSError, ValueError, TypeError, RuntimeError):
+        # Неверная конфигурация не делает неизвестный каталог публичным.
+        raise AgentError("FILE_PRIVATE_PATH_CONFIG_INVALID", 403) from None
 
 
 # Каталоги авторизации не перечисляем через HTTP; открытие их папки в Проводнике остаётся локальным.
-def browsable(service, path, purpose="file"):
+def browsable(service, path, purpose="file", *, roots=None):
+    roots = private_roots(service.settings.root, service.settings.app, purpose) if roots is None else roots
     return not any(path.is_relative_to(directory)
-                   for directory in private_roots(service.settings.root, service.settings.app, purpose))
+                   for directory in roots)
 
 
 # Фильтр файлов одинаков для встроенного выбора, системного диалога и проверки результата.
@@ -72,17 +96,18 @@ def extensions(purpose):
 def browse(service, value="", purpose="file"):
     allowed = extensions(purpose)
     root = service.settings.root.resolve()
+    roots = private_roots(root, service.settings.app, purpose)
     path = project_path(service, value)
     while not path.is_dir() and path != root:
         path = path.parent
-    if not browsable(service, path, purpose):
+    if not browsable(service, path, purpose, roots=roots):
         raise AgentError("FILE_DIRECTORY_PRIVATE", 403)
     entries = []
     try:
         for child in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold())):
             try:
                 resolved = project_path(service, child.relative_to(root).as_posix())
-                if not browsable(service, resolved, purpose):
+                if not browsable(service, resolved, purpose, roots=roots):
                     continue
                 directory = resolved.is_dir()
                 if not directory and (not resolved.is_file() or resolved.suffix.lower() not in allowed):
