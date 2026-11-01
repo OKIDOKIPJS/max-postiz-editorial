@@ -26,6 +26,7 @@ updates:
     # Версия компилятора является частью сохранённых hashes Postiz.
     ignore:
       - dependency-name: typescript
+      - dependency-name: tslib
   - package-ecosystem: github-actions
     directory: /
     schedule:

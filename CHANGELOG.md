@@ -1,5 +1,29 @@
 # История версий
 
+## 0.11.7 — 2026-11-01: проверка pins Dependabot и фактическое включение защиты
+
+- Ruleset `Protect main` №26308277 включён и прочитан обратно через GitHub API:
+  PR, обязательный актуальный `CI required` от app 15368, CodeQL errors/high,
+  запрет удаления/force push и пустой bypass. Пока проверки PR не завершены,
+  GitHub показывает `BLOCKED`. Настройки безопасности прочитаны обратно:
+  Dependabot security updates, Secret scanning и Push protection включены;
+  открытых Secret scanning alerts на момент проверки нет.
+- Dependabot не разбирает нестандартные `requirements*.lock`. Добавлен поддерживаемый
+  `requirements-ci.txt` с 55 точными pins из runtime/dev/browser locks и обязательный
+  stdlib-checker их равенства. PR обновления требует синхронной правки соответствующих
+  locks; изменение одного лишь манифеста не пройдёт CI. Старые locks не мигрировали.
+  TypeScript/tslib исключены из обычных автообновлений: их версии закреплены CAS
+  contract и меняются вместе с доказательствами компиляции.
+- Явно разрешена выгрузка только выбранных скрытых JUnit/coverage-файлов;
+  для `.yml` закреплён LF. Дополнительные проверки: actionlint 1.7.12 прошёл,
+  checker pins прошёл positive-case и семь независимых negative-cases,
+  локальный целевой pytest — 671 passed, 5 expected skipped, 1 warning.
+  Первые GitHub Ruff/build, PostgreSQL, Node Windows/Linux и CodeQL jobs прошли;
+  итог полного CI проверяется на последней версии PR перед объединением.
+- CodeQL baseline и шесть прежних Dependabot alerts (4 high, 1 medium, 1 low)
+  сохранены открытыми для отдельного разбора. Ничего не dismissed/подавлено,
+  защита не ослаблялась ради старых alerts. Работающий сервер не затронут.
+
 ## 0.11.7 — 2026-11-01: GitHub CI и защита main
 
 - Добавлены обязательные проверки GitHub Actions: Ruff, совместимость зависимостей,
