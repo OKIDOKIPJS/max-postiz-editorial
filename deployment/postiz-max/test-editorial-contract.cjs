@@ -50,6 +50,19 @@ test('cookie owner request forwards fixed path and trusted identity, never brows
   assert.equal(JSON.stringify(calls).includes('secret browser cookie'), false);
   assert.equal(calls[0][1].redirect, 'error');
 });
+
+test('monitor BFF only forwards fixed read-only owner paths and rejects action query parameters', async () => {
+  const { instance, calls } = controller(() => response({ available: false, read_only: true }));
+  await instance.monitor(request());
+  await instance.monitorPreview(request());
+  assert.deepEqual(calls.map(call => call[0]), [`${env.EDITORIAL_INTERNAL_URL}/monitor`, `${env.EDITORIAL_INTERNAL_URL}/monitor-preview`]);
+  assert.ok(calls.every(call => call[1].method === 'GET' && call[1].body === undefined));
+  const query = request(); query.query = { action: 'send' };
+  await rejected(Promise.resolve().then(() => instance.monitor(query)), 'INPUT_INVALID', 422);
+  const other = request(); other.user.id = 'other';
+  await rejected(Promise.resolve().then(() => instance.monitorPreview(other)), 'EDITORIAL_OWNER_REQUIRED');
+  assert.equal(calls.length, 2);
+});
 for (const [name, mutate, code] of [
   ['no cookie', req => { req.cookies = {}; }, 'EDITORIAL_COOKIE_SESSION_REQUIRED'],
   ['auth header', req => { req.headers.auth = 'jwt'; }, 'EDITORIAL_COOKIE_SESSION_REQUIRED'],
@@ -374,6 +387,120 @@ function routeUi(react, globals = {}) {
     'react/jsx-runtime': require(path.join(tooling, 'react/jsx-runtime')), './editorial-form': formApi,
     './editorial.module.css': new Proxy({}, { get: (_, key) => String(key) }) }, globals);
 }
+
+test('monitor UI validates owner status, separates unknown delivery and exposes no mutation controls', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  const value = ui.monitorStatusResult({ available: true, read_only: true, enabled: false, ledger_available: true,
+    freshness: 'stale', commands: { enabled: false, paired: true, contract_verified: false },
+    observer: { heartbeat_at: 1793520000, private_cookie: 'private-never-render' },
+    reports: { last: { state: 'unknown', created_at: 1793519999, text: 'private-never-render' } } });
+  const markup = renderToStaticMarkup(React.createElement(ui.MonitoringStatus, { value }));
+  assert.ok(markup.includes('Рассылка выключена')); assert.ok(markup.includes('Команды выключены'));
+  assert.ok(markup.includes('сигнал наблюдателя устарел')); assert.ok(markup.includes('исход отправки неизвестен'));
+  assert.ok(!markup.includes('private-never-render')); assert.ok(!markup.includes('type="checkbox"'));
+  assert.ok(!markup.includes('Запустить') && !markup.includes('Разблокировать'));
+  for (const bad of [null, { available: true, read_only: false }, { available: true, read_only: true },
+    { ...value, enabled: 'true' }, { ...value, commands: { enabled: true } }]) {
+    assert.throws(() => ui.monitorStatusResult(bad), /MONITOR_RESPONSE_INVALID/);
+  }
+});
+
+test('monitor UI separates configured command permission from actual receiver failures and freshness', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  const base = { available: true, read_only: true, enabled: true, ledger_available: true,
+    freshness: 'fresh', commands: { enabled: true, paired: true, contract_verified: true },
+    observer: {}, reports: { last: null } };
+  const view = patch => renderToStaticMarkup(React.createElement(ui.MonitoringStatus,
+    { value: ui.monitorStatusResult({ ...base, commands: { ...base.commands, ...patch } }) }));
+  const blocked = view({ receiver_state: 'blocked', receiver_heartbeat_at: 1793520000,
+    receiver_freshness: 'fresh', error: 'private-cookie-DOM-error' });
+  assert.ok(blocked.includes('Команды разрешены'));
+  assert.ok(blocked.includes('Приём команд заблокирован'));
+  assert.ok(!blocked.includes('Приём команд отвечает'));
+  assert.ok(!blocked.includes('private-cookie-DOM-error'));
+  const stale = view({ receiver_state: 'ready', receiver_heartbeat_at: 1793520000, receiver_freshness: 'stale' });
+  assert.ok(stale.includes('Сигнал приёма команд устарел'));
+  assert.ok(!stale.includes('Приём команд отвечает'));
+  assert.ok(view({}).includes('Работа приёма команд ещё не подтверждена'));
+  assert.ok(view({ receiver_state: 'ready', receiver_heartbeat_at: 1793520000,
+    receiver_freshness: 'fresh' }).includes('Приём команд отвечает'));
+  assert.ok(view({ receiver_state: 'ready', receiver_freshness: 'fresh' }).includes('ещё не подтверждена'));
+});
+
+test('monitor command history hides private payloads and distinguishes queued, progress and final outcomes', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  const base = { available: true, read_only: true, enabled: true, ledger_available: true,
+    freshness: 'fresh', commands: { enabled: true, paired: true, contract_verified: true,
+      history_available: true }, observer: {}, reports: { last: { state: 'unknown' } } };
+  const task = { command_id: '1'.repeat(32), action: 'refill', state: 'queued', phase: 'reserve_refilled',
+    ready: 3, goal: 6, created_at: 1793519900, updated_at: 1793520000,
+    actor: 'private-actor', chat_id: 'private-chat', payload: 'private-payload', message: 'private-result' };
+  const parsed = patch => ui.monitorStatusResult({ ...base,
+    commands: { ...base.commands, recent: [{ ...task, ...patch }] } });
+  const markup = value => renderToStaticMarkup(React.createElement(ui.MonitoringStatus, { value }));
+  const queued = markup(parsed({}));
+  assert.ok(queued.includes('Принято в очередь; выполнение ещё не подтверждено'));
+  assert.ok(!queued.includes('Обработка завершена')); assert.ok(!queued.includes('private-'));
+  assert.ok(!JSON.stringify(parsed({})).includes('private-'));
+  const partialDone = markup(parsed({ state: 'done' }));
+  assert.ok(partialDone.includes('Целевой запас не достигнут'));
+  const final = markup(parsed({ state: 'done', phase: 'reserve_satisfied', ready: 6, updated_at: 1793520030 }));
+  assert.ok(final.includes('Обработка завершена')); assert.ok(final.includes('Проверка готового запаса'));
+  assert.ok(!final.includes('Целевой запас не достигнут')); assert.ok(!final.includes('выполнение ещё не подтверждено'));
+  assert.ok(final.includes('исход отправки неизвестен'));
+  assert.ok(final.includes('Состояние задачи и доставка ответа учитываются отдельно'));
+  const stopping = markup(parsed({ state: 'running', phase: 'cancellation_requested' }));
+  assert.ok(stopping.includes('текущая операция завершается'));
+  assert.ok(stopping.includes('Выполнение начато; итог ещё неизвестен'));
+  const cancelled = markup(parsed({ state: 'cancelled', phase: 'cancelled' }));
+  assert.ok(cancelled.includes('Будущие проходы отменены; история сохранена'));
+  assert.ok(!cancelled.includes('Целевой запас не достигнут'));
+  assert.ok(markup(parsed({ action: 'help', state: 'done' })).includes('Список команд'));
+  assert.ok(markup(parsed({ action: 'diagnostics', state: 'done' })).includes('Диагностика'));
+  const invalid = parsed({ command_id: 'private-invalid-id', action: 'private-action', state: 'private-state',
+    phase: 'private-phase', ready: true, goal: 100 });
+  assert.ok(!JSON.stringify(invalid).includes('private-'));
+  assert.equal(invalid.commands.recent[0].state, 'unknown');
+  assert.equal(invalid.commands.recent[0].ready, undefined); assert.equal(invalid.commands.recent[0].goal, undefined);
+  const bounded = ui.monitorStatusResult({ ...base, commands: { ...base.commands,
+    recent: Array.from({ length: 20 }, (_, i) => ({ ...task, command_id: i.toString(16).padStart(32, '0') })) } });
+  assert.equal(bounded.commands.recent.length, 10);
+});
+
+test('monitor UI loads status and preview only on explicit GET clicks; it never queues or sends', async () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const values = [], calls = [];
+  let index = 0;
+  const hooks = { ...React, useState(initial) { const key = index++; if (!(key in values)) values[key] = initial;
+    return [values[key], next => { values[key] = typeof next === 'function' ? next(values[key]) : next; }]; } };
+  const ui = routeUi(hooks, { fetch: async (url, options) => { calls.push([url, options]);
+    return { ok: true, json: async () => url.endsWith('monitor-preview')
+      ? { available: true, read_only: true, external_mutations: 0, text: '<script>text only</script>' }
+      : { available: true, read_only: true, enabled: false, ledger_available: false, freshness: 'unobserved',
+        commands: { enabled: false, paired: false, contract_verified: false }, observer: {}, reports: { last: null } } };
+  } });
+  const render = () => { index = 0; return ui.Monitoring(); };
+  const buttons = node => !node || typeof node !== 'object' ? [] : Array.isArray(node)
+    ? node.flatMap(buttons) : [...(node.type === 'button' ? [node] : []), ...buttons(node.props?.children)];
+  let tree = render();
+  assert.equal(calls.length, 0); assert.equal(buttons(tree)[1].props.disabled, true);
+  await buttons(tree)[0].props.onClick(); tree = render();
+  assert.equal(calls[0][0], '/api/editorial/monitor'); assert.equal(calls[0][1].method, 'GET');
+  assert.equal(buttons(tree)[1].props.disabled, false);
+  await buttons(tree)[1].props.onClick(); tree = render();
+  assert.equal(calls[1][0], '/api/editorial/monitor-preview');
+  assert.ok(calls.every(call => call[1].method === 'GET' && call[1].body === undefined));
+  const markup = renderToStaticMarkup(tree);
+  assert.ok(markup.includes('&lt;script&gt;text only&lt;/script&gt;'));
+  assert.ok(!markup.includes('<script>'));
+});
 const routeTarget = { id: 'vk_target', platform: 'vk', route: 'vk_api', destination: '-123456', enabled: true,
   paused: true, binding_hash: 'c'.repeat(64), live_verified: false, status_kind: 'configuration_only',
   credentials_configured: true, adapter_mode: 'live' };

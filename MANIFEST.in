@@ -20,6 +20,7 @@ recursive-include deployment *.json *.ts *.tsx *.cjs *.png Dockerfile .dockerign
 recursive-include deployment *.css
 recursive-include deployment Dockerfile.*
 recursive-include deployment *.sh *.service
+recursive-include deployment *.service.example
 recursive-include deployment *.conf
 include deployment/translation/candle_t5_worker.rs
 include deployment/translation/candle-t5-causal-position.patch

@@ -1,6 +1,8 @@
 """Native expected-hash guards run before the Postiz controller can overwrite."""
 import copy
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,6 +13,8 @@ from fastapi.testclient import TestClient
 from max_postiz_agent.config import AgentError
 from max_postiz_agent.hub_api import hub_app
 from max_postiz_agent.hub_models import BridgePost
+from max_postiz_agent.server_models import EditorialControl
+from max_postiz_agent.server_state import CONTROL_ID, ServerState
 
 pytest_plugins = ["test_max_bridge"]
 
@@ -161,6 +165,86 @@ def test_api_forwards_cas_and_finish_keeps_original_contract(bridge):
         response = client.post("/api/max-bridge/mutation/start",
                                json={**payload, "expected_hash": malformed}, headers=headers)
         assert response.status_code == 422 and owner(core) is None
+
+
+def test_new_native_lease_is_legal_while_editorial_paused(bridge):
+    core, _, expected = draft(bridge)
+    state = ServerState(core)
+    before = state.initialize()
+    assert before["paused"] is True
+    lease = core.bridge.mutation(["post-max"], expected_hash=expected, expected_post_id="post-max")
+    assert owner(core) == lease["owner"] and lease["cas_verified"] is True
+    assert state.read() == before
+    core.bridge.mutation(["post-max"], release=lease["owner"])
+    assert owner(core) is None and state.read() == before
+
+
+def test_release_does_not_acquire_configuration_fence_or_release_another_owner(bridge, monkeypatch):
+    from max_postiz_agent import server_state
+
+    core, _, _ = draft(bridge)
+    lease = core.bridge.mutation(["post-max"])
+
+    def prohibited(_):
+        pytest.fail("release must retain its existing path without a configuration fence")
+
+    monkeypatch.setattr(server_state, "fence_editorial_configuration", prohibited)
+    core.bridge.mutation(["post-max"], release="different-owner")
+    assert owner(core) == lease["owner"]
+    core.bridge.mutation(["post-max"], release=lease["owner"])
+    assert owner(core) is None
+
+
+@pytest.mark.parametrize("control_exists", [True, False])
+def test_native_lease_waits_for_configuration_transaction_before_variant_lock(bridge, monkeypatch, control_exists):
+    """Real SQLite writers serialize even with no historical Control row."""
+    from max_postiz_agent import server_state
+
+    core, _, _ = draft(bridge)
+    state = ServerState(core)
+    initial = state.initialize() if control_exists else None
+    original_fence = server_state.fence_editorial_configuration
+    original_variant = core._variant
+    entered_fence, entered_variant = threading.Event(), threading.Event()
+    observed_revisions = []
+    caller_thread = threading.get_ident()
+
+    def fenced(session):
+        if threading.get_ident() != caller_thread:
+            entered_fence.set()
+        return original_fence(session)
+
+    def variant(session, ident, lock=False):
+        if lock:
+            control = session.get(EditorialControl, CONTROL_ID)
+            observed_revisions.append(control.revision if control is not None else None)
+            entered_variant.set()
+        return original_variant(session, ident, lock)
+
+    monkeypatch.setattr(server_state, "fence_editorial_configuration", fenced)
+    monkeypatch.setattr(core, "_variant", variant)
+    # Sync is independently tested above; here only lease transaction ordering matters.
+    monkeypatch.setattr(core.bridge, "sync", lambda **kwargs: None)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with core.db.session.begin() as configuration:
+            original_fence(configuration)
+            control = configuration.get(EditorialControl, CONTROL_ID)
+            if control_exists:
+                settings = copy.deepcopy(control.settings)
+                settings["nasa"]["keywords"] = ["new-filter"]
+                control.settings, control.revision = settings, control.revision + 1
+                configuration.flush()
+            else:
+                assert control is None
+            pending = pool.submit(core.bridge.mutation, ["post-max"])
+            assert entered_fence.wait(timeout=5), "lease did not reach its transaction fence"
+            assert not entered_variant.wait(timeout=0.2), "lease read/locked Variant before configuration committed"
+            assert owner(core) is None
+        lease = pending.result(timeout=5)
+    assert entered_variant.is_set() and owner(core) == lease["owner"]
+    assert observed_revisions == [initial["revision"] + 1 if control_exists else None]
+    core.bridge.mutation(["post-max"], release=lease["owner"])
+    assert owner(core) is None
 
 
 def test_native_typescript_guard_mock_controls(tmp_path):

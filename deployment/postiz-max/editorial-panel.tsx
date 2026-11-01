@@ -389,6 +389,150 @@ export function EditorialRoutes({ inventory, pending, error, onAction, onPreview
   </section>;
 }
 
+type MonitorCommand = {
+  command_id: string; action: string; state: string; phase?: string;
+  created_at?: number; updated_at?: number; ready?: number; goal?: number;
+};
+type MonitorState = {
+  available: boolean; read_only: true; enabled?: boolean; ledger_available?: boolean;
+  freshness?: 'fresh' | 'stale' | 'unobserved';
+  commands?: { enabled: boolean; paired: boolean; contract_verified: boolean;
+    receiver_state: 'ready' | 'blocked' | 'unobserved'; receiver_heartbeat_at?: number;
+    receiver_freshness: 'fresh' | 'stale' | 'unobserved'; history_available: boolean; recent: MonitorCommand[] };
+  observer?: { heartbeat_at?: number; source_heartbeat_at?: number; sender_heartbeat_at?: number };
+  reports?: { last: { state: string; created_at?: number } | null };
+};
+export function monitorStatusResult(value: unknown): MonitorState {
+  const record = (item: unknown): item is Record<string, any> => !!item && typeof item === 'object' && !Array.isArray(item);
+  if (!record(value) || typeof value.available !== 'boolean' || value.read_only !== true) throw new Error('MONITOR_RESPONSE_INVALID');
+  if (!value.available) return { available: false, read_only: true };
+  if (typeof value.enabled !== 'boolean' || typeof value.ledger_available !== 'boolean' ||
+      !['fresh', 'stale', 'unobserved'].includes(value.freshness) || !record(value.commands) ||
+      ['enabled', 'paired', 'contract_verified'].some(key => typeof value.commands[key] !== 'boolean') ||
+      !record(value.observer) || !record(value.reports)) throw new Error('MONITOR_RESPONSE_INVALID');
+  const stamp = (item: unknown): number | undefined => typeof item === 'number' && Number.isFinite(item) && item >= 0 ? item : undefined;
+  const last = value.reports.last;
+  const reportStates = ['pending', 'sending', 'unknown', 'confirmed', 'failed', 'cancelled', 'expired'];
+  const receiverAt = stamp(value.commands.receiver_heartbeat_at);
+  const receiverState = ['ready', 'blocked', 'unobserved'].includes(value.commands.receiver_state) ? value.commands.receiver_state : 'unobserved';
+  const receiverFreshness = receiverAt !== undefined && ['fresh', 'stale'].includes(value.commands.receiver_freshness)
+    ? value.commands.receiver_freshness : 'unobserved';
+  const actions = ['status', 'reserve', 'errors', 'sources', 'refill', 'pause', 'reconcile', 'unblock', 'source_propose', 'source_settings',
+    'help', 'tasks', 'task', 'cancel', 'resume_refill', 'resume_project', 'diagnostics'];
+  const commandStates = ['queued', 'running', 'done', 'blocked', 'unknown', 'cancelled'];
+  const commandPhases = ['paused', 'reserve_disabled', 'blocked', 'worker_busy', 'waiting_source', 'reserve_satisfied',
+    'reserve_refilled', 'no_source', 'preparation_deferred', 'selecting', 'translating', 'reviewing', 'repairing',
+    'preparing', 'quality_ready', 'reserve_empty', 'waiting_interval', 'waiting_services', 'cancelled', 'cancellation_requested'];
+  const integer = (item: unknown, low: number, high: number): number | undefined => typeof item === 'number' &&
+    Number.isSafeInteger(item) && item >= low && item <= high ? item : undefined;
+  const recent: MonitorCommand[] = (Array.isArray(value.commands.recent) ? value.commands.recent : []).slice(0, 10)
+    .filter(record).map(item => ({ command_id: typeof item.command_id === 'string' && /^[a-f0-9]{32}$/.test(item.command_id)
+      ? item.command_id : 'unknown', action: actions.includes(item.action) ? item.action : 'unknown',
+      state: commandStates.includes(item.state) ? item.state : 'unknown', phase: commandPhases.includes(item.phase) ? item.phase : undefined,
+      created_at: stamp(item.created_at), updated_at: stamp(item.updated_at),
+      ready: ['refill', 'reserve'].includes(item.action) ? integer(item.ready, 0, 24) : undefined,
+      goal: item.action === 'refill' ? integer(item.goal, 1, 12) : undefined }));
+  return { available: true, read_only: true, enabled: value.enabled, ledger_available: value.ledger_available,
+    freshness: value.freshness, commands: { enabled: value.commands.enabled, paired: value.commands.paired,
+      contract_verified: value.commands.contract_verified, receiver_state: receiverState,
+      receiver_heartbeat_at: receiverAt, receiver_freshness: receiverFreshness,
+      history_available: value.commands.history_available === true, recent },
+    observer: { heartbeat_at: stamp(value.observer.heartbeat_at), source_heartbeat_at: stamp(value.observer.source_heartbeat_at),
+      sender_heartbeat_at: stamp(value.observer.sender_heartbeat_at) },
+    reports: { last: record(last) ? { state: reportStates.includes(last.state) ? last.state : 'unknown',
+      created_at: stamp(last.created_at) } : null } };
+}
+
+export function MonitoringCommands({ available, recent }: { available: boolean; recent: MonitorCommand[] }) {
+  const actions: Record<string, string> = { status: 'Статус', reserve: 'Резерв', errors: 'Ошибки', sources: 'Источники',
+    refill: 'Пополнение резерва', pause: 'Пауза', reconcile: 'Сверка отправки', unblock: 'Диагностика блокировки',
+    source_propose: 'Предложение источника', source_settings: 'Фильтры источников', help: 'Список команд',
+    tasks: 'Задачи', task: 'Состояние задачи', cancel: 'Отмена задачи', resume_refill: 'Продолжение подготовки',
+    resume_project: 'Снятие общей паузы для подготовки', diagnostics: 'Диагностика' };
+  const states: Record<string, string> = { queued: 'Принято в очередь; выполнение ещё не подтверждено',
+    running: 'Выполнение начато; итог ещё неизвестен', done: 'Обработка завершена', blocked: 'Заблокировано проверками',
+    unknown: 'Исход неизвестен; требуется сверка', cancelled: 'Будущие проходы отменены; история сохранена' };
+  const phases: Record<string, string> = { paused: 'Редакция на паузе', reserve_disabled: 'Резерв выключен',
+    blocked: 'Остановлено проверками', worker_busy: 'Ожидание обработчика', waiting_source: 'Ожидание источника',
+    reserve_satisfied: 'Проверка готового запаса', reserve_refilled: 'Пополнение запаса', no_source: 'Нет подходящего источника',
+    preparation_deferred: 'Подготовка отложена', selecting: 'Выбор источника', translating: 'Перевод', reviewing: 'Проверка',
+    repairing: 'Редактура', preparing: 'Подготовка', quality_ready: 'Проверено', reserve_empty: 'Запас пуст',
+    waiting_interval: 'Ожидание интервала', waiting_services: 'Ожидание доступности моделей',
+    cancelled: 'Отмена завершена', cancellation_requested: 'Отмена запрошена; текущая операция завершается' };
+  return <div><h3 className={styles.subheading}>Последние команды</h3>
+    <p className={styles.muted}>Последние 10 обновлённых задач. Состояние задачи и доставка ответа учитываются отдельно.</p>
+    {!available ? <p className={styles.muted}>История команд пока недоступна.</p> : !recent.length
+      ? <p className={styles.muted}>Команд пока нет.</p> : <div className={styles.routesGrid}>
+        {recent.map((command, index) => <article className={styles.routeTarget} key={`${command.command_id}-${index}`}>
+          <strong>{actions[command.action] || 'Команда'}</strong>
+          <p>{states[command.state] || states.unknown}</p>
+          {command.phase && <p className={styles.muted}>{phases[command.phase] || 'Этап не указан'}</p>}
+          {(command.ready !== undefined || command.goal !== undefined) && <p>Готово по учёту: {command.ready ?? 'неизвестно'}
+            {command.goal !== undefined && <> · Цель: {command.goal}</>}</p>}
+          {command.state === 'done' && command.ready !== undefined && command.goal !== undefined && command.ready < command.goal &&
+            <p className={styles.notice}>Целевой запас не достигнут.</p>}
+          <p className={styles.detail}>Создана: {readableTime(command.created_at)} · Обновлена: {readableTime(command.updated_at)}
+            <br />Номер: {command.command_id === 'unknown' ? 'не подтверждён' : command.command_id.slice(0, 8)}</p>
+        </article>)}
+      </div>}
+  </div>;
+}
+
+export function MonitoringStatus({ value }: { value: MonitorState }) {
+  if (!value.available) return <p className={styles.muted}>Мониторинг ещё не подключён в этой установке.</p>;
+  const states: Record<string, string> = { pending: 'ожидает отправки', sending: 'отправляется',
+    unknown: 'исход отправки неизвестен; требуется сверка', confirmed: 'доставка отчёта подтверждена',
+    failed: 'ошибка до отправки', cancelled: 'отменён', expired: 'устарел и не отправлен' };
+  const receiver = value.commands;
+  const receiverStatus = receiver?.receiver_state === 'blocked' ? 'Приём команд заблокирован; требуется проверка доступа.'
+    : receiver?.receiver_state === 'ready' && receiver.receiver_freshness === 'fresh' ? 'Приём команд отвечает.'
+    : receiver?.receiver_freshness === 'stale' ? 'Сигнал приёма команд устарел; работа команд не подтверждена.'
+    : 'Работа приёма команд ещё не подтверждена.';
+  return <div aria-live="polite">
+    <p><strong>{value.enabled ? 'Рассылка включена' : 'Рассылка выключена'}</strong> · {value.commands?.enabled ? 'Команды разрешены' : 'Команды выключены'}</p>
+    <p className={styles.muted}>На момент чтения: {value.freshness === 'fresh' ? 'свежий сигнал наблюдателя' : value.freshness === 'stale' ? 'сигнал наблюдателя устарел' : 'сигналов ещё нет'}.
+      Последний сигнал: {readableTime(value.observer?.heartbeat_at)}.</p>
+    <p className={styles.muted}>Сигнал редакционного обработчика: {readableTime(value.observer?.source_heartbeat_at)} · Отправителя отчётов: {readableTime(value.observer?.sender_heartbeat_at)}</p>
+    {!value.ledger_available && <p className={styles.notice}>Журнал наблюдателя пока недоступен. Работа рассылки не подтверждена.</p>}
+    {!value.commands?.paired && <p className={styles.muted}>Управляющий чат ещё не привязан.</p>}
+    {value.commands?.paired && !value.commands.contract_verified && <p className={styles.muted}>Чтение команд ещё не проверено.</p>}
+    {value.commands?.enabled && <p className={value.commands.receiver_state === 'blocked' ? styles.notice : styles.muted}>{receiverStatus}</p>}
+    <p className={styles.muted}>Последняя проверка приёма команд: {readableTime(value.commands?.receiver_heartbeat_at)}.</p>
+    <p>Последний служебный отчёт: {value.reports?.last ? states[value.reports.last.state] || states.unknown : 'пока нет'}.
+      {value.reports?.last && <span className={styles.detail}>Создан: {readableTime(value.reports.last.created_at)}</span>}</p>
+    <MonitoringCommands available={value.commands?.history_available === true} recent={value.commands?.recent || []} />
+  </div>;
+}
+
+export function Monitoring() {
+  const [value, setValue] = useState<MonitorState | null>(null);
+  const [preview, setPreview] = useState('');
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  const load = async (showPreview: boolean) => {
+    setPending(true); setError(''); setPreview('');
+    try {
+      if (showPreview) {
+        const result = await api('monitor-preview');
+        if (!result || result.available !== true || result.read_only !== true || result.external_mutations !== 0 ||
+            typeof result.text !== 'string' || result.text.length > 4000) throw new Error('MONITOR_RESPONSE_INVALID');
+        setPreview(result.text);
+      } else { setValue(monitorStatusResult(await api('monitor'))); }
+    } catch { setValue(null); setError('Не удалось прочитать мониторинг. Обновите статус позже.'); }
+    finally { setPending(false); }
+  };
+  return <section className={styles.card} aria-labelledby="monitor-heading"><h2 id="monitor-heading">Служебный канал MAX</h2>
+    <p className={styles.muted}>Состояние рассылки и команд с телефона. Предпросмотр показывает текст отчёта и не отправляет сообщение.</p>
+    <div className={styles.actions}>
+      <button type="button" className={styles.button} disabled={pending} onClick={() => load(false)}>{value ? 'Обновить мониторинг' : 'Показать мониторинг'}</button>
+      <button type="button" className={styles.button} disabled={pending || value?.available !== true} onClick={() => load(true)}>Предпросмотр отчёта</button>
+    </div>
+    {error && <p role="alert" className={styles.notice}>{error}</p>}
+    {value && <MonitoringStatus value={value} />}
+    {preview && <pre className={styles.fullBody} aria-label="Предпросмотр служебного отчёта">{preview}</pre>}
+  </section>;
+}
+
 export function EditorialPanel() {
   const [state, setState] = useState<State | null>(null);
   const [settings, setSettings] = useState<EditorialSettings | null>(null);
@@ -546,6 +690,7 @@ export function EditorialPanel() {
     {routeNotice && <div role="status" className={styles.notice}>{routeNotice}</div>}
     <EditorialRoutes inventory={routes} pending={pending || Boolean(routeError)} error={routeError} onAction={routeAction} onPreview={routePreview}
       detailsById={routeDetails} onDetails={loadRouteDetails} onPage={changeRoutePage} />
+    <Monitoring />
     <section className={styles.card}><h2>Последние материалы</h2><EditorialRecords records={state?.recent || []} /></section>
   </main>;
 }
