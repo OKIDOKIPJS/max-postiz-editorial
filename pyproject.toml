@@ -50,3 +50,7 @@ ignore = ["S101", "S603", "S607"]
 "src/max_postiz_agent/api.py" = ["B008"]
 "src/max_postiz_agent/hub_api.py" = ["B008"]
 "tests/*" = ["S105", "S106"]
+
+[tool.max-postiz.check]
+# Остальные 213 файлов требуют отдельной миграции форматирования.
+format-paths = ["scripts/check.py", "tests/test_check.py"]
