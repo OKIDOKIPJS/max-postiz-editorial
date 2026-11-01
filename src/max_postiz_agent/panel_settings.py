@@ -6,13 +6,14 @@ import os
 import re
 import shutil
 import tempfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from sqlalchemy import select
 
 from .channel_profiles import PROFILE_FILE, atomic_json, profiles
 from .config import AgentError, Settings, inside, parse_json, fingerprint
 from .db import Intent
+from .panel_files import private_roots
 
 DEFAULT_ENV = {"DATABASE_URL", "APP_AUTH_SECRET", "APP_EDITOR_SECRET", "APP_VIEWER_SECRET",
                "MAX_AGENT_BACKUP_KEY", "PIXABAY_API_KEY", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET",
@@ -34,14 +35,61 @@ def credential_names(settings):
     return names - {"PATH", "HOME", "CODEX_HOME", "PYTHONPATH", "PYTHONHOME"}
 
 
+# Пути формы должны оставаться в своём разделе, а не только внутри общего проекта.
+def configuration_path(root, value, directory, suffix, *, fixed=None, error="SETTINGS_PATH_INVALID"):
+    if (not isinstance(value, str) or not value or len(value) > 2048
+            or any(character in value for character in "\\:\0\r\n")
+            or any(not part or part in {".", ".."} or part.endswith((".", " "))
+                   or PureWindowsPath(part).is_reserved() for part in value.split("/"))):
+        raise AgentError(error)
+    root = Path(root).resolve()
+    exact = value == fixed
+    if not exact and not (value.startswith(directory + "/") and value.endswith(suffix)):
+        raise AgentError(error)
+    try:
+        target = inside(root, value)
+    except (AgentError, OSError, RuntimeError):
+        raise AgentError(error) from None
+    if ((exact and target != root / fixed)
+            or (not exact and not target.is_relative_to(root / directory))):
+        raise AgentError(error)
+    return target
+
+
+# Workflow не может подменить другой уже проверенный документ или файл доступа.
+def workflow_target(root, app):
+    value = app.get("video", {}).get("workflow_path")
+    if value is None or value == "":
+        return None
+    target = configuration_path(root, value, "config", ".json", error="WORKFLOW_PATH_INVALID")
+    if any(target.is_relative_to(directory) for directory in private_roots(root, app, "workflow")):
+        raise AgentError("WORKFLOW_PATH_INVALID")
+    if target.name.casefold() == "opencode.private.json":
+        raise AgentError("WORKFLOW_PATH_INVALID")
+    protected = {"config/app.json", "config/sources.json", "config/image_sources.json",
+                 PROFILE_FILE, "config/holidays.json", "config/publishing.json",
+                 "config/reddit_intake.json", "config/translation.json",
+                 "config/translation-service.json", "config/opencode.private.json",
+                 app["topic_path"], app["sources_path"]}
+    protected_targets = {Path(root).resolve() / name for name in protected}
+    for name in protected:
+        try:
+            protected_targets.add(inside(root, name))
+        except (AgentError, OSError, RuntimeError):
+            # Недоступная посторонняя ссылка не даёт разрешения читать её через workflow.
+            continue
+    if target in protected_targets:
+        raise AgentError("WORKFLOW_PATH_INVALID")
+    return target
+
+
 # Полная конфигурация имеет один контракт для формы и расширенного JSON-редактора.
 def snapshot(service):
     root, settings = service.settings.root, service.settings
     path = inside(root, "config/image_sources.json")
     if not path.exists():
         path = inside(root, "config/image_sources.example.json")
-    workflow_path = settings.app.get("video", {}).get("workflow_path")
-    workflow = inside(root, workflow_path) if workflow_path else None
+    workflow = workflow_target(root, settings.app)
     from .holidays import catalog
     return {"configuration": copy.deepcopy({"app": settings.app, "topic": settings.topic,
             "sources": settings.sources, "image_sources": parse_json(path.read_text(encoding="utf-8-sig")),
@@ -58,10 +106,14 @@ def validate_configuration(root, value):
         raise AgentError("SETTINGS_DOCUMENT_INVALID")
     app = value["app"]
     # Редактор конфигурации не перезаписывает исходники, схемы или служебные файлы проекта.
-    if not (app["topic_path"] == "TOPIC.md" or app["topic_path"].startswith("config/topics/") and app["topic_path"].endswith(".md")):
-        raise AgentError("SETTINGS_PATH_INVALID")
-    if not (app["sources_path"] == "config/sources.json" or app["sources_path"].startswith("config/sources/") and app["sources_path"].endswith(".json")):
-        raise AgentError("SETTINGS_PATH_INVALID")
+    configuration_path(root, app["topic_path"], "config/topics", ".md", fixed="TOPIC.md")
+    configuration_path(root, app["sources_path"], "config/sources", ".json", fixed="config/sources.json")
+    workflow = workflow_target(root, app)
+    if value["workflow"] is not None:
+        if not isinstance(value["workflow"], dict):
+            raise AgentError("WORKFLOW_SCHEMA_INVALID")
+        if workflow is None:
+            raise AgentError("WORKFLOW_PATH_INVALID")
     from .backup import check_config_secrets
     check_config_secrets(value)
     with tempfile.TemporaryDirectory(prefix="max-settings-") as directory:
@@ -71,6 +123,8 @@ def validate_configuration(root, value):
                  "config/image_sources.json": value["image_sources"], PROFILE_FILE: value["image_channels"], "config/holidays.json": value["holidays"]}
         for name, data in files.items():
             atomic_json(trial, name, data)
+        if value["workflow"] is not None:
+            atomic_json(trial, app["video"]["workflow_path"], value["workflow"])
         topic = inside(trial, app["topic_path"])
         topic.parent.mkdir(parents=True, exist_ok=True)
         topic.write_text("<!-- TOPIC_CONFIG_BEGIN -->\n```json\n" + json.dumps(value["topic"], ensure_ascii=False)
@@ -90,8 +144,6 @@ def validate_configuration(root, value):
             minutes = sorted(int(time[:2]) * 60 + int(time[3:]) for time in times)
             if any(b - a < policy["min_gap_minutes"] for a, b in zip(minutes, minutes[1:], strict=False)):
                 raise AgentError("SCHEDULE_GAP_TOO_SMALL")
-        if value["workflow"] is not None and not isinstance(value["workflow"], dict):
-            raise AgentError("WORKFLOW_SCHEMA_INVALID")
     return True
 
 
@@ -120,7 +172,9 @@ def save_configuration(service, value, *, validate_only=False):
                           if app.get(name) != service.settings.app.get(name)]
         restart_fields.extend("api." + name for name in ("host", "port")
                               if app["api"].get(name) != service.settings.app["api"].get(name))
-        topic_path = inside(root, app["topic_path"])
+        topic_path = configuration_path(root, app["topic_path"], "config/topics", ".md", fixed="TOPIC.md")
+        configuration_path(root, app["sources_path"], "config/sources", ".json", fixed="config/sources.json")
+        workflow = workflow_target(root, app)
         old_topic = inside(root, service.settings.app["topic_path"]).read_text(encoding="utf-8-sig")
         pattern = r"(<!-- TOPIC_CONFIG_BEGIN -->\s*```json\s*)(.*?)(\s*```\s*<!-- TOPIC_CONFIG_END -->)"
         text = re.sub(pattern, lambda m: m[1] + json.dumps(value["topic"], ensure_ascii=False, indent=2) + m[3], old_topic, flags=re.S)
@@ -128,7 +182,7 @@ def save_configuration(service, value, *, validate_only=False):
                  "config/image_sources.json": value["image_sources"], PROFILE_FILE: value["image_channels"], "config/holidays.json": value["holidays"]}
         workflow_path = app.get("video", {}).get("workflow_path")
         if value["workflow"] is not None:
-            if not workflow_path or not workflow_path.startswith("config/") or not workflow_path.endswith(".json"):
+            if workflow is None:
                 raise AgentError("WORKFLOW_PATH_INVALID")
             files[workflow_path] = value["workflow"]
         targets = [inside(root, name) for name in files] + [topic_path]

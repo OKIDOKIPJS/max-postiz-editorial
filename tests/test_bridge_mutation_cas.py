@@ -178,12 +178,12 @@ let source = fs.readFileSync(process.argv[1], 'utf8')
  .replace('context: ExecutionContext', 'context').replace(': Promise<boolean>', '')
  .replace('Set<string>', 'Set').replace(/: string/g, '').replace(/: any/g, '');
 source += '\n globalThis.Guard = MaxBrowserMutationGuard;';
-const hash = 'a'.repeat(64), post = 'post-max';
-const validRow = {id:post,parentPostId:null,state:'DRAFT',group:'group-max',integrationId:'integration-max'};
-async function run(change = {}, ack = 'valid', rows = [validRow]) {
+const hash = 'a'.repeat(64), post = 'post-max', group = 'fixture-group', integrationId = 'fixture-max';
+const storedPost = {id: post, parentPostId: null, state:'DRAFT', group, integrationId};
+async function run(change = {}, ack = 'valid', rows = [{...storedPost}]) {
  const calls = [], events = [], headers = {}, request = {method:'POST', path:'/public/v1/posts',
   headers:{'x-max-postiz-expected-hash':hash}, body:{type:'draft',republish:false,
-  posts:[{group:'group-max',integration:{id:'integration-max'},value:[{id:post,content:'corrected'}]}]}, ...change};
+  posts:[{group,integration:{id:integrationId},value:[{id:post,content:'corrected'}]}]}, ...change};
  const context = {switchToHttp:()=>({getRequest:()=>request,
   getResponse:()=>({once:(...a)=>events.push(a),setHeader:(k,v)=>headers[k]=v})})};
  const scope = {process:{env:{MAX_POSTIZ_BRIDGE_KEY:'mock-key'}},
@@ -220,16 +220,16 @@ async function run(change = {}, ack = 'valid', rows = [validRow]) {
   assert.equal(result.calls.length,0);
  }
  result = await run({},'valid',[]); assert.equal(result.error,'MAX_BROWSER_CAS_INVALID');
- for (const change of [{state:'QUEUE'},{group:'wrong-group'},{integrationId:'wrong-integration'},
+ for (const change of [{state:'QUEUE'},{group:'other-group'},{integrationId:'other-integration'},
   {state:undefined},{group:undefined},{integrationId:undefined}]) {
-  result = await run({},'valid',[{...validRow,...change}]);
+  result = await run({},'valid',[{...storedPost,...change}]);
   assert.equal(result.error,'MAX_BROWSER_CAS_INVALID'); assert.equal(result.calls.length,0);
  }
  for (const entry of [
-  {integration:{id:'integration-max'},value:[{id:post,content:'corrected'}]},
-  {group:'group-max',value:[{id:post,content:'corrected'}]},
-  {group:'wrong-group',integration:{id:'integration-max'},value:[{id:post,content:'corrected'}]},
-  {group:'group-max',integration:{id:'wrong-integration'},value:[{id:post,content:'corrected'}]},
+  {integration:{id:integrationId},value:[{id:post,content:'corrected'}]},
+  {group,value:[{id:post,content:'corrected'}]},
+  {group:'other-group',integration:{id:integrationId},value:[{id:post,content:'corrected'}]},
+  {group,integration:{id:'other-integration'},value:[{id:post,content:'corrected'}]},
  ]) {
   result = await run({body:{type:'draft',republish:false,posts:[entry]}});
   assert.equal(result.error,'MAX_BROWSER_CAS_INVALID'); assert.equal(result.calls.length,0);

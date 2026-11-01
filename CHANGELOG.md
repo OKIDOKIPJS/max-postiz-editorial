@@ -1,5 +1,31 @@
 # История версий
 
+## 0.12.3 — 2026-11-01: объединение четырёх маршрутов с main
+
+- Объединены разработка 0.12.2 и исправления безопасности/CI из main 0.11.10.
+  Сохранены маршруты MAX/Telegram/VK, прежний код Пикабу, ограничения согласования,
+  unknown/lease, защита путей конфигурации и обновлённые dependency lock-файлы.
+- Версии pyproject.toml и __init__.py согласованы на 0.12.3. История обеих веток
+  сохранена; отдельная Android-monitor ветка в это слияние не включается.
+- Разрешены конфликты benchmark adapter и строгого соответствия image chunks;
+  тестовые фикстуры сохраняют актуальные CAS controls и проверки обеих веток.
+- Файловый API защищает новые VK browser profiles наравне с MAX/OpenCode:
+  добавлены 14 синтетических проверок приватных namespace, symlink и импорта.
+- CI Node runner проверяет также production build contract с его замороженной
+  fixture; сборка Docker и внешние публикации этими mock-проверками не запускаются.
+- Проверки объединённых исходников в новом изолированном venv с pins main:
+  761 passed, 10 skipped в security/CI/benchmark/CAS/source-наборе;
+  730 passed, 3 skipped, 1 deselected в Telegram/VK/supervisor-наборе.
+  Пропуски относятся к Windows symlink/Linux cgroup и отсутствию тестовой
+  PostgreSQL. Ruff, 55 dependency pins, pip check и wheel/sdist build прошли;
+  все 134 Node mock tests прошли. Полный GitHub CI обязателен перед merge.
+- Позднейшая живая приёмка Telegram 1 ноября подтвердила один пост с фото
+  1400×1000 и подписью 450 символов после reload. Это отдельное browser evidence;
+  API verified=false сохранён. В рамках слияния новых публикаций не выполняли.
+- Ограничения: слияние не развёртывает релиз на рабочей VM и не переносит сессии,
+  БД или токены. Серверная приёмка/TLS и общий контракт будущих изображений VK
+  остаются отдельными задачами. Пикабу не включается, внешних действий нет.
+
 ## 0.12.2 — 2026-11-01: native Docker и изображение VK приняты в копии
 
 - Полный Next прошёл webpack, TypeScript, page data, static generation,
@@ -957,6 +983,140 @@
   Наборы пересекаются и не суммируются. Ruff и diff-check прошли. Изолированная
   PostgreSQL QA и установка ещё не выполнены; исторические результаты ниже
   сохранены, локальные проверки не объявляются живой доставкой.
+## 0.11.10 — 2026-11-01: разбор CodeQL и исправления зависимостей
+
+- Выполнен разбор 45 CodeQL alerts по сохранённому SARIF основного Python analysis.
+  Подтверждены 7 отмеченных мест в двух связанных цепочках (3 прямых sink и
+  4 prerequisite/validation locations), остальные 38 — доказанные false positives.
+  Это не семь отдельных дефектов. Полное сопоставление всех 45 locations,
+  регрессионных тестов и 82 dependency alerts: docs/security/2026-11-01-v0.11.10.json.
+  После полной индексации манифестов Dependabot показал 82 alerts: 50 уникальных
+  advisory для шести пакетов; дубли разных манифестов учитываются отдельно.
+- Уязвимые объявленные версии заменены: Pillow 13.0.0, cryptography 50.0.2,
+  certifi 2026.10.23, setuptools 84.2.1, opentelemetry-api 1.45.2,
+  Transformers 5.17.0 и совместимый huggingface-hub 1.33.0. Минимальные/верхние
+  границы и runtime/dev/images locks согласованы с requirements-ci.txt.
+  Для advisory Transformers без first_patched_version проверено включение
+  конкретного upstream fix commit в release, а не только уязвимый диапазон.
+- Исходные CodeQL flows для env names, подписанной cookie и фиксированного argv
+  проверены отдельными synthetic controls. Значения ключей не помещаются в отчёт;
+  подтверждённые ошибки путей и ложные срабатывания фиксируются раздельно.
+- Исправлены пять функциональных дефектов: обход topic/sources namespace,
+  workflow collision с проверенными файлами, direct private JSON selection,
+  открытый неявный/перенесённый стандартный профиль и workflow=None readback.
+  Одна privacy policy защищает известные default и настроенные browser/OpenCode
+  roots, включая roots под config/. Schema poisoning не проходит предварительную
+  проверку; все targets перепроверяются до записи. Live guards sending/unknown,
+  mutation locks, восстановление прежних файлов и публикационные проверки сохранены.
+- В отдельных окружениях прошли pip check, аудит 55 core pins и 37 resolved
+  translation dependencies без Torch: 0 известных advisory в проверенных наборах.
+  Pillow formats, Fernet и CA bundle проверены smoke; synthetic Fernet ciphertext
+  совместим в обе стороны между cryptography 49.0.0 и 50.0.2. Wheel/sdist собраны.
+  Итоговый локальный набор на обновлённых зависимостях: 104 passed, 4 ожидаемых
+  Windows symlink skipped, 1 прежний Starlette/httpx warning; Ruff/pins прошли.
+  Полные GitHub pytest/CodeQL и Linux symlink-контроли обязательны перед merge.
+- Установки и проверки выполняются в отдельных локальных окружениях/временных
+  каталогах. Модели, рабочая VM, её БД, очереди, история, публикации и исходный
+  checkout не изменяются. Новая версия относится к репозиторию и ещё не установлена
+  на работающий сервер. Финальные проверки и disposition записываются в этом наборе.
+
+## 0.11.7 — 2026-11-01: полный Windows pytest четырьмя обязательными частями
+
+- Последовательный Windows job дошёл до 88% и был остановлен по лимиту 45 минут;
+  `CI required` завершился ошибкой и сохранил запрет merge. Linux проверен полностью:
+  4863 passed, 18 ожидаемых PostgreSQL skipped, 1 warning; отдельная PostgreSQL 17:
+  199 passed, 1 warning, без пропусков. Таймаут не выдан за успешный тест.
+- Windows collection разделена на четыре обязательных job по SHA256 nodeid.
+  Ни один тест не удаляется: `CI required` проверяет успех всех matrix jobs и
+  receipts четырёх частей — одинаковый полный collection/hash, точные counts,
+  однократное назначение каждого nodeid, отсутствие пересечений/потерь и exit 0.
+  Отфильтрованный набор и повреждённые/неполные receipts блокируют merge.
+- JUnit и receipts имеют разные имена artifacts; агрегатор получает только чтение
+  Actions. Download action закреплён по SHA. Linux сохраняет полный pytest/coverage,
+  PostgreSQL и Node Windows/Linux остаются обязательными. Hard gates не ослаблены,
+  runtime-пакет, production-сервер, модели, очередь и публикации не менялись.
+- До применения проверено на 28 синтетических тестах: четыре непересекающиеся
+  части полностью покрыли collection; перестановка порядка не меняет назначения;
+  pytest failure/usage/no-tests и неверные параметры сохраняют ненулевые exit codes.
+  Постоянный набор проверки wrapper/receipts: 23 passed; checker работает без
+  site-packages (`python -S`); Ruff, pins и actionlint прошли. Полный GitHub CI
+  повторяется на новой конфигурации перед штатным merge.
+
+## 0.11.7 — 2026-11-01: исправления по первому полному GitHub CI
+
+- Первый полный Ubuntu pytest обнаружил шесть ошибок: 4857 passed, 6 failed,
+  18 PostgreSQL skipped, 1 warning. Существующий benchmark subclass обходил
+  родительский конструктор и не имел `segment_chars`/`config_hash`; три маршрута
+  завершались AttributeError до HTTP. Добавлена инициализация прежнего лимита
+  1400 и hash фактической конфигурации маршрута. Критерии, raw, запрет повтора
+  неизвестного исхода и production adapter не ослаблялись.
+- Native CAS test теперь использует полный актуальный DRAFT/group/integration
+  snapshot. Добавлены три проверки отказа для изменённых state/group/integration;
+  рабочий TypeScript guard и его pinned hashes не менялись. Локально весь CAS
+  модуль: 20 passed, 1 deprecation warning; benchmark: 34 passed, без пропусков.
+- В PostgreSQL job добавлены test_article_reserve_store и test_reserve_preclick_recovery:
+  это ещё четыре проверки гонок/истории, которые в общем наборе требуют отдельной
+  БД. Ruff дополнительно охватывает исправленный benchmark. Полный CI повторяется
+  на исправленном commit; защита main остаётся активной, failing PR не объединён.
+- Полный pytest остаётся обязательным на обеих ОС; coverage собирается на Linux,
+  чтобы Windows не повторяла ту же инструментированную проверку. Каждый новый
+  commit PR проверяется через pull_request/synchronize, main — через push;
+  устранены два одинаковых CI запуска на каждое изменение PR.
+- Исправления выполнялись в отдельном worktree. Работающий сервер, модели,
+  production-БД, публикации и исходный checkout не затронуты.
+
+## 0.11.7 — 2026-11-01: проверка pins Dependabot и фактическое включение защиты
+
+- Ruleset `Protect main` №26308277 включён и прочитан обратно через GitHub API:
+  PR, обязательный актуальный `CI required` от app 15368, CodeQL errors/high,
+  запрет удаления/force push и пустой bypass. Пока проверки PR не завершены,
+  GitHub показывает `BLOCKED`. Настройки безопасности прочитаны обратно:
+  Dependabot security updates, Secret scanning и Push protection включены;
+  открытых Secret scanning alerts на момент проверки нет.
+- Dependabot не разбирает нестандартные `requirements*.lock`. Добавлен поддерживаемый
+  `requirements-ci.txt` с 55 точными pins из runtime/dev/browser locks и обязательный
+  stdlib-checker их равенства. PR обновления требует синхронной правки соответствующих
+  locks; изменение одного лишь манифеста не пройдёт CI. Старые locks не мигрировали.
+  TypeScript/tslib исключены из обычных автообновлений: их версии закреплены CAS
+  contract и меняются вместе с доказательствами компиляции.
+- Явно разрешена выгрузка только выбранных скрытых JUnit/coverage-файлов;
+  для `.yml` закреплён LF. Дополнительные проверки: actionlint 1.7.12 прошёл,
+  checker pins прошёл positive-case и семь независимых negative-cases,
+  локальный целевой pytest — 671 passed, 5 expected skipped, 1 warning.
+  Первые GitHub Ruff/build, PostgreSQL, Node Windows/Linux и CodeQL jobs прошли;
+  итог полного CI проверяется на последней версии PR перед объединением.
+- CodeQL baseline и шесть прежних Dependabot alerts (4 high, 1 medium, 1 low)
+  сохранены открытыми для отдельного разбора. Ничего не dismissed/подавлено,
+  защита не ослаблялась ради старых alerts. Работающий сервер не затронут.
+
+## 0.11.7 — 2026-11-01: GitHub CI и защита main
+
+- Добавлены обязательные проверки GitHub Actions: Ruff, совместимость зависимостей,
+  сборка wheel/sdist, полный pytest с Chrome на Windows/Linux, отдельная одноразовая
+  PostgreSQL 17 и пять Node suites Postiz на обеих ОС. Агрегатор `CI required`
+  отклоняет failed/cancelled/skipped jobs; Actions закреплены по точным commit SHA,
+  token имеет только чтение, JUnit/coverage сохраняются на семь дней.
+- Node tooling отделён от OpenCode runtime и закреплён lock-файлом. CAS guard
+  компилируется только во временной копии с проверкой source/compiled SHA;
+  все suites обязательны, пропуски запрещены. Нормализация LF воспроизводит Git
+  blobs на Windows, не переписывая исходники и не обращаясь к Docker/серверу.
+- Добавлены Dependabot для Python, npm и Actions, а также декларативный ruleset:
+  PR, успешный `CI required` именно от GitHub Actions, актуальная база, CodeQL,
+  запрет force push/удаления main и обязательное закрытие обсуждений. Для одного
+  владельца не требуется чужой approving review; bypass не предусмотрен.
+- В GitHub включены Dependabot alerts/security updates, Secret scanning,
+  Push protection и CodeQL Python/JavaScript/TypeScript. Первый CodeQL baseline
+  завершился успешно и сохранил 45 открытых alerts (2 critical, 42 high, 1 medium).
+  Они не подавлялись и требуют отдельного разбора; успешный scan не означает
+  отсутствие уязвимостей. CodeQL merge protection оценивает находки PR diff.
+- Исправлены 55 нарушений существующего Ruff без ослабления правил: многооператорные
+  строки тестов, регистрация pytest fixtures, явная строгость zip и имя неиспользуемого
+  значения при сохранении обязательного чтения `payload["chat_id"]`.
+- Локально: зависимости установлены в отдельную .venv; pip check и wheel/sdist
+  прошли; Node 89 passed, 0 failed/skipped; CAS 81 mocked checks; npm audit tooling
+  не нашёл уязвимостей. Полные GitHub jobs и применение ruleset проверяются отдельно.
+  Версия runtime-пакета не менялась; работающая VM, её БД, очереди, публикации,
+  модели и существующие локальные checkout не изменялись.
 
 ## 0.11.7 — 2026-10-30: установка, закрытие старого unknown и фактическая доставка
 
