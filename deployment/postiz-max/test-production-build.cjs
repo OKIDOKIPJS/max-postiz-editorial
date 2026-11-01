@@ -2,9 +2,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+const crypto = require('node:crypto');
+const { spawnSync } = require('node:child_process');
 const { argumentsFor, structuralCheck, main } = require('./build-production-image.cjs');
+const frontend = require('./patch-production-frontend.cjs');
+const originSecurity = require('./production-origin.cjs');
 
-const args = ['--build', '--origin', 'http://postiz.test:14007', '--tag', 'max-postiz-linux:0.12.1-production-test'];
+const args = ['--build', '--origin', 'http://127.0.0.1:14007', '--tag', 'max-postiz-linux:0.12.1-production-test'];
 function docker(options = {}) {
   const calls = [];
   const run = (command, parameters) => {
@@ -24,6 +29,7 @@ function docker(options = {}) {
 test('fresh recipe checks exact pinned source sets and rebuilds all native targets after both overlays', () => {
   const checked = structuralCheck(__dirname);
   assert.equal(checked.upstream_source_pin_count, 11); assert.equal(checked.editorial_source_pin_count, 2);
+  assert.equal(checked.frontend_config_source_pin_count, 1);
   assert.equal(checked.compiled_artifact_reused, false); assert.equal(checked.full_native_rebuild_required, true);
   const upstream = JSON.parse(fs.readFileSync(path.join(__dirname, 'source-manifest.json')));
   const editorial = JSON.parse(fs.readFileSync(path.join(__dirname, 'editorial-manifest.json')));
@@ -37,6 +43,116 @@ test('fresh recipe checks exact pinned source sets and rebuilds all native targe
   assert.ok(recipe.includes('max-browser.provider.ts max-browser.guard.ts'));
   assert.ok(!recipe.includes('FROM max-postiz-')); assert.ok(!recipe.includes('COPY . '));
   assert.ok(!/^RUN .*prisma (?:db push|migrate)/m.test(recipe));
+  assert.ok(recipe.indexOf('pnpm --filter ./apps/orchestrator build') < recipe.indexOf('node /adapter/patch-production-frontend.cjs'));
+  assert.ok(recipe.indexOf('node /adapter/patch-production-frontend.cjs') < recipe.indexOf('pnpm --filter ./apps/frontend exec next build --webpack'));
+});
+
+test('native server sanitizer is externalized with one additive line against the exact pinned official Next config', () => {
+  // Official Postiz source at 91c91f633a0175fb3914dba64c932928c514b72a.
+  const raw = fs.readFileSync(path.join(__dirname, 'fixtures/production-next.config.upstream.cjs'));
+  assert.equal(crypto.createHash('sha256').update(raw).digest('hex'), frontend.UPSTREAM_NEXT_CONFIG_SHA256);
+  const planned = frontend.planFrontendConfig(raw);
+  const addition = "  serverExternalPackages: ['isomorphic-dompurify'],\n";
+  assert.equal(planned.split(addition).length, 2);
+  assert.equal(planned.replace(addition, ''), raw.toString('utf8'));
+  assert.ok(planned.includes('productionBrowserSourceMaps: true'));
+  assert.ok(planned.includes('export default withSentryConfig(nextConfig'));
+  assert.ok(!/ignoreBuildErrors|ignoreDuringBuilds|swcMinify|typescript\s*:/.test(planned));
+});
+
+test('changed, already patched, non-buffer or truncated Next source is refused without writing', () => {
+  const raw = fs.readFileSync(path.join(__dirname, 'fixtures/production-next.config.upstream.cjs'));
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'postiz-next-pin-'));
+  try {
+    const target = path.join(folder, frontend.UPSTREAM_NEXT_CONFIG);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    for (const bad of [Buffer.concat([raw, Buffer.from('\n')]), Buffer.from(frontend.planFrontendConfig(raw)), raw.subarray(0, 32)]) {
+      fs.writeFileSync(target, bad);
+      assert.throws(() => frontend.main(folder), /PRODUCTION_FRONTEND_SOURCE_MISMATCH/);
+      assert.deepEqual(fs.readFileSync(target), bad);
+    }
+    assert.throws(() => frontend.planFrontendConfig(raw.toString('utf8')), /PRODUCTION_FRONTEND_SOURCE_MISMATCH/);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('frontend config patch writes only the intended pinned file and refuses reentry', () => {
+  const raw = fs.readFileSync(path.join(__dirname, 'fixtures/production-next.config.upstream.cjs'));
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'postiz-next-native-'));
+  try {
+    const target = path.join(folder, frontend.UPSTREAM_NEXT_CONFIG);
+    fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, raw);
+    const result = frontend.main(folder);
+    assert.deepEqual(result.server_external_packages, ['isomorphic-dompurify']);
+    assert.equal(result.sanitizer_changed, false);
+    assert.equal(fs.readFileSync(target, 'utf8'), frontend.planFrontendConfig(raw));
+    assert.deepEqual(fs.readdirSync(path.dirname(target)), ['next.config.js']);
+    assert.throws(() => frontend.main(folder), /PRODUCTION_FRONTEND_SOURCE_MISMATCH/);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('secure mode is empty for HTTPS and true only for canonical literal loopback HTTP', () => {
+  for (const value of ['https://postiz.example', 'https://postiz.example:8443', 'https://127.0.0.1:14007']) {
+    assert.equal(originSecurity.securityForOrigin(value).not_secured, '');
+    assert.equal(originSecurity.validateBuildSecurity(value, '').origin, value);
+  }
+  for (const value of ['http://127.0.0.1:14007', 'http://[::1]:14007']) {
+    assert.equal(originSecurity.securityForOrigin(value).not_secured, 'true');
+    assert.equal(originSecurity.validateBuildSecurity(value, 'true').origin, value);
+  }
+});
+
+test('public HTTP, ambiguous origins and truthy false or omitted cookie modes fail closed', () => {
+  for (const value of ['http://postiz.example', 'http://localhost:14007', 'http://127.1:14007',
+    'http://2130706433:14007', 'http://127.0.0.1.example', 'http://[::ffff:127.0.0.1]',
+    'https://user:fixture-secret@postiz.example', 'https://postiz.example/path', 'https://postiz.example/',
+    'https://postiz.example?x=1', 'https://postiz.example#x', ' https://postiz.example', null, {}]) {
+    assert.throws(() => originSecurity.securityForOrigin(value), /PRODUCTION_BUILD_ORIGIN_INVALID/);
+  }
+  for (const selected of [undefined, '__UNSET__', 'true', 'false', '0', false, null]) {
+    assert.throws(() => originSecurity.validateBuildSecurity('https://postiz.example', selected), /PRODUCTION_COOKIE_MODE_INVALID/);
+  }
+  assert.throws(() => originSecurity.validateBuildSecurity('http://127.0.0.1:14007', ''), /PRODUCTION_COOKIE_MODE_INVALID/);
+});
+
+test('direct Docker validator accepts an explicit empty HTTPS argument and refuses omitted or contradictory modes', () => {
+  const helper = path.join(__dirname, 'production-origin.cjs');
+  for (const [values, passed] of [
+    [['https://postiz.example', ''], true], [['http://127.0.0.1:14007', 'true'], true],
+    [['https://postiz.example'], false], [['https://postiz.example', '__UNSET__'], false],
+    [['https://postiz.example', 'true'], false], [['https://postiz.example', 'false'], false],
+    [['http://postiz.example', 'true'], false], [['https://user:fixture-secret@postiz.example', ''], false],
+  ]) {
+    const result = spawnSync(process.execPath, [helper, ...values], { encoding: 'utf8' });
+    assert.equal(result.status === 0, passed);
+    assert.ok(!result.stdout.includes('fixture-secret') && !result.stderr.includes('fixture-secret'));
+    if (passed) assert.equal(JSON.parse(result.stdout).not_secured, values[1]);
+    else assert.match(result.stderr, /^PRODUCTION_[A-Z_]+\r?\n$/);
+  }
+});
+
+test('runner passes the explicit derived HTTPS empty build argument and rejects conflicting caller environment before Docker', () => {
+  const secureArgs = args.map(value => value === 'http://127.0.0.1:14007' ? 'https://postiz.example' : value);
+  const { run, calls } = docker();
+  main(secureArgs, run, __dirname, Object.freeze({ NOT_SECURED: '', PRODUCTION_NOT_SECURED: '' }));
+  const built = calls.find(call => call.includes('build'));
+  assert.ok(built.includes('PRODUCTION_NOT_SECURED='));
+  for (const environment of [{ NOT_SECURED: 'true' }, { NOT_SECURED: 'false' }, { PRODUCTION_NOT_SECURED: 'true' }]) {
+    assert.throws(() => main(secureArgs, () => assert.fail('No Docker for contradictory security'), __dirname, environment), /PRODUCTION_COOKIE_MODE_INVALID/);
+  }
+  assert.throws(() => main(args, () => assert.fail('No Docker for contradictory security'), __dirname, { NOT_SECURED: '' }), /PRODUCTION_COOKIE_MODE_INVALID/);
+  const publicHttp = args.map(value => value === 'http://127.0.0.1:14007' ? 'http://postiz.example' : value);
+  assert.throws(() => main(publicHttp, () => assert.fail('No Docker for public HTTP'), __dirname, {}), /PRODUCTION_BUILD_ORIGIN_INVALID/);
+});
+
+test('security validator and final ENV follow full Next so the native build cache remains reusable', () => {
+  const recipe = fs.readFileSync(path.join(__dirname, 'Dockerfile.production'), 'utf8');
+  const fullNext = recipe.indexOf('RUN pnpm --filter ./apps/frontend exec next build --webpack');
+  const guard = recipe.indexOf('RUN node /adapter/production-origin.cjs "$PUBLIC_ORIGIN" "$PRODUCTION_NOT_SECURED"');
+  const finalEnv = recipe.indexOf('ENV NOT_SECURED=$PRODUCTION_NOT_SECURED');
+  assert.ok(fullNext < guard && guard < finalEnv);
+  assert.ok(recipe.includes('ARG PRODUCTION_NOT_SECURED=__UNSET__'));
+  assert.ok(!recipe.slice(finalEnv).includes('NOT_SECURED=true'));
+  assert.equal(recipe.slice(fullNext, guard).match(/\bRUN\b/g).length, 1);
 });
 
 test('check is strictly local and never claims a built image or accesses Docker', () => {
@@ -51,7 +167,8 @@ test('fresh build invokes only local-context probes and one Docker build, no ser
   const builds = calls.filter(call => call.includes('build')); assert.equal(builds.length, 1);
   assert.equal(builds[0][builds[0].indexOf('--builder') + 1], 'default');
   assert.ok(builds[0].includes(path.join(__dirname, 'Dockerfile.production')));
-  assert.ok(builds[0].includes('PUBLIC_ORIGIN=http://postiz.test:14007'));
+  assert.ok(builds[0].includes('PUBLIC_ORIGIN=http://127.0.0.1:14007'));
+  assert.ok(builds[0].includes('PRODUCTION_NOT_SECURED=true'));
   assert.ok(calls.every(call => !call.some(value => ['run', 'compose', 'start', 'stop', 'volume', 'push', 'tag'].includes(value))));
 });
 

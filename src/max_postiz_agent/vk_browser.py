@@ -1,6 +1,7 @@
 """VK через отдельный пользовательский браузер; VK ID token не подменяет право wall/photos."""
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -59,6 +60,28 @@ PERSONAL_TEXT_DOM = {
     "blocked": 'iframe[src*="captcha" i],[data-testid="captcha"]',
     "errors": '[data-testid="posting_modal_box"] :is([role="alert"],[aria-invalid="true"])',
 }
+# Observed native input/upload/preview/public-photo controls. Their presence in
+# code does not enable media: flags and a bound observation artifact stay required.
+PERSONAL_IMAGE_DOM = {
+    **{key: value for key, value in PERSONAL_TEXT_DOM.items() if key not in {"uploaded_images", "preview_images"}},
+    "upload_input": '[role="dialog"][data-testid="posting_modal_box"] input[type="file"][data-testid="posting_base_screen_download_from_device"]',
+    "uploaded_asset": '[role="dialog"][data-testid="posting_modal_box"] [data-sortable-item="true"][data-sortable-id^="photo"]',
+    "uploaded_asset_id_attribute": "data-sortable-id",
+    "uploaded_images": '[role="dialog"][data-testid="posting_modal_box"] [data-sortable-item="true"][data-sortable-id^="photo"] [data-testid="posting_attachment_item"] img',
+    "preview_asset": '[role="dialog"][data-testid="posting_modal_box"] [data-testid="posting_preview_attachment_item"]',
+    "preview_asset_binding": "uploaded-cdn-url-v1",
+    "preview_images": '[role="dialog"][data-testid="posting_modal_box"] [data-testid="posting_preview_attachment_item"] img',
+    "preview_grid": '[role="dialog"][data-testid="posting_modal_box"] [data-testid="grid-item"]',
+    "uploaded_transform": '[role="dialog"][data-testid="posting_modal_box"] [data-testid="posting_attachment_item"]',
+    "preview_transform": '[role="dialog"][data-testid="posting_modal_box"] [data-testid="posting_preview_attachment_item"]',
+    "photo_transform_contract": "native-photo-transform-v1",
+    "post_asset": 'a[data-testid="primary-attachment-interactive-wrapper"][href^="/photo"]',
+    "post_asset_id_attribute": "href",
+    "post_images": 'a[data-testid="primary-attachment-interactive-wrapper"] img[data-testid="primary-attachment-image-content"]',
+    "photo_viewer": "#pv_box._scroll_node.pv_box",
+    "photo_viewer_image": '#pv_photo > img[data-testid="pv_photo_image"]',
+    "photo_original": "a#pv_more_act_download",
+}
 REQUIRED_DOM = {"account", "open_editor", "editor", "upload_input", "uploaded_images",
                 "recipient", "preview_author", "preview_text", "preview_images", "publish", "publish_label",
                 "posts", "post_text", "post_link", "post_author", "post_images", "forbidden_settings",
@@ -105,13 +128,14 @@ def wall_url(destination, options):
 
 def dom_contract(options, *, publish=False):
     profile = options.get("dom_contract_profile")
-    if profile not in {None, "personal-text-v1"}:
+    if profile not in {None, "personal-text-v1", "personal-image-v1"}:
         raise AgentError("VK_BROWSER_DOM_PROFILE_UNSUPPORTED")
     extra = options.get("dom_contract", {})
     if (not isinstance(extra, dict) or any(not isinstance(key, str) or not isinstance(value, str)
             or not value.strip() or len(value) > 1000 for key, value in extra.items())):
         raise AgentError("VK_BROWSER_DOM_CONTRACT_INVALID")
-    selectors = {**(PERSONAL_TEXT_DOM if profile else OBSERVED_DOM), **extra}
+    base = PERSONAL_IMAGE_DOM if profile == "personal-image-v1" else PERSONAL_TEXT_DOM if profile else OBSERVED_DOM
+    selectors = {**base, **extra}
     identity = selectors.get("identity_contract", "explicit-v1")
     if identity not in {"explicit-v1", "personal-wall-settings-v1"}:
         raise AgentError("VK_BROWSER_IDENTITY_CONTRACT_INVALID")
@@ -121,6 +145,11 @@ def dom_contract(options, *, publish=False):
             "modal", "preview_scope", "story_switch", "coauthors", "visibility", "text_contract"}
         if selectors.get("text_contract") not in {"vk-spacer-div-v1", "vk-native-text-v2"}:
             raise AgentError("VK_BROWSER_TEXT_CONTRACT_UNVERIFIED")
+    if profile == "personal-image-v1":
+        from .vk_media import REQUIRED_DOM as MEDIA_DOM
+        if identity != "personal-wall-settings-v1":
+            raise AgentError("VK_BROWSER_MEDIA_IDENTITY_CONTRACT_INVALID")
+        required = required | MEDIA_DOM
     if publish and (options.get("dom_contract_verified") is not True
                     or not required <= selectors.keys()):
         raise AgentError("VK_BROWSER_DOM_CONTRACT_UNVERIFIED")
@@ -175,11 +204,13 @@ def prepare(root, options, destination, snapshot):
     media = snapshot.get("media", [])
     if not isinstance(media, list) or len(media) > 1:
         raise AgentError("VK_BROWSER_SINGLE_PHOTO_REQUIRED")
+    if options.get("dom_contract_profile") == "personal-image-v1" and len(media) != 1:
+        raise AgentError("VK_BROWSER_SINGLE_PHOTO_REQUIRED")
     if media and options.get("dom_contract_profile") == "personal-text-v1":
         raise AgentError("VK_BROWSER_TEXT_PROFILE_MEDIA_UNSUPPORTED")
     if media and options.get("media_contract_verified") is not True:
         raise AgentError("VK_BROWSER_MEDIA_CONTRACT_UNVERIFIED")
-    checked = []
+    checked, frozen_raw = [], None
     for item in media:
         if (not isinstance(item, dict) or not isinstance(item.get("path"), str)
                 or item.get("mime") not in {"image/jpeg", "image/png"}
@@ -192,7 +223,7 @@ def prepare(root, options, destination, snapshot):
             raw = path.read_bytes()
             if hashlib.sha256(raw).hexdigest() != item["sha256"]:
                 raise AgentError("VK_BROWSER_IMAGE_HASH_CHANGED", 409)
-            with Image.open(path) as image:
+            with Image.open(io.BytesIO(raw)) as image:
                 mime = {"JPEG": "image/jpeg", "PNG": "image/png"}.get(image.format)
                 if (mime != item["mime"] or image.width * image.height > 40_000_000
                         or getattr(image, "n_frames", 1) != 1):
@@ -201,12 +232,21 @@ def prepare(root, options, destination, snapshot):
         except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
             raise AgentError("VK_BROWSER_PHOTO_FORMAT_INVALID") from None
         checked.append(dict(item))
-    return {"destination": destination, "wall_url": url, "owner": owner_id(options),
+        frozen_raw = raw
+    result = {"destination": destination, "wall_url": url, "owner": owner_id(options),
             "text": text, "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "media": checked, "snapshot_sha256": snapshot_hash,
             "dom_contract_sha256": fingerprint(selectors), "title_format": "plain",
             "author_id_attribute": selectors.get("author_id_attribute"),
             "allowed_text_urls": approved_text_urls(text, snapshot)}
+    if options.get("dom_contract_profile") == "personal-image-v1":
+        from .vk_media import LINK_CONTRACT, image_identity, require_contract
+        result["image_contract"] = require_contract(root, options, selectors, result["owner"])
+        result["source_image"] = image_identity(frozen_raw)
+        if result["source_image"]["source_sha256"] != checked[0]["sha256"]:
+            raise AgentError("VK_BROWSER_IMAGE_HASH_CHANGED")
+        result["link_contract"] = LINK_CONTRACT
+    return result
 
 
 def _receipt_author(value, destination, expected_attribute):
@@ -234,6 +274,27 @@ def _receipt_author(value, destination, expected_attribute):
         except (AgentError, ValueError):
             return False
     return href is None and attribute is not None
+
+
+def _receipt_images(item, plan, proof, request_id, fixture, media_review=None):
+    if not plan.get("image_contract"):
+        return (isinstance(item.get("image_sha256"), list)
+                and item["image_sha256"] == [media["sha256"] for media in plan["media"]])
+    from .vk_media import receipt_origin, validate_proof, validate_upload
+    upload, images = proof.get("upload"), item.get("image_proofs")
+    try:
+        origin = receipt_origin(upload, fixture)
+    except AgentError:
+        return False
+    if (not validate_upload(upload, plan, request_id, origin=origin) or not isinstance(images, list) or len(images) != 1
+            or "image_sha256" in item or item.get("link_contract") != plan["link_contract"]):
+        return False
+    if media_review:
+        from .vk_media_review import validate_accepted_proof
+        return validate_accepted_proof(images[0], plan["source_image"], plan["image_contract"],
+                                       upload["asset_id"], media_review, origin=origin)
+    return validate_proof(images[0], plan["source_image"], plan["image_contract"],
+                          plan["owner"], upload["asset_id"], origin=origin)
 
 
 class VKBrowser:
@@ -296,7 +357,8 @@ class VKBrowser:
                 "profile": self.options.get("profile_dir", "data/vk-browser")}
 
     @staticmethod
-    def _delivery(value, destination, request_id, plan=None, *, expected_fixture=None, minimum_observed_at=None):
+    def _delivery(value, destination, request_id, plan=None, *, expected_fixture=None, minimum_observed_at=None,
+                  expected_media_review=None):
         if not isinstance(value, dict):
             return Delivery("unknown", verified=False,
                             evidence={"failure_code": "VK_BROWSER_RECEIPT_INVALID"})
@@ -309,7 +371,22 @@ class VKBrowser:
             ident = value.get("external_id")
             proof = evidence.get("proof") if isinstance(evidence, dict) else None
             reloads = proof.get("reloads") if isinstance(proof, dict) else None
-            expected_images = [item["sha256"] for item in plan["media"]] if isinstance(plan, dict) else None
+            native_image = isinstance(plan, dict) and plan.get("image_contract")
+            verification = ("independent_wall_reload_exact_text_recipient_author_native_photo_v1" if native_image
+                            else "independent_wall_reload_exact_text_recipient_author_image_sha256")
+            review_valid = True
+            if expected_media_review is not None:
+                from .vk_media_review import VERIFICATION, reference
+                try:
+                    review_valid = (bool(native_image) and isinstance(proof, dict)
+                        and ident == expected_media_review["details"]["external_id"]
+                        and proof.get("media_review") == reference(expected_media_review)
+                        and proof.get("original_policy_satisfied") is False)
+                except (KeyError, TypeError, ValueError):
+                    review_valid = False
+                verification = VERIFICATION
+            elif isinstance(proof, dict) and ("media_review" in proof or "original_policy_satisfied" in proof):
+                review_valid = False
             observed_at = proof.get("observed_at") if isinstance(proof, dict) else None
             if (not isinstance(ident, str) or not re.fullmatch(re.escape(destination) + r"_[1-9][0-9]{0,18}", ident)
                     or value.get("permalink") != ORIGIN + "/wall" + ident
@@ -329,12 +406,11 @@ class VKBrowser:
                     or type(observed_at) not in {int, float} or observed_at <= 0 or observed_at > 1e12
                     or not math.isfinite(observed_at)
                     or minimum_observed_at is not None and observed_at < minimum_observed_at
-                    or proof.get("verification") != "independent_wall_reload_exact_text_recipient_author_image_sha256"
+                    or proof.get("verification") != verification or not review_valid
                     or not isinstance(reloads, list) or len(reloads) != 2
                     or any(not isinstance(item, dict) or item.get("external_id") != ident
                            or item.get("text_sha256") != plan["text_sha256"]
-                           or not isinstance(item.get("image_sha256"), list)
-                           or item.get("image_sha256") != expected_images
+                           or not _receipt_images(item, plan, proof, request_id, expected_fixture, expected_media_review)
                            or not isinstance(item.get("text_links"), list)
                            or any(not isinstance(href, str) or href not in plan["allowed_text_urls"]
                                   for href in item["text_links"])
@@ -368,6 +444,9 @@ class VKBrowser:
                 or not isinstance(evidence, dict) or journal.get("proof") != evidence.get("proof")
                 or journal.get("clicks") != evidence.get("clicks")):
             raise AgentError("VK_BROWSER_RECEIPT_INVALID", 409)
+        if plan.get("image_contract") and (journal.get("upload_proof") != journal["proof"].get("upload")
+                or journal.get("dom_contract_sha256") != plan["dom_contract_sha256"]):
+            raise AgentError("VK_BROWSER_RECEIPT_INVALID", 409)
         return journal["fixture"]
 
     def publish(self, destination, snapshot, request_id):
@@ -396,13 +475,21 @@ class VKBrowser:
                 raise AgentError("VK_BROWSER_JOURNAL_CONFLICT", 409)
             if journal.get("snapshot_sha256") != plan["snapshot_sha256"]:
                 raise AgentError("VK_BROWSER_RECONCILE_SNAPSHOT_MISMATCH", 409)
+            media_review = None
+            if plan.get("image_contract"):
+                from .vk_media_review import load_review
+                media_review = load_review(self.root, self.options, destination, request_id, plan, journal)
             started_at = time.time()
             value = self._call("reconcile", destination, request_id=request_id)
             fixture = (self._confirmed_journal(value, destination, request_id, plan,
                                                expected_fixture=journal["fixture"])
                        if isinstance(value, dict) and value.get("state") == "confirmed" else None)
+            if isinstance(value, dict) and value.get("state") == "confirmed" and plan.get("image_contract"):
+                _, current_journal = _read(self.root, request_id)
+                if load_review(self.root, self.options, destination, request_id, plan, current_journal) != media_review:
+                    raise AgentError("VK_BROWSER_ACTUAL_MEDIA_ACCEPTANCE_CHANGED", 409)
             return self._delivery(value, destination, request_id, plan, expected_fixture=fixture,
-                                  minimum_observed_at=started_at)
+                                  minimum_observed_at=started_at, expected_media_review=media_review)
         except AgentError as exc:
             return Delivery("unknown", value.get("external_id") if isinstance(value, dict) else None,
                             value.get("permalink") if isinstance(value, dict) else None,

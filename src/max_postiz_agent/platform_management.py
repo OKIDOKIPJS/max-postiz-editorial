@@ -175,6 +175,7 @@ def preview(core, variant_id):
 
 def reconcile(core, dispatch_id, actor="owner"):
     """Только чтение внешнего результата, без повторной загрузки или отправки."""
+    reconciliation_started = now()
     with core.db.session() as session:
         dispatch = session.get(Dispatch, dispatch_id)
         if dispatch is None or dispatch.state not in {"sending", "unknown"}:
@@ -215,6 +216,11 @@ def reconcile(core, dispatch_id, actor="owner"):
         if (row.state != "unknown" or row.owner is not None or row.snapshot_hash != frozen
                 or current != frozen or stored != frozen or approval is None or approval.revoked):
             raise AgentError("APPROVAL_STALE", 409)
+        proof = delivery.evidence.get("proof") if isinstance(delivery.evidence, dict) else None
+        if delivery.state == "confirmed" and isinstance(proof, dict):
+            from .vk_media_review import VERIFICATION, final_acceptance_check
+            if proof.get("verification") == VERIFICATION or "media_review" in proof:
+                final_acceptance_check(core, session, row, current_target, delivery, not_before=reconciliation_started)
         if delivery.external_id:
             row.external_id = delivery.external_id
         if delivery.state == "confirmed":

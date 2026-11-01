@@ -217,7 +217,7 @@ def test_invalid_timeout_never_starts_process(monkeypatch, timeout):
 
 
 def test_nonzero_worker_exit_is_a_completed_process(kernel_ownership):
-    result = runner.run_browser_worker([sys.executable, "-c", "import sys;sys.stderr.write('failed');sys.exit(7)"],
+    result = runner.run_browser_worker([sys.executable, "-c", "import sys;sys.stdin.read();sys.stderr.write('failed');sys.exit(7)"],
                                       input="{}", timeout=10)
     assert result.returncode == 7 and result.stdout == "" and result.stderr == "failed"
 

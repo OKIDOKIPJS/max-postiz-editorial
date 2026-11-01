@@ -7,6 +7,11 @@
 контрольные суммы поставляемых архивов записываются в release-verification.json.
 Исторический протокол 0.12.0 сохранён в `FOUR_PLATFORM_ACCEPTANCE.md`.
 
+Продолжение 0.12.2 с отдельным Linux-стендом описано в
+[протоколе полной приёмки](FOUR_PLATFORM_FULL_READINESS.md). Ниже сохранены
+результаты 0.12.1; ограничения Docker/Linux того среза не заменяют новый протокол.
+Новые тесты Пикабу остановлены по последнему поручению владельца.
+
 ## Установка новой копии
 
 Нужны Python 3.12, собственный `.venv` и Google Chrome для браузерных маршрутов.
@@ -143,26 +148,39 @@ intent; само наличие clicks=0 без проверенного про�
 
 ```sh
 node deployment/postiz-max/build-production-image.cjs --check
-node deployment/postiz-max/build-production-image.cjs --build --origin http://<host>:14007 --tag max-postiz-linux:0.12.1-production-<unique>
+node deployment/postiz-max/build-production-image.cjs --build --origin https://postiz.example.org --tag max-postiz-linux:0.12.2-production-example
 ```
+
+`postiz.example.org` — пример: укажите фактический HTTPS-адрес панели и новый
+свободный tag.
 
 Новый recipe начинается с pinned official OCI, включает текущие MAX provider/
 guard и editorial source overlay, затем пересобирает backend, orchestrator и
 frontend. Он не зависит от старого локального image 0.5.1 или его compiled API.
 `--check` проверяет только структуру; `--source-root` дополнительно проверяет
-13 закреплённых upstream SHA. `--build` отказывает при занятом tag, удалённых
+13 закреплённых upstream/editorial SHA и отдельный SHA next.config в 0.12.2.
+С 0.12.2 origin должен быть canonical HTTPS; для изолированной HTTP-копии
+допустим `http://127.0.0.1:14007`. Runtime cookie mode вычисляется runner,
+а прямой Docker build дополнительно требует точный PRODUCTION_NOT_SECURED
+(пустой для HTTPS, `true` только для literal HTTP loopback). Для другого
+public origin образ пересобирают. `--build` отказывает при занятом tag, удалённых
 Docker/Buildx overrides и использует проверенный локальный context/default builder.
 Контейнеры, volumes, compose, push и deployment этот runner не меняет.
 
-Docker daemon на машине проверки недоступен: полный Next/image build и запуск
+Исторический срез 0.12.1: Docker daemon на машине проверки недоступен, Next/image build и запуск
 нового стека **NOT_BUILT / NOT_STARTED**. Отдельная semantic-проверка overlay с
 настоящими TS/Nest/React types не подменяет эту приёмку. Legacy Postiz-команды
 отказывают в копии с isolation marker, чтобы не управлять старым compose-проектом.
+Новый изолированный Linux/Docker стенд и фактический результат 0.12.2 отражены
+в [актуальном протоколе](FOUR_PLATFORM_FULL_READINESS.md).
 
 ## Проверки
 
 `scripts/test-four-platform.ps1 -Full -Ui` включает весь pytest, собственную
 PostgreSQL test DB, Ruff, pip check, UI и production-build contracts.
+Это полная команда исторической приёмки 0.12.1; в текущей приёмке 0.12.2 она
+не запускалась, поскольку владелец остановил тесты Пикабу. Выбранный текущий
+набор проверок описан в актуальном протоколе.
 Перед проверками Python отдельно устанавливают dev-зависимости в `.venv`:
 
 ```powershell

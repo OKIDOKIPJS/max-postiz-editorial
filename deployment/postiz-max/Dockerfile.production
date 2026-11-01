@@ -14,4 +14,13 @@ WORKDIR /app
 # Client generation only; no db push/migration, model, worker or application start.
 RUN pnpm exec prisma generate --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
 RUN pnpm --filter ./apps/backend build && pnpm --filter ./apps/orchestrator build
+# Preserve the native Node sanitizer package and its jsdom filesystem assets.
+COPY patch-production-frontend.cjs /adapter/
+RUN node /adapter/patch-production-frontend.cjs
 RUN pnpm --filter ./apps/frontend exec next build --webpack
+# NOT_SECURED is read at request time by dynamic layouts, proxy and backend.
+# Validate direct Docker invocations too; an omitted/contradictory mode fails.
+COPY production-origin.cjs /adapter/
+ARG PRODUCTION_NOT_SECURED=__UNSET__
+RUN node /adapter/production-origin.cjs "$PUBLIC_ORIGIN" "$PRODUCTION_NOT_SECURED"
+ENV NOT_SECURED=$PRODUCTION_NOT_SECURED
