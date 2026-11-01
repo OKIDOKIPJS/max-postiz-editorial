@@ -12,7 +12,7 @@ import ctypes
 import hashlib
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
@@ -23,6 +23,21 @@ import uuid
 
 GIB = 1024 ** 3
 LABEL_KEY = "editorial.readiness.owner"
+BUNDLE_CONTRACT = "owned-docker-static-bundle-v1"
+BUNDLE_VERSION = "29.9.2"
+BUNDLE_SHA256 = "9ac225999fd5e863f7694c728ef23d480616b1e5639328fa309befd4243d69eb"
+BUNDLE_BYTES = 86374273
+BUNDLE_FILES = frozenset({"containerd", "runc", "containerd-shim-runc-v2", "docker", "docker-proxy", "ctr", "dockerd", "docker-init"})
+BUNDLE_BINARY_SHA256 = {
+    "containerd": "5e970f05f9feef7b89e6f38965ea1e91224644864e60bd6f5f3242d84e094228",
+    "runc": "6043541aca928890ab8ad0630cafd2b272c3880779d8ada1b3fe81bc22e80d20",
+    "containerd-shim-runc-v2": "7a0ed4065fc701913aabb26b73b7dd07d67b51b1cfe7721bd287161b3b26e865",
+    "docker": "6c71cfe71faff949a602946a4df4799b563232e79d0b8b6fd343d0ef081c9621",
+    "docker-proxy": "e29981721256f9bde91cdffd23e1b5c6a50b9949e17a3aaa027d8112d0d97717",
+    "ctr": "2ac4aa817c12480c3d53f639753540ffc3fc6fca8eef248d56f920aea07e4b33",
+    "dockerd": "3a6132d4d99c1437e3422599f802207a3def9ba4de00ec1004a8e40d2740b9b0",
+    "docker-init": "5ccb076690ac3d060511c63d02194bd5cefaba8dbf225fd60b26283eb1055e4b",
+}
 
 
 class EngineError(RuntimeError):
@@ -46,7 +61,7 @@ def _inside_plain(path: Path, parent: Path) -> Path:
     return resolved
 
 
-def _environment(environment=None, *, config_dir: Path) -> dict[str, str]:
+def _environment(environment=None, *, config_dir: Path, binary_root: Path | None = None) -> dict[str, str]:
     # DOCKER_HOST/CONTEXT, auth helpers and inherited Buildx context cannot select
     # an ambient daemon. A new empty config directory is always authoritative.
     value = dict(os.environ if environment is None else environment)
@@ -54,7 +69,74 @@ def _environment(environment=None, *, config_dir: Path) -> dict[str, str]:
              if not key.startswith("DOCKER_") and key not in {"BUILDX_CONFIG", "BUILDX_BUILDER", "BUILDKIT_HOST"}}
     value.update(DOCKER_CONFIG=str(config_dir), DOCKER_CLI_HINTS="false",
                  BUILDX_CONFIG=str(config_dir / "buildx"))
+    if binary_root is not None:
+        value["PATH"] = str(binary_root) + ":/usr/bin:/bin"
     return value
+
+
+def _bundle_stat(value, *, directory=False, executable=False):
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if (not kind(value.st_mode) or value.st_uid != 0 or value.st_mode & 0o6022
+            or not directory and value.st_nlink != 1
+            or executable and not value.st_mode & 0o111):
+        raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID")
+
+
+def _bundle_bytes(path: Path, *, maximum: int, executable=False):
+    before = path.lstat()
+    _bundle_stat(before, executable=executable)
+    if before.st_size <= 0 or before.st_size > maximum:
+        raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        _bundle_stat(opened, executable=executable)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+            raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID")
+        chunks, size = [], 0
+        while chunk := os.read(descriptor, min(1024 * 1024, maximum + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > maximum:
+                raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID")
+        after = os.fstat(descriptor)
+        if (opened.st_size, opened.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or size != opened.st_size:
+            raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_binary_root(root: Path, temporary: Path) -> Path:
+    try:
+        root = _inside_plain(root, temporary)
+        for current in (root, *root.parents):
+            if current == temporary.resolve():
+                break
+            _bundle_stat(current.lstat(), directory=True)
+        if {path.name for path in root.iterdir()} != BUNDLE_FILES | {"bundle.json"}:
+            raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID")
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError
+                result[key] = value
+            return result
+        marker = json.loads(_bundle_bytes(root / "bundle.json", maximum=16384), object_pairs_hook=pairs)
+        if (not isinstance(marker, dict) or set(marker) != {"contract", "version", "archive_sha256", "archive_bytes", "binaries"}
+                or marker["contract"] != BUNDLE_CONTRACT or marker["version"] != BUNDLE_VERSION
+                or marker["archive_sha256"] != BUNDLE_SHA256 or type(marker["archive_bytes"]) is not int
+                or marker["archive_bytes"] != BUNDLE_BYTES or not isinstance(marker["binaries"], dict)
+                or marker["binaries"] != BUNDLE_BINARY_SHA256):
+            raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID")
+        for name, expected in marker["binaries"].items():
+            if (not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected)
+                    or hashlib.sha256(_bundle_bytes(root / name, maximum=150 * 1024 * 1024, executable=True)).hexdigest() != expected):
+                raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID")
+        return root
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError):
+        raise EngineError("OWN_ENGINE_BINARY_BUNDLE_INVALID") from None
 
 
 def _limits(available: int) -> dict:
@@ -88,9 +170,10 @@ def _available_memory() -> int:
 
 
 class Engine:
-    def __init__(self, root: Path, evidence: Path):
+    def __init__(self, root: Path, evidence: Path, *, binary_root: Path | None = None):
         self.root = Path(root)
         self.evidence = Path(evidence)
+        self.binary_root = Path(binary_root) if binary_root is not None else None
         self.label_value = uuid.uuid4().hex
         self.slice = "editorial_readiness_" + self.label_value + ".slice"
         self.daemon_unit = "editorial_readiness_daemon_" + self.label_value + ".service"
@@ -117,7 +200,15 @@ class Engine:
 
     @property
     def environment(self):
-        return _environment(config_dir=self.config_dir)
+        return _environment(config_dir=self.config_dir, binary_root=self.binary_root)
+
+    @property
+    def docker_binary(self):
+        return self.binary_root / "docker" if self.binary_root is not None else PurePosixPath("/usr/bin/docker")
+
+    @property
+    def dockerd_binary(self):
+        return self.binary_root / "dockerd" if self.binary_root is not None else PurePosixPath("/usr/bin/dockerd")
 
     @property
     def common_limits(self):
@@ -126,7 +217,7 @@ class Engine:
     def plan(self, available_bytes: int) -> dict:
         """Pure inspection, including on Windows; never creates paths/processes."""
         limits = _limits(available_bytes)
-        daemon = ["/usr/bin/dockerd", "--host=" + self.socket,
+        daemon = [str(self.dockerd_binary), "--host=" + self.socket,
                   "--data-root=" + str(self.data_root), "--exec-root=" + str(self.exec_root),
                   "--pidfile=" + str(self.root / "dockerd.pid"),
                   "--config-file=" + str(self.root / "daemon.json"),
@@ -153,7 +244,12 @@ class Engine:
             raise EngineError("OWN_ENGINE_PATH_ALREADY_EXISTS")
         if len(os.fsencode(self.socket_path)) > 100:
             raise EngineError("OWN_ENGINE_SOCKET_PATH_TOO_LONG")
-        for executable in ("docker", "dockerd", "systemctl", "systemd-run", "unshare", "mount", "sleep"):
+        if self.binary_root is not None:
+            self.binary_root = _validate_binary_root(self.binary_root, temporary)
+        executables = ("systemctl", "systemd-run", "unshare", "mount", "sleep")
+        if self.binary_root is None:
+            executables += ("docker", "dockerd")
+        for executable in executables:
             path = Path("/usr/bin") / executable
             if not path.is_file() or not os.access(path, os.X_OK):
                 raise EngineError("OWN_ENGINE_DEPENDENCY_MISSING")
@@ -241,8 +337,8 @@ class Engine:
             raise EngineError("OWN_ENGINE_DOCKER_OVERRIDE_FORBIDDEN")
         kwargs.pop("shell", None)
         supplied_environment = kwargs.pop("env", None)
-        environment = _environment(supplied_environment, config_dir=self.config_dir)
-        return self._run(["/usr/bin/docker", "--host", self.socket, "--config", str(self.config_dir), *args],
+        environment = _environment(supplied_environment, config_dir=self.config_dir, binary_root=self.binary_root)
+        return self._run([str(self.docker_binary), "--host", self.socket, "--config", str(self.config_dir), *args],
                          env=environment, **kwargs)
 
     def _info(self, *, record_failure=True):
@@ -376,10 +472,12 @@ class Engine:
             self._capture_cgroup()
             self._daemon_started = True
             self._stage = "DAEMON_START"
+            daemon_environment = ["--setenv=PATH=" + self.environment["PATH"]] if self.binary_root is not None else []
             self._run(["/usr/bin/systemd-run", "--unit=" + self.daemon_unit, "--slice=" + self.slice,
                        "--service-type=exec", "--collect", "--property=Delegate=yes",
                        "--property=MemoryMax=" + str(GIB), "--property=MemorySwapMax=0",
                        "--property=KillMode=control-group", "--property=TimeoutStopSec=20",
+                       *daemon_environment,
                        *self.plan(self.commonlimits["memory_bytes"] + 2 * GIB)["daemon"]])
             deadline = time.monotonic() + 40
             self._stage = "DAEMON_READY"

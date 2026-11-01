@@ -1,5 +1,24 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: закреплённый Docker для нативного стенда
+
+- Native run 41354862919 прошёл bootstrap/dependencies/pinned pulls и подтвердил
+  отсутствие внешней сети в RUN, затем остановился до полной сборки: требуемые
+  per-step CPU/memory/swap лимиты не подтвердились на Docker runner. Его отказ
+  и доказательства сохранены; он не считается успешным build или приёмкой.
+- Для следующего disposable GitHub run добавлен собственный Docker 29.9.2 только
+  в RUNNER_TEMP: официальный TLS URL, фиксированные SHA/размер архива и SHA восьми
+  бинарников, публичный IPv4/SNI без proxies/redirects, ручное извлечение только
+  проверенных regular members. Системный Docker/пакеты/daemon не заменяются.
+- Engine использует проверенные CLI/daemon/helper PATH; сохраняются собственные
+  socket/data/cgroup, fd cleanup и строгий реальный resource/network probe.
+  В диагностике probe добавлены self cgroup и mount information; неограниченные
+  значения по-прежнему блокируют тяжёлую сборку.
+- Проверки: 97 pure/mock tests passed, 1 Windows symlink skip, Ruff/diff-check
+  прошли, независимый review без блокеров. Исполнения нового Linux набора ещё
+  не было. В R2 отдельно прошли настоящий PostgreSQL CI (237 tests) и CodeQL;
+  общий CI следующего commit и полная нативная приёмка остаются обязательными.
+
 ## 0.14.0 — 2026-11-02: исправления первого независимого CI
 
 - Первый native run 41353716315 остановился в preflight до копирования исходников,

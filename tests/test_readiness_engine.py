@@ -1,6 +1,7 @@
 """Pure/mock tests: no Docker daemon, systemd, Linux runtime or browser starts."""
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import stat
@@ -119,7 +120,7 @@ def mock_engine(tmp_path, monkeypatch, *, dirty=False, identity_override=None):
         output = ""
         if command[0] == "/usr/bin/systemctl" and "--property=ControlGroup" in command:
             output = engine.cgroup_parent
-        if command[0] == "/usr/bin/docker":
+        if command[0] == str(engine.docker_binary):
             args = command[5:]
             if args[0] == "info":
                 output = json.dumps({"ID": "own-engine-id", "DockerRootDir": str(engine.data_root),
@@ -382,3 +383,87 @@ def test_readiness_poll_failures_are_not_persisted_unless_startup_times_out(tmp_
     assert engine.last_failure is None and not (tmp_path / "private/engine-failure.json").exists()
     engine._persist_failure(engine._transient_failure)
     assert json.loads((tmp_path / "private/engine-failure.json").read_bytes())["stage"] == "DAEMON_READY"
+
+
+def bundle_fixture(tmp_path, monkeypatch):
+    root = tmp_path / "download/bin"
+    root.mkdir(parents=True)
+    contents = {name: ("synthetic-not-executable:" + name).encode() for name in engine_module.BUNDLE_FILES}
+    hashes = {name: hashlib.sha256(value).hexdigest() for name, value in contents.items()}
+    for name, value in contents.items():
+        (root / name).write_bytes(value)
+    marker = {"contract": engine_module.BUNDLE_CONTRACT, "version": engine_module.BUNDLE_VERSION,
+              "archive_sha256": engine_module.BUNDLE_SHA256, "archive_bytes": engine_module.BUNDLE_BYTES,
+              "binaries": hashes}
+    (root / "bundle.json").write_text(json.dumps(marker))
+    # Windows does not expose POSIX owner/execute bits. Ownership/modes are
+    # tested independently with Linux-shaped stat values below; no binary runs.
+    monkeypatch.setattr(engine_module, "_bundle_stat", lambda *a, **k: None)
+    monkeypatch.setattr(engine_module, "BUNDLE_BINARY_SHA256", hashes)
+    return root, marker
+
+
+def test_owned_bundle_validates_every_byte_against_pinned_manifest_without_execution(tmp_path, monkeypatch):
+    root, _ = bundle_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(engine_module.subprocess, "run", lambda *a, **k: pytest.fail("execution forbidden"))
+    assert engine_module._validate_binary_root(root, tmp_path) == root.resolve()
+    (root / "runc").write_bytes(b"replacement")
+    with pytest.raises(EngineError, match="OWN_ENGINE_BINARY_BUNDLE_INVALID"):
+        engine_module._validate_binary_root(root, tmp_path)
+
+
+@pytest.mark.parametrize("change", ["version", "archive_sha", "archive_bytes", "forged_manifest", "missing", "extra", "duplicate"])
+def test_owned_bundle_rejects_unpinned_or_incomplete_markers(tmp_path, monkeypatch, change):
+    root, marker = bundle_fixture(tmp_path, monkeypatch)
+    if change == "version":
+        marker["version"] = "29.4.2"
+    elif change == "archive_sha":
+        marker["archive_sha256"] = "0" * 64
+    elif change == "archive_bytes":
+        marker["archive_bytes"] = True
+    elif change == "forged_manifest":
+        marker["binaries"] = {**marker["binaries"], "runc": "0" * 64}
+    elif change == "missing":
+        (root / "runc").unlink()
+    elif change == "extra":
+        (root / "unapproved-helper").write_bytes(b"extra")
+    if change == "duplicate":
+        raw = json.dumps(marker)[:-1] + ',"version":"29.9.2"}'
+    else:
+        raw = json.dumps(marker)
+    (root / "bundle.json").write_text(raw)
+    with pytest.raises(EngineError, match="OWN_ENGINE_BINARY_BUNDLE_INVALID"):
+        engine_module._validate_binary_root(root, tmp_path)
+
+
+def test_owned_bundle_cannot_reside_outside_runner_temp(tmp_path, monkeypatch):
+    root, _ = bundle_fixture(tmp_path, monkeypatch)
+    with pytest.raises(EngineError):
+        engine_module._validate_binary_root(root, tmp_path / "different-root")
+
+
+@pytest.mark.parametrize("changes", [
+    {"st_uid": 1000}, {"st_mode": stat.S_IFREG | 0o577},
+    {"st_mode": stat.S_IFREG | 0o4755}, {"st_mode": stat.S_IFLNK | 0o777},
+    {"st_nlink": 2}, {"st_mode": stat.S_IFREG | 0o444},
+])
+def test_binary_stat_requires_root_owned_plain_single_link_executable(changes):
+    value = {"st_uid": 0, "st_mode": stat.S_IFREG | 0o555, "st_nlink": 1, **changes}
+    with pytest.raises(EngineError, match="OWN_ENGINE_BINARY_BUNDLE_INVALID"):
+        engine_module._bundle_stat(SimpleNamespace(**value), executable=True)
+
+
+def test_owned_bundle_cli_and_systemd_helper_path_are_explicit_without_global_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "ambient-unsafe-path")
+    engine, calls = mock_engine(tmp_path, monkeypatch)
+    engine.binary_root = tmp_path / "owned-docker/bin"
+    engine.__enter__()
+    expected = str(engine.binary_root) + ":/usr/bin:/bin"
+    daemon = next(command for command, _ in calls if str(engine.dockerd_binary) in command)
+    assert "--setenv=PATH=" + expected in daemon
+    assert str(engine.dockerd_binary) == daemon[daemon.index(str(engine.dockerd_binary))]
+    cli_calls = [(command, options) for command, options in calls if command[0] == str(engine.docker_binary)]
+    assert cli_calls and all(options["env"]["PATH"] == expected for _, options in cli_calls)
+    assert all(command[1:5] == ["--host", engine.socket, "--config", str(engine.config_dir)] for command, _ in cli_calls)
+    assert engine_module.os.environ["PATH"] == "ambient-unsafe-path"
+    engine.close()

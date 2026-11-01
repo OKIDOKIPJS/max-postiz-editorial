@@ -26,6 +26,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from readiness_engine import Engine, LABEL_KEY
+from readiness_docker import prepare as prepare_docker
 
 GIB = 1024 ** 3
 ORIGIN = "http://10.20.30.45:4007"
@@ -286,6 +287,24 @@ class Acceptance:
         if "--resource" not in helptext:
             raise ReadinessError("NATIVE_DOCKER_BUILD_RESOURCE_UNSUPPORTED")
 
+    def docker_versions(self):
+        value = json.loads(self.engine.docker("version", "--format", "{{json .}}").stdout)
+        if value["Client"]["Version"] != "29.9.2" or value["Server"]["Version"] != "29.9.2":
+            raise ReadinessError("NATIVE_DOCKER_PIN_VERSION_MISMATCH")
+        self.run(self.engine.namespace_command([str(self.engine.docker_binary), "buildx", "version"]),
+                 name="buildx-version", timeout=30, env=self.engine.environment)
+        self.run(self.engine.namespace_command([str(self.engine.docker_binary), "buildx", "inspect", "default"]),
+                 name="buildkit-version", timeout=30, env=self.engine.environment)
+        buildx = (self.private / "buildx-version.log").read_text()
+        buildkit = (self.private / "buildkit-version.log").read_text()
+        plugin = re.search(r"\bv(\d+\.\d+\.\d+)(?:\s|$)", buildx)
+        backend = re.search(r"(?mi)^\s*BuildKit(?:\s+version)?:\s+v?(\d+\.\d+\.\d+)(?:[-+][0-9A-Za-z.-]+)?(?:\s|$)", buildkit)
+        if not plugin or not backend or tuple(map(int, backend[1].split("."))) < (0, 31, 0):
+            raise ReadinessError("NATIVE_BUILDKIT_RESOURCE_CAPABILITY_REQUIRED")
+        self.report["checks"]["actual_docker_versions"] = {"client": value["Client"]["Version"],
+            "server": value["Server"]["Version"], "buildx": plugin[1], "buildkit": backend[1],
+            "buildkit_inspect_sha256": digest(buildkit.encode()), "host_binaries_changed": False}
+
     def build_flags(self):
         limits = self.engine.commonlimits
         return ["--resource", "memory=" + str(limits["native_memory_bytes"]),
@@ -306,9 +325,9 @@ class Acceptance:
         # A real resource/network probe on the same pinned base precedes heavy RUNs.
         probe = self.engine.root / "probe"
         probe.mkdir()
-        script = "const fs=require('node:fs');console.log('RESOURCE_PROOF '+JSON.stringify({memory:fs.readFileSync('/sys/fs/cgroup/memory.max','utf8').trim(),swap:fs.readFileSync('/sys/fs/cgroup/memory.swap.max','utf8').trim(),cpu:fs.readFileSync('/sys/fs/cgroup/cpu.max','utf8').trim(),devices:fs.readFileSync('/proc/net/dev','utf8').split('\\n').slice(2).filter(Boolean).map(x=>x.split(':')[0].trim()),routes:fs.readFileSync('/proc/net/route','utf8').trim().split('\\n').slice(1)}))"
+        script = "const fs=require('node:fs');console.log('RESOURCE_PROOF '+JSON.stringify({memory:fs.readFileSync('/sys/fs/cgroup/memory.max','utf8').trim(),swap:fs.readFileSync('/sys/fs/cgroup/memory.swap.max','utf8').trim(),cpu:fs.readFileSync('/sys/fs/cgroup/cpu.max','utf8').trim(),devices:fs.readFileSync('/proc/net/dev','utf8').split('\\n').slice(2).filter(Boolean).map(x=>x.split(':')[0].trim()),routes:fs.readFileSync('/proc/net/route','utf8').trim().split('\\n').slice(1),cgroup:fs.readFileSync('/proc/self/cgroup','utf8'),cgroup_mounts:fs.readFileSync('/proc/self/mountinfo','utf8').split('\\n').filter(x=>x.includes(' - cgroup2 '))}))"
         (probe / "Dockerfile").write_text("FROM " + BASE + "\nRUN " + json.dumps(["node", "-e", script]) + "\n")
-        self.run(self.engine.namespace_command(["/usr/bin/docker", "build", "--builder", "default", *self.build_flags(), "--tag",
+        self.run(self.engine.namespace_command([str(self.engine.docker_binary), "build", "--builder", "default", *self.build_flags(), "--tag",
             "max-postiz-linux:resource-" + self.engine.label_value[:12], str(probe)]),
             name="resource-probe", timeout=180, env=self.engine.environment)
         raw = (self.private / "resource-probe.log").read_text()
@@ -317,8 +336,10 @@ class Acceptance:
             raise ReadinessError("NATIVE_RESOURCE_PROOF_MISSING")
         observed = json.loads(match[1])
         limits = self.engine.commonlimits
-        if observed != {"memory": str(limits["native_memory_bytes"]), "swap": str(limits["native_swap_bytes"]),
-                        "cpu": "400000 100000", "devices": ["lo"], "routes": []}:
+        self.report["checks"]["build_resource_probe_observed"] = observed
+        expected = {"memory": str(limits["native_memory_bytes"]), "swap": str(limits["native_swap_bytes"]),
+                    "cpu": "400000 100000", "devices": ["lo"], "routes": []}
+        if any(observed.get(key) != value for key, value in expected.items()):
             raise ReadinessError("NATIVE_RESOURCE_OR_NETWORK_FENCE_INVALID")
         self.report["checks"]["actual_build_resource_and_network_fence"] = observed
         wrapper = self.engine.root / "build.cjs"
@@ -904,7 +925,7 @@ finally:s.client.close()
         folder = Path(os.environ["RUNNER_TEMP"]) / "native-readiness-image"
         folder.mkdir(mode=0o755)
         target = folder / "max-postiz-0.14.0.tar.gz"
-        command = ["/usr/bin/docker", "--host", self.engine.socket, "--config", str(self.engine.config_dir), "image", "save", self.image]
+        command = [str(self.engine.docker_binary), "--host", self.engine.socket, "--config", str(self.engine.config_dir), "image", "save", self.image]
         with target.open("xb") as output, (self.private / "image-save.log").open("xb") as errors:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, env=self.engine.environment)
             completed = []
@@ -948,10 +969,14 @@ finally:s.client.close()
 
     def execute(self):
         self.report["disk"] = disk_preflight(self.job, self.workspace)
+        self.phase("pinned_docker_tools")
+        binaries, provenance = prepare_docker(self.job / "docker-tools")
+        self.report["checks"]["pinned_docker_tools"] = provenance
         self.phase("owned_engine_bootstrap")
-        with Engine(self.job / "engine", self.private / "engine.json") as engine:
+        with Engine(self.job / "engine", self.private / "engine.json", binary_root=binaries) as engine:
             self.engine = engine
             try:
+                self.docker_versions()
                 self.source_copy()
                 self.dependencies()
                 self.image_pull()
