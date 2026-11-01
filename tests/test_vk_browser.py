@@ -4,7 +4,9 @@ import hashlib
 import html
 import io
 import json
+import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -12,7 +14,7 @@ import pytest
 from PIL import Image
 
 from max_postiz_agent import vk_browser_worker as worker
-from max_postiz_agent.config import AgentError
+from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.vk_browser import OBSERVED_DOM, VKBrowser, dom_contract, prepare, wall_url
 
 pytest_plugins = ["test_four_platform_hub"]
@@ -45,8 +47,10 @@ def sample(tmp_path):
     return SimpleNamespace(root=tmp_path, raw=raw, options=options, snapshot=snapshot, payload=payload)
 
 
-def post_html(state, text, ident):
+def post_html(state, text, ident, *, readback=False):
     body = html.escape(text + (" changed" if state.corrupt_readback else ""))
+    if readback and getattr(state, "rich_readback", False):
+        body = "<strong>" + body + "</strong>"
     href = getattr(state, "post_body_link_href", None)
     if href is not None:
         word = html.escape(text.split(" ", 1)[0])
@@ -62,7 +66,8 @@ def post_html(state, text, ident):
 
 
 def fixture_html(state):
-    posts = "".join(post_html(state, text, ident) for text, ident in state.posts)
+    posts = getattr(state, "old_rich_posts", "") + "".join(
+        post_html(state, text, ident, readback=True) for text, ident in state.posts)
     owner = "999999" if state.wrong_owner else OWNER
     code = r"""
 const show=document.getElementById('create');
@@ -94,19 +99,72 @@ document.getElementById('publish').onclick=async()=>{
  window.clicks++;
  const text=window.personal?editor.innerText:document.getElementById('preview-text').innerText;
  const story=window.personal&&document.getElementById('story').checked;
- const response=await fetch('/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,story})});
+ const response=await fetch('/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+  text,story,fixture_ready:window.spaEvents||[],fixture_waiting:window.spaWaiting||null,
+  fixture_revoked:window.spaRevoked===true})});
  const data=await response.json();
  document.getElementById('posts').innerHTML=data.html;
  document.getElementById('composer').hidden=true;
 };
 window.clicks=0;window.fills=0;window.opens=0;window.nexts=0;
 """
+    if any(getattr(state, name, 0) for name in (
+            "editor_mount_delay_ms", "next_ready_delay_ms", "story_aria_delay_ms")):
+        code += r"""
+window.spaEvents=[];window.spaWaiting=null;window.spaRevoked=false;
+const transition=(name,delay,finish)=>{
+ window.spaWaiting=name;window.spaEvents.push(name+'_start');
+ if(name===window.fixturePauseAt)setTimeout(()=>{
+  window.spaRevoked=true;window.spaEvents.push(name+'_paused');
+ },100);
+ setTimeout(()=>{finish();window.spaEvents.push(name+'_ready');window.spaWaiting=null;},delay);
+};
+"""
+        code += "window.fixturePauseAt=" + json.dumps(getattr(state, "pause_transition", None)) + ";"
+        if getattr(state, "next_ready_delay_ms", 0):
+            mode = getattr(state, "next_delay_mode", "disabled")
+            code += "const delayedNext=document.getElementById('next');"
+            if mode == "absent":
+                code += "delayedNext.remove();"
+                finish = "document.getElementById('base').append(delayedNext);"
+            elif mode == "hidden":
+                code += "delayedNext.hidden=true;"
+                finish = "delayedNext.hidden=false;"
+            else:
+                assert mode == "disabled"
+                code += "delayedNext.disabled=true;"
+                finish = "delayedNext.disabled=false;"
+            code += ("editor.addEventListener('input',()=>transition('next',"
+                     + str(state.next_ready_delay_ms) + ",()=>{" + finish + "}));")
+        if getattr(state, "story_aria_delay_ms", 0):
+            code += ("const delayedStory=document.getElementById('story');delayedStory.onchange=()=>{"
+                     "window.storyChanges++;const checked=String(delayedStory.checked);transition('story',"
+                     + str(state.story_aria_delay_ms)
+                     + ",()=>delayedStory.setAttribute('aria-checked',checked));};")
+        if getattr(state, "editor_mount_delay_ms", 0):
+            # Register child-control handlers before detaching the whole subtree.
+            code += ("const delayedComposer=document.getElementById('composer');delayedComposer.remove();"
+                     "show.onclick=()=>{window.opens++;transition('editor',"
+                     + str(state.editor_mount_delay_ms)
+                     + ",()=>{document.body.append(delayedComposer);delayedComposer.hidden=false;});};")
+    if getattr(state, "create_delay_ms", 0):
+        code += ("const delayedCreate=document.getElementById('create');delayedCreate.remove();"
+                 "setTimeout(()=>document.getElementById('wall-ready').prepend(delayedCreate),"
+                 + str(state.create_delay_ms) + ");")
+    if getattr(state, "account_href_delay_ms", 0):
+        code += ("const account=document.querySelector('[data-testid=header-profile-menu-button]');"
+                 "const accountHref=account.getAttribute('href');account.setAttribute('href','');"
+                 "setTimeout(()=>account.setAttribute('href',accountHref),"
+                 + str(state.account_href_delay_ms) + ");")
     personal = getattr(state, "personal", False)
     settings = ('<div data-testid="posting_coowners_cell">Пригласить соавторов&nbsp;</div>'
                 '<div data-testid="posting_settings_visibility">Кто увидит этот пост<br>&nbsp;<br>Все<br>&nbsp;</div>'
                 '<input id="story" type="checkbox" role="switch" '
                 'data-testid="posting_settings_repost_to_story_switch" aria-checked="true" checked '
                 'onchange="this.setAttribute(\'aria-checked\',String(this.checked));window.storyChanges++">') if personal else ''
+    if personal and getattr(state, "native_story_label", False):
+        settings = settings.replace('<input id="story"', '<label id="native-story-label" style="display:block;width:32px;height:20px;position:relative"><input style="opacity:0;pointer-events:none;width:32px;height:20px;position:absolute" id="story"')
+        settings += '<span style="display:block;width:32px;height:20px">Story</span></label>'
     identity = ('<a id="recipient" href="/'
                 + ('club' + state.destination[1:] if state.destination.startswith('-') else 'id' + state.destination)
                 + '" data-owner-id="' + state.destination + '">Адресат</a>'
@@ -136,7 +194,7 @@ def local_vk(sample):
     state = SimpleNamespace(destination=OWNER, raw=sample.raw, uploads=0, publishes=0, posts=[],
                             gets=[], wrong_owner=False, corrupt_readback=False, bad_photo=False,
                             drop_reply=False, redirect_wrong_wall=False, post_author_override=None,
-                            personal=False, stories=0)
+                            personal=False, stories=0, publish_readiness=[])
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -171,6 +229,8 @@ def local_vk(sample):
                 state.publishes += 1
                 posted = json.loads(raw)
                 text = posted["text"]
+                state.publish_readiness.append({"ready": posted.get("fixture_ready"),
+                    "waiting": posted.get("fixture_waiting"), "revoked": posted.get("fixture_revoked")})
                 state.stories += int(posted.get("story", False))
                 state.posts.append((text, 51))
                 if state.drop_reply:
@@ -230,6 +290,52 @@ def personal_wall(sample, state):
     selectors.update(identity_contract="personal-wall-settings-v1", text_contract="vk-spacer-div-v1")
 
 
+@pytest.mark.parametrize("composer_visible", [False, True])
+def test_background_create_changes_are_ignored_only_inside_visible_composer(sample, page, composer_visible):
+    selectors = dom_contract(sample.options)
+    hidden = "" if composer_visible else " hidden"
+    page.set_content('<a data-testid="header-profile-menu-button" href="/id123456">Профиль</a>'
+                     '<button data-testid="posting_create_post_button">Создать</button>'
+                     '<div role="dialog" data-testid="posting_modal_box"' + hidden + '>'
+                     '<span data-testid="posting_base_screen_input_message">Точный текст</span></div>')
+    before = worker._mutation_stamp(page, selectors)
+    page.locator('[data-testid="posting_create_post_button"]').evaluate(
+        "e=>e.innerHTML='<span>Фоновый черновик обновлён</span>'")
+    assert (worker._mutation_stamp(page, selectors) == before) is composer_visible
+    if composer_visible:
+        page.locator('[data-testid="posting_base_screen_input_message"]').evaluate(
+            "e=>e.textContent='Другой текст'")
+        assert worker._mutation_stamp(page, selectors) != before
+        before = worker._mutation_stamp(page, selectors)
+        page.locator('[data-testid="header-profile-menu-button"]').evaluate(
+            "e=>e.setAttribute('href','/id999999')")
+        assert worker._mutation_stamp(page, selectors) != before
+        before = worker._mutation_stamp(page, selectors)
+        page.locator('[data-testid="posting_modal_box"]').evaluate("e=>e.hidden=true")
+        assert worker._mutation_stamp(page, selectors) != before
+
+
+def test_native_background_draft_update_does_not_block_exact_guarded_form(
+        sample, local_vk, page, monkeypatch):
+    personal_wall(sample, local_vk)
+    original, changed = worker._all_preview_media, False
+
+    def background_update(*args, **kwargs):
+        nonlocal changed
+        if not changed:
+            page.locator('#create').evaluate("e=>e.innerHTML='<span>Обновлён черновик</span>'")
+            changed = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(worker, '_all_preview_media', background_update)
+    result = run(page, sample, local_vk)
+    assert result['state'] == 'confirmed', result
+    assert changed and local_vk.publishes == 1 and local_vk.stories == local_vk.uploads == 0
+    _, journal = worker._read(sample.root, sample.payload['request_id'])
+    assert journal['worker_code_sha256'] == worker.WORKER_SOURCE_SHA256
+    assert journal['last_action_intent'] == 'click_intent' and journal['clicks'] == 1
+
+
 def test_personal_settings_exact_native_spacing_and_story_disabled_before_one_post(sample, local_vk, page):
     personal_wall(sample, local_vk)
     result = run(page, sample, local_vk)
@@ -244,6 +350,90 @@ def test_personal_settings_exact_native_spacing_and_story_disabled_before_one_po
     before = list(local_vk.gets)
     assert run(page, sample, local_vk) == result
     assert local_vk.gets == before and local_vk.publishes == 1
+
+
+def _old_rich_post(markup):
+    return ('<article data-testid="post"><a data-testid="post-header-title" href="/id' + OWNER
+            + '">Автор</a><span data-testid="post_text" style="white-space:pre-wrap">' + markup
+            + '</span><a data-testid="post_date_block_preview" href="/wall' + OWNER
+            + '_17">Раньше</a></article>')
+
+
+def test_unrelated_unsupported_rich_history_does_not_block_one_exact_post_or_reload(sample, local_vk, page):
+    personal_wall(sample, local_vk)
+    local_vk.old_rich_posts = _old_rich_post(
+        '<strong>Другой старый пост</strong><div><img src="/photo.png">Постороннее описание.</div>')
+    result = run(page, sample, local_vk)
+    assert result["state"] == "confirmed", result
+    assert result["verified"] is False and result["evidence"]["fixture"] is True
+    assert len(result["evidence"]["proof"]["reloads"]) == 2
+    assert local_vk.publishes == 1 and local_vk.uploads == local_vk.stories == 0
+    assert local_vk.posts[0][0] == prepare(sample.root, sample.options, OWNER, sample.snapshot)["text"]
+    before = list(local_vk.gets)
+    assert run(page, sample, local_vk) == result
+    assert local_vk.gets == before and local_vk.publishes == 1
+
+
+@pytest.mark.parametrize("decoration", ["none", "hidden_suffix", "hidden_interleaved"])
+def test_potential_matching_unsupported_history_still_blocks_before_editor(
+        sample, local_vk, page, decoration):
+    personal_wall(sample, local_vk)
+    text = prepare(sample.root, sample.options, OWNER, sample.snapshot)["text"]
+    if decoration == "none":
+        markup = "<strong>" + html.escape(text) + "</strong>"
+    elif decoration == "hidden_suffix":
+        markup = html.escape(text) + '<span hidden>Старые скрытые сведения</span>'
+    else:
+        offset = 8
+        markup = (html.escape(text[:offset]) + '<span hidden>Вставка посередине слова</span>'
+                  + html.escape(text[offset:]))
+    local_vk.old_rich_posts = _old_rich_post(markup)
+    result = run(page, sample, local_vk)
+    assert result["state"] == "failed", result
+    assert result["evidence"]["failure_code"] == "VK_BROWSER_RENDERED_TEXT_UNSUPPORTED"
+    assert local_vk.publishes == local_vk.uploads == local_vk.stories == 0
+    assert page.evaluate("window.opens") == 0
+    before = list(local_vk.gets)
+    assert run(page, sample, local_vk) == result
+    assert local_vk.gets == before and local_vk.publishes == 0
+
+
+def test_matching_unsupported_target_on_independent_reload_is_unknown_never_confirmed(sample, local_vk, page):
+    personal_wall(sample, local_vk)
+    local_vk.rich_readback = True
+    result = run(page, sample, local_vk)
+    assert result["state"] == "unknown" and result["verified"] is False, result
+    assert result["external_id"] == OWNER + "_51"
+    assert result["evidence"]["failure_code"] == "VK_BROWSER_RENDERED_TEXT_UNSUPPORTED"
+    assert result["evidence"]["proof"] is None
+    assert local_vk.publishes == 1 and local_vk.uploads == local_vk.stories == 0
+    before = list(local_vk.gets)
+    repeated = run(page, sample, local_vk)
+    assert repeated["state"] == "unknown" and repeated["verified"] is False
+    assert repeated["external_id"] == result["external_id"]
+    assert local_vk.gets == before and local_vk.publishes == 1
+
+
+@pytest.mark.parametrize("markup,expected,possible", [
+    ("Другая статья", "Согласованный текст", False),
+    ("БА", "АБ", False),
+    ("Начало", "НачалоКонец", False),
+    ("Текст", "Текст", True),
+    ("А\u00a0Б\u2009В\nГ", "А Б\n\nВ\tГ", True),
+    ("Привет🙂 мир", "Привет🙂\nмир", True),
+    ('А<span hidden>Вставка</span>Б<span hidden>Другое</span>В', "АБВ", True),
+    ('<strong>Кандидат</strong><span hidden>Декорация</span>', "Кандидат", True),
+])
+def test_history_prefilter_preserves_order_unicode_whitespace_and_hidden_subsequences(page, markup, expected, possible):
+    page.set_content('<span id="candidate">' + markup + '</span>')
+    assert worker._could_match_text(page.locator("#candidate"), expected) is possible
+
+
+def test_history_prefilter_refuses_unbounded_raw_text_instead_of_skipping_it(page):
+    page.set_content('<span id="candidate"></span>')
+    page.locator("#candidate").evaluate("e=>e.textContent='x'.repeat(200001)")
+    with pytest.raises(AgentError):
+        worker._could_match_text(page.locator("#candidate"), "Кандидат")
 
 
 @pytest.mark.parametrize("change,code", [
@@ -745,6 +935,276 @@ def test_read_only_inspection_does_not_open_composer_or_upload(sample, local_vk,
     assert page.evaluate("window.opens") == 0 and local_vk.uploads == local_vk.publishes == 0
 
 
+def test_inspection_waits_for_native_spa_editor_after_account_header(sample, local_vk, page, monkeypatch):
+    ready = worker._ready
+    observed = []
+
+    def shell_ready(*args):
+        ready(*args)
+        observed.append(page.evaluate("""() => {
+          const button=document.querySelector('[data-testid="posting_create_post_button"]');
+          button.remove();setTimeout(()=>document.getElementById('wall-ready').prepend(button),350);
+          return document.querySelectorAll('[data-testid="posting_create_post_button"]').length;
+        }"""))
+
+    monkeypatch.setattr(worker, "_ready", shell_ready)
+    result = worker.inspect_page(page, sample.options, OWNER, origin=local_vk.origin, fixture=True)
+    assert observed == [0]
+    assert result["editor_ready"] is True and result["publish"] is True
+    assert result["create_button_count"] == 1 and result["blockers"] == []
+    assert page.evaluate("window.opens") == 0 and local_vk.uploads == local_vk.publishes == 0
+
+
+def test_publication_waits_for_native_spa_editor(sample, local_vk, page):
+    local_vk.create_delay_ms = 350
+    result = run(page, sample, local_vk)
+    assert result["state"] == "confirmed", result
+    assert local_vk.publishes == local_vk.uploads == 1
+
+
+@pytest.mark.parametrize("transitions,next_mode", [
+    (("editor",), "disabled"),
+    (("next",), "absent"),
+    (("next",), "hidden"),
+    (("next",), "disabled"),
+    (("story",), "disabled"),
+    (("editor", "next", "story"), "absent"),
+])
+def test_personal_spa_transitions_wait_before_one_currently_authorized_publish(
+        sample, local_vk, page, transitions, next_mode):
+    personal_wall(sample, local_vk)
+    for name in transitions:
+        setattr(local_vk, {"editor": "editor_mount_delay_ms", "next": "next_ready_delay_ms",
+                          "story": "story_aria_delay_ms"}[name], 300)
+    local_vk.next_delay_mode = next_mode
+    final_authorizations = []
+    journal = worker._path(sample.root, sample.payload["request_id"])
+
+    def authorize():
+        if journal.exists() and json.loads(journal.read_text(encoding="utf-8"))["state"] == "click_intent":
+            state = page.evaluate("""() => ({waiting:window.spaWaiting,revoked:window.spaRevoked,
+              ready:window.spaEvents,story:document.getElementById('story').checked,
+              aria:document.getElementById('story').getAttribute('aria-checked'),nexts:window.nexts})""")
+            assert state["waiting"] is None and state["revoked"] is False
+            assert state["story"] is False and state["aria"] == "false" and state["nexts"] == 1
+            assert all(name + "_ready" in state["ready"] for name in transitions)
+            final_authorizations.append(state)
+
+    result = run(page, sample, local_vk, authorize)
+    assert result["state"] == "confirmed", result
+    assert result["verified"] is False and result["evidence"]["fixture"] is True
+    assert final_authorizations, "The publish action needs fresh authorization after every SPA wait"
+    assert local_vk.publishes == 1 and local_vk.uploads == local_vk.stories == 0
+    assert local_vk.posts[0][0] == prepare(sample.root, sample.options, OWNER, sample.snapshot)["text"]
+    assert len(local_vk.publish_readiness) == 1
+    receipt = local_vk.publish_readiness[0]
+    assert receipt["waiting"] is None and receipt["revoked"] is False
+    assert all(name + "_ready" in receipt["ready"] for name in transitions)
+    before = list(local_vk.gets)
+    assert run(page, sample, local_vk, authorize) == result
+    assert local_vk.gets == before and local_vk.publishes == 1
+
+
+@pytest.mark.parametrize("transition", ["editor", "next", "story"])
+def test_pause_during_personal_spa_wait_prevents_publish_and_repeat(
+        sample, local_vk, page, transition):
+    personal_wall(sample, local_vk)
+    setattr(local_vk, {"editor": "editor_mount_delay_ms", "next": "next_ready_delay_ms",
+                      "story": "story_aria_delay_ms"}[transition], 300)
+    local_vk.next_delay_mode = "absent"
+    local_vk.pause_transition = transition
+    rejected = []
+
+    def authorize():
+        if page.evaluate("window.spaRevoked===true"):
+            rejected.append(True)
+            raise AgentError("EDITORIAL_PAUSED", 409)
+
+    result = run(page, sample, local_vk, authorize)
+    assert result["state"] == "unknown", result
+    assert result["evidence"]["failure_code"] == "EDITORIAL_PAUSED" and rejected
+    assert local_vk.publishes == local_vk.uploads == local_vk.stories == 0
+    events = page.evaluate("window.spaEvents")
+    assert events.index(transition + "_paused") < events.index(transition + "_ready")
+    assert not local_vk.publish_readiness
+    before = list(local_vk.gets)
+    repeated = run(page, sample, local_vk, authorize)
+    assert repeated["state"] == "unknown" and repeated["evidence"]["failure_code"] == "EDITORIAL_PAUSED"
+    assert local_vk.gets == before and local_vk.publishes == 0
+
+
+@pytest.mark.parametrize("wrong_owner", [False, True])
+def test_inspection_waits_for_account_href_hydration_without_accepting_wrong_owner(
+        sample, local_vk, page, wrong_owner):
+    local_vk.account_href_delay_ms = 700
+    local_vk.wrong_owner = wrong_owner
+    if wrong_owner:
+        with pytest.raises(AgentError, match="VK_BROWSER_ACCOUNT_MISMATCH"):
+            worker.inspect_page(page, sample.options, OWNER, origin=local_vk.origin, fixture=True)
+    else:
+        result = worker.inspect_page(page, sample.options, OWNER, origin=local_vk.origin, fixture=True)
+        assert result["editor_ready"] is True
+    assert page.evaluate("window.opens") == 0
+    assert local_vk.publishes == local_vk.uploads == 0
+
+
+@pytest.mark.parametrize("wrong_owner", [False, True])
+def test_login_feed_redirect_returns_only_proven_owner_to_personal_wall(sample, local_vk, page, wrong_owner):
+    local_vk.wrong_owner = wrong_owner
+    page.goto(local_vk.origin + "/feed")
+    plan = {"wall_url": wall_url(OWNER, sample.options), "owner": OWNER}
+    result = worker._restore_login_wall(page, plan, dom_contract(sample.options), origin=local_vk.origin)
+    assert result is not wrong_owner
+    assert page.url == local_vk.origin + ("/feed" if wrong_owner else "/id" + OWNER)
+    assert worker._restore_login_wall(page, plan, dom_contract(sample.options), origin=local_vk.origin) is False
+    assert page.evaluate("window.opens") == 0 and local_vk.uploads == local_vk.publishes == 0
+
+
+def test_personal_text_profile_provides_a_complete_opt_in_contract(sample):
+    options = {**sample.options, "dom_contract": {}, "dom_contract_profile": "personal-text-v1"}
+    snapshot = {**sample.snapshot, "media": [], "body": "Полный согласованный текст без вложений."}
+    result = VKBrowser(sample.root, options).validate(OWNER, snapshot)
+    assert result["preflight_only"] is True and result["media"] == []
+    with pytest.raises(AgentError, match="VK_BROWSER_PERSONAL_WALL_REQUIRED"):
+        prepare(sample.root, options, "-" + OWNER, {**snapshot, "destination": "-" + OWNER})
+
+
+def test_personal_text_profile_does_not_enable_media_or_unverified_dom(sample):
+    options = {**sample.options, "dom_contract": {}, "dom_contract_profile": "personal-text-v1"}
+    with pytest.raises(AgentError, match="VK_BROWSER_TEXT_PROFILE_MEDIA_UNSUPPORTED"):
+        prepare(sample.root, options, OWNER, sample.snapshot)
+    options["dom_contract_verified"] = False
+    with pytest.raises(AgentError, match="VK_BROWSER_DOM_CONTRACT_UNVERIFIED"):
+        prepare(sample.root, options, OWNER, {**sample.snapshot, "media": []})
+    with pytest.raises(AgentError, match="VK_BROWSER_DOM_PROFILE_UNSUPPORTED"):
+        dom_contract({"dom_contract_profile": "unknown"})
+
+
+def test_pause_during_final_dom_guard_is_checked_before_native_publish(sample, local_vk, page, monkeypatch):
+    final = worker._final_snapshot
+    revoked = False
+    journal = worker._path(sample.root, sample.payload["request_id"])
+
+    def final_guard(*args, **kwargs):
+        nonlocal revoked
+        result = final(*args, **kwargs)
+        if journal.exists() and json.loads(journal.read_text(encoding="utf-8"))["state"] == "click_intent":
+            revoked = True
+        return result
+
+    def authorize():
+        if revoked:
+            raise AgentError("VK_BROWSER_DISPATCH_NOT_APPROVED")
+
+    monkeypatch.setattr(worker, "_final_snapshot", final_guard)
+    result = run(page, sample, local_vk, authorize)
+    assert revoked is True
+    assert result["state"] == "unknown"
+    assert result["evidence"]["failure_code"] == "VK_BROWSER_DISPATCH_NOT_APPROVED"
+    assert local_vk.publishes == 0
+
+
+def test_slow_fresh_authorization_expires_before_native_publish(sample, local_vk, page):
+    journal = worker._path(sample.root, sample.payload["request_id"])
+
+    def authorize():
+        if journal.exists() and json.loads(journal.read_text(encoding="utf-8"))["state"] == "click_intent":
+            time.sleep(1.1)
+
+    result = run(page, sample, local_vk, authorize)
+    assert result["state"] == "unknown"
+    assert result["evidence"]["failure_code"] == "VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED"
+    assert local_vk.publishes == 0
+
+
+def test_native_story_label_is_clicked_without_forcing_hidden_input(sample, local_vk, page):
+    personal_wall(sample, local_vk)
+    local_vk.native_story_label = True
+    sample.options["dom_contract"]["story_toggle_label"] = "#native-story-label"
+    result = run(page, sample, local_vk)
+    assert result["state"] == "confirmed", result
+    assert local_vk.publishes == 1 and local_vk.stories == 0
+    assert result["evidence"]["sender_settings"]["story_checked"] is False
+
+
+@pytest.mark.parametrize("kind", ["preview", "post"])
+def test_native_v2_rendering_accepts_only_observed_inline_unary_wrappers(page, kind):
+    content = 'Заголовок<div style="display:block;width:0;height:6px"><br> </div>Полный согласованный текст.'
+    native = '<div style="display:inline">' + content + '</div>'
+    if kind == "preview":
+        markup = '<div id="native" data-testid="showmoretext-in" style="display:flow-root;overflow:hidden;max-height:38px">' + native + '</div>'
+    else:
+        markup = '<span id="native" data-testid="post_text" style="display:block"><div><div data-testid="showmoretext-in-expanded" style="display:inline">' + native + '</div></div></span>'
+    page.set_content(markup)
+    selectors = {"text_contract": "vk-native-text-v2"}
+    assert worker._rendered_text(page.locator("#native"), selectors) == "Заголовок\n\nПолный согласованный текст."
+    with pytest.raises(AgentError, match="VK_BROWSER_RENDERED_TEXT_UNSUPPORTED"):
+        worker._rendered_text(page.locator("#native"), {"text_contract": "vk-spacer-div-v1"})
+
+
+@pytest.mark.parametrize("markup", [
+    '<div id="native"><div style="display:inline">Подмена</div></div>',
+    '<div id="native" data-testid="showmoretext-in"><div style="display:inline">Первая<div>Другая граница</div></div></div>',
+    '<div id="native" data-testid="showmoretext-in"><div style="display:inline">Текст<div><br style="opacity:0"></div></div></div>',
+])
+def test_native_v2_does_not_flatten_unknown_blocks_or_hidden_breaks(page, markup):
+    page.set_content(markup)
+    with pytest.raises(AgentError, match="VK_BROWSER_RENDERED_TEXT_UNSUPPORTED"):
+        worker._rendered_text(page.locator("#native"), {"text_contract": "vk-native-text-v2"})
+
+
+def test_context_is_validated_between_atomic_stamps_before_authorization(monkeypatch):
+    current = {"owner": "approved"}
+    actions = []
+
+    def stamp(*args):
+        current["owner"] = "wrong"
+        return "wrong-owner-stamp"
+
+    def context(*args, **kwargs):
+        if current["owner"] != "approved":
+            raise AgentError("VK_BROWSER_ACCOUNT_MISMATCH")
+
+    monkeypatch.setattr(worker, "_mutation_stamp", stamp)
+    monkeypatch.setattr(worker, "_context", context)
+    with pytest.raises(AgentError, match="VK_BROWSER_ACCOUNT_MISMATCH"):
+        worker._mutate(None, {}, {}, lambda: actions.append("authorize"), lambda: None,
+                       lambda timeout: actions.append("native"), origin="https://vk.ru")
+    assert actions == []
+
+
+def test_native_actions_do_not_issue_unbounded_locator_queries_after_sql_fence(sample, local_vk, page, monkeypatch):
+    original_mutate, original_one = worker._mutate, worker._one
+    fenced = False
+    late_queries = []
+
+    def mutate(page, plan, selectors, authorize, check, action, *, origin):
+        nonlocal fenced
+
+        def fresh():
+            nonlocal fenced
+            authorize()
+            fenced = True
+
+        try:
+            return original_mutate(page, plan, selectors, fresh, check, action, origin=origin)
+        finally:
+            fenced = False
+
+    def one(*args):
+        if fenced:
+            late_queries.append(args[1])
+            time.sleep(1.1)
+        return original_one(*args)
+
+    monkeypatch.setattr(worker, "_mutate", mutate)
+    monkeypatch.setattr(worker, "_one", one)
+    result = run(page, sample, local_vk)
+    assert result["state"] == "confirmed", result
+    assert late_queries == []
+    assert local_vk.publishes == 1
+
+
 @pytest.mark.parametrize("change,code", [
     (lambda value: value["media"][0].update(path="../outside.png"), "VK_BROWSER_PATH_UNSAFE"),
     (lambda value: value["media"][0].update(mime="video/mp4"), "VK_BROWSER_MEDIA_INVALID"),
@@ -799,6 +1259,86 @@ def leased_vk(four_hub, sample):
 def test_database_authorizer_requires_exact_active_sending_dispatch(leased_vk):
     core, options, payload = leased_vk
     assert worker.authorize(core.settings.root, payload, options) == "vk-fixture-worker"
+
+
+@pytest.mark.parametrize("change", ["app", "env"])
+def test_persistent_browser_authority_rejects_runtime_rotation_between_callbacks(leased_vk, change):
+    core, options, payload = leased_vk
+    authority = worker._authority_core(core.settings.root)
+    try:
+        assert worker.authorize(core.settings.root, payload, options, authority_core=authority) == "vk-fixture-worker"
+        if change == "app":
+            path = core.settings.root / "config/app.json"
+            app = json.loads(path.read_text(encoding="utf-8"))
+            app["api"]["port"] += 1
+            path.write_text(json.dumps(app), encoding="utf-8")
+        else:
+            (core.settings.root / ".env.local").write_text("TEST_RUNTIME_GENERATION=rotated\n", encoding="utf-8")
+        with pytest.raises(AgentError, match="ROUTE_RUNTIME_RESTART_REQUIRED"):
+            worker.authorize(core.settings.root, payload, options, authority_core=authority,
+                             expected_lease_owner="vk-fixture-worker")
+    finally:
+        authority.close()
+        authority.db.engine.dispose()
+
+
+def test_child_rejects_changed_parent_runtime_before_database_or_browser(sample, monkeypatch, capsys):
+    calls = []
+    fake = SimpleNamespace(route_runtime_generation=lambda: "a" * 64,
+        close=lambda: calls.append("close"),
+        db=SimpleNamespace(engine=SimpleNamespace(dispose=lambda: calls.append("dispose"))))
+    monkeypatch.setattr(worker, "_authority_core", lambda root: fake)
+    monkeypatch.setattr(worker, "target_options", lambda root, destination: sample.options)
+    monkeypatch.setattr(worker, "authorize", lambda *args, **kwargs: pytest.fail("DB must not be queried"))
+    monkeypatch.setattr(worker, "session", lambda *args, **kwargs: pytest.fail("browser must not be opened"))
+    payload = {**sample.payload, "options_sha256": fingerprint(sample.options), "runtime_generation": "b" * 64}
+    monkeypatch.setattr(worker.sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert worker.main(["--root", str(sample.root)]) == 1
+    assert json.loads(capsys.readouterr().out)["code"] == "VK_BROWSER_RUNTIME_GENERATION_CHANGED"
+    assert calls == ["close", "dispose"]
+
+
+def test_owned_worker_ipc_includes_private_parent_generation(sample, monkeypatch):
+    import max_postiz_agent.vk_browser as adapter_module
+
+    observed = []
+
+    def supervisor(command, *, input, timeout):
+        payload = json.loads(input)
+        observed.append(payload)
+        assert command[-2:] == ["--root", str(sample.root)]
+        assert timeout == 61
+        return subprocess.CompletedProcess(command, 0, json.dumps({"state": "access_only"}), "")
+
+    monkeypatch.setattr(adapter_module, "run_browser_worker", supervisor)
+    adapter = VKBrowser(sample.root, sample.options)
+    adapter.runtime_generation = "a" * 64
+    result = adapter._call("publish", OWNER, snapshot=sample.snapshot, request_id="vk-fixture")
+    assert observed[0]["runtime_generation"] == "a" * 64
+    assert observed[0]["options_sha256"] == fingerprint(sample.options)
+    assert "runtime_generation" not in result
+
+
+@pytest.mark.parametrize("failure", ["timeout", "cleanup", "runtime", "object_code", "array_code"])
+def test_owned_worker_errors_preserve_only_safe_unknown_codes(sample, monkeypatch, failure):
+    import max_postiz_agent.vk_browser as adapter_module
+    from max_postiz_agent.browser_process import BrowserWorkerError
+
+    def supervisor(command, *, input, timeout):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired("PRIVATE_REQUEST", timeout, output="PRIVATE_RESPONSE")
+        if failure == "cleanup":
+            raise BrowserWorkerError("BROWSER_WORKER_CLEANUP_UNKNOWN")
+        if failure in {"object_code", "array_code"}:
+            return subprocess.CompletedProcess(command, 1, json.dumps({"code": {} if failure == "object_code" else []}), "")
+        return subprocess.CompletedProcess(command, 1, json.dumps({"code": "ROUTE_RUNTIME_RESTART_REQUIRED"}), "")
+
+    monkeypatch.setattr(adapter_module, "run_browser_worker", supervisor)
+    result = VKBrowser(sample.root, sample.options).publish(OWNER, sample.snapshot, "vk-fixture")
+    assert result.state == "unknown" and result.verified is False
+    assert result.evidence["failure_code"] == (
+        "VK_BROWSER_RUNTIME_GENERATION_CHANGED" if failure == "runtime" else "VK_BROWSER_OPERATION_UNKNOWN")
+    assert "PRIVATE" not in repr(result)
 
 
 @pytest.mark.parametrize("damage", ["unknown", "expired", "owner", "pause", "snapshot", "approval", "future", "global_pause"])

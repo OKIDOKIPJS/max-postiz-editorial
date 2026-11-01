@@ -1,6 +1,6 @@
 """Управление четырьмя маршрутами без автоматического включения новых адресатов."""
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .config import AgentError, fingerprint
 from .db import Audit, now
@@ -36,23 +36,42 @@ def _evidence_kind(dispatch, audits):
     return "unverified"
 
 
-def route_state(core):
+def route_state(core, *, variant_page=0, dispatch_page=0, dispatch_filter="all"):
+    import json
+
+    if (any(type(page) is not int or not 0 <= page <= 1000000
+            for page in (variant_page, dispatch_page)) or dispatch_filter not in {"all", "unresolved"}):
+        raise AgentError("ROUTE_LIST_INVALID", 422)
+    page_size = 50
     with core.db.session() as session:
         targets = [core.routes.status(target) for target in
                    session.scalars(select(Target).order_by(Target.id))]
         variants = []
-        for variant in session.scalars(select(Variant).order_by(Variant.updated_at.desc()).limit(100)):
+        variant_count = session.scalar(select(func.count()).select_from(Variant))
+        variant_active = session.scalar(select(func.count()).select_from(Variant).where(
+            Variant.state.in_({"review_pending", "ready", "draft"})))
+        for variant in session.scalars(select(Variant).order_by(
+                Variant.updated_at.desc(), Variant.id.desc()).offset(variant_page * page_size).limit(page_size)):
             target = core._target(session, variant.target_id)
             snapshot = core.snapshot(variant, target)
             variants.append({"id": variant.id, "target_id": variant.target_id,
-                "title": variant.title, "body": variant.body, "revision": variant.revision,
+                "title": variant.title, "revision": variant.revision,
                 "state": variant.state, "content_hash": fingerprint(snapshot),
                 "media_count": len(variant.media), "source_count": len(variant.sources),
                 "origin": variant.metadata_json.get("origin"),
                 "approval_mode": variant.metadata_json.get("approval_mode"),
                 "manual_approval_allowed": variant.metadata_json.get("origin") != "hourly_article_test"})
         dispatches = []
-        recent = list(session.scalars(select(Dispatch).order_by(Dispatch.due_at.desc()).limit(100)))
+        unresolved = Dispatch.state.in_({"sending", "unknown"})
+        dispatch_active = session.scalar(select(func.count()).select_from(Dispatch).where(unresolved))
+        dispatch_query = select(Dispatch)
+        dispatch_count_query = select(func.count()).select_from(Dispatch)
+        if dispatch_filter == "unresolved":
+            dispatch_query = dispatch_query.where(unresolved)
+            dispatch_count_query = dispatch_count_query.where(unresolved)
+        dispatch_count = session.scalar(dispatch_count_query)
+        recent = list(session.scalars(dispatch_query.order_by(
+            Dispatch.due_at.desc(), Dispatch.id.desc()).offset(dispatch_page * page_size).limit(page_size)))
         audits = {}
         if recent:
             for audit in session.scalars(select(Audit).where(
@@ -70,8 +89,17 @@ def route_state(core):
                 "error": dispatch.error, "attempts": dispatch.attempts,
                 "snapshot_hash": dispatch.snapshot_hash,
                 "evidence_kind": _evidence_kind(dispatch, audits.get(dispatch.id, []))})
-        return {"targets": targets, "variants": variants, "dispatches": dispatches,
-                "configuration_only": True}
+        result = {"targets": targets, "variants": variants, "dispatches": dispatches,
+                  "configuration_only": True, "pagination": {
+                      "page_size": page_size, "variant_page": variant_page,
+                      "variant_count": variant_count, "variant_active_count": variant_active,
+                      "variant_has_next": (variant_page + 1) * page_size < variant_count,
+                      "dispatch_page": dispatch_page, "dispatch_count": dispatch_count,
+                      "dispatch_active_count": dispatch_active, "dispatch_filter": dispatch_filter,
+                      "dispatch_has_next": (dispatch_page + 1) * page_size < dispatch_count}}
+        if len(json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 900000:
+            raise AgentError("ROUTE_LIST_SIZE_INVALID", 422)
+        return result
 
 
 def preflight(core, variant_id):
@@ -147,6 +175,16 @@ def preview(core, variant_id):
 
 def reconcile(core, dispatch_id, actor="owner"):
     """Только чтение внешнего результата, без повторной загрузки или отправки."""
+    with core.db.session() as session:
+        dispatch = session.get(Dispatch, dispatch_id)
+        if dispatch is None or dispatch.state not in {"sending", "unknown"}:
+            raise AgentError("ROUTE_RECONCILE_STATE_INVALID", 409)
+        variant = core._variant(session, dispatch.variant_id)
+        if core._target(session, variant.target_id).route not in DIRECT_ROUTES:
+            raise AgentError("TARGET_ROUTE_UNSUPPORTED", 409)
+    # Cleanup локального истёкшего lease не требует снятия общей паузы. Его
+    # отдельный commit остаётся durable даже при последующем stale approval.
+    core._expire_send_leases(dispatch_id=dispatch_id, actor=actor)
     with core.db.session() as session:
         dispatch = session.get(Dispatch, dispatch_id)
         if dispatch is None or dispatch.state != "unknown":

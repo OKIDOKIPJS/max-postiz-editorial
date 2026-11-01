@@ -2,6 +2,7 @@ import { Body, Controller, Get, HttpCode, HttpException, Post, Put, Req } from '
 
 type EditorialRequest = {
   headers: Record<string, string | string[] | undefined>;
+  query?: Record<string, unknown>;
   cookies?: Record<string, string | undefined>;
   user?: { id?: string; activated?: boolean };
   org?: { id?: string; users?: { role?: string; disabled?: boolean }[] };
@@ -54,7 +55,7 @@ export class EditorialController {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
   }
 
-  private async forward(request: EditorialRequest, route: 'state' | 'settings' | 'control' | 'routes' | 'route-action', method: string, body?: unknown) {
+  private async forward(request: EditorialRequest, route: 'state' | 'settings' | 'control' | 'routes' | 'route-action', method: string, body?: unknown, query = '') {
     const identity = this.authorize(request, method !== 'GET');
     let url: URL;
     const key = process.env.EDITORIAL_INTERNAL_KEY;
@@ -70,7 +71,7 @@ export class EditorialController {
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 15000);
     try {
-      const response = await fetch(`${url.href}/${route}`, {
+      const response = await fetch(`${url.href}/${route}${query}`, {
         method, redirect: 'error', signal: abort.signal,
         headers: {
           'Content-Type': 'application/json', 'X-Editorial-Key': key,
@@ -103,7 +104,25 @@ export class EditorialController {
   settings(@Req() request: EditorialRequest) { return this.forward(request, 'settings', 'GET'); }
 
   @Get('/routes')
-  routes(@Req() request: EditorialRequest) { return this.forward(request, 'routes', 'GET'); }
+  routes(@Req() request: EditorialRequest) {
+    this.authorize(request, false);
+    const query = request.query || {};
+    if (Object.keys(query).some(key => !['variant_page', 'dispatch_page', 'dispatch_filter'].includes(key))) {
+      this.fail('EDITORIAL_ROUTE_LIST_INVALID', 422);
+    }
+    const page = (key: string) => {
+      const value = query[key] === undefined ? '0' : query[key];
+      if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]{0,6})$/.test(value) || Number(value) > 1000000) {
+        this.fail('EDITORIAL_ROUTE_LIST_INVALID', 422);
+      }
+      return value;
+    };
+    const filter = query.dispatch_filter === undefined ? 'all' : query.dispatch_filter;
+    if (filter !== 'all' && filter !== 'unresolved') this.fail('EDITORIAL_ROUTE_LIST_INVALID', 422);
+    const suffix = Object.keys(query).length
+      ? `?variant_page=${page('variant_page')}&dispatch_page=${page('dispatch_page')}&dispatch_filter=${filter}` : '';
+    return this.forward(request, 'routes', 'GET', undefined, suffix);
+  }
 
   // Nginx использует только эту проверку сессии для закрытого окна входа в MAX.
   @Get('/browser-authorize')
@@ -138,7 +157,7 @@ export class EditorialController {
   routeAction(@Req() request: EditorialRequest, @Body() body: any) {
     this.authorize(request, true);
     if (!body || typeof body !== 'object' || Array.isArray(body) ||
-        !['inspect', 'preflight', 'preview', 'approve', 'pause', 'resume', 'reconcile'].includes(body.action) ||
+        !['inspect', 'details', 'preflight', 'preview', 'approve', 'pause', 'resume', 'reconcile'].includes(body.action) ||
         typeof body.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(body.id)) {
       this.fail('EDITORIAL_ROUTE_ACTION_INVALID', 422);
     }

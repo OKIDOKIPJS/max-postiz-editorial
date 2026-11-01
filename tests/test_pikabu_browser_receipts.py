@@ -55,6 +55,35 @@ def test_exact_sealed_receipt_is_accepted_only_with_bound_snapshot(receipt, monk
     assert result.external_id == "123"
 
 
+@pytest.mark.parametrize("damage", [None, "omit_added", "auto_empty", "effective_changed", "auto_extra", "policy_wrong", "source_wrong"])
+def test_text_only_native_label_receipt_is_sealed_and_fully_bound(receipt, monkeypatch, damage):
+    adapter, snapshot, journal, _, save = receipt
+    snapshot["media"] = []
+    raw = _story_html(ORIGIN, snapshot).replace('</div></article>',
+        '<a class="tags__tag">Текст</a></div></article>').encode()
+    proof = parse_public_story(raw, ORIGIN + "/story/test_123", snapshot, "fixture_owner")
+    proof.update(image_sha256=[], public_dom_sha256="a" * 64, observed_at=time.time(),
+                 verification="independent_reload_exact_text_owner_links_tags_image_sha256")
+    if damage == "omit_added":
+        proof.pop("platform_added_tags")
+    elif damage == "auto_empty":
+        proof["platform_added_tags"] = []
+    elif damage == "effective_changed":
+        proof["effective_tags_sha256"] = "b" * 64
+    elif damage == "auto_extra":
+        proof["platform_added_tags"] = ["Текст", "Политика"]
+    elif damage == "policy_wrong":
+        proof["tag_policy"] = "unreviewed-policy"
+    elif damage == "source_wrong":
+        proof["tag_policy_source"] = "https://example.org/unreviewed"
+    journal.update(snapshot_sha256=fingerprint(snapshot), proof=proof)
+    value = save()
+    monkeypatch.setattr(adapter, "_call", lambda *args, **kwargs: value)
+    result = adapter.publish("fixture_owner", snapshot, "receipt-test")
+    assert result.state == ("confirmed" if damage is None else "unknown")
+    assert result.verified is (damage is None)
+
+
 @pytest.mark.parametrize("change", [
     "fixture", "untyped_fixture", "missing_proof", "body", "title", "images", "tags", "sources", "dom",
     "owner_attested", "request", "destination", "root", "options", "snapshot", "clicks_bool",
@@ -102,7 +131,8 @@ def test_malformed_stdout_never_becomes_verified(receipt, monkeypatch, change):
     assert result.external_id is None
 
 
-@pytest.mark.parametrize("change", ["body", "title", "images", "tags", "sources", "dom", "fixture", "readback_url"])
+@pytest.mark.parametrize("change", ["body", "title", "images", "tags", "sources", "dom", "fixture", "readback_url",
+    "declared_tags", "effective_tags", "platform_tags", "tag_policy", "tag_source", "old_contract"])
 def test_invalid_proof_remains_unknown_even_when_stdout_matches_checksummed_journal(receipt, monkeypatch, change):
     adapter, snapshot, journal, _, save = receipt
     proof = journal["proof"]
@@ -118,6 +148,16 @@ def test_invalid_proof_remains_unknown_even_when_stdout_matches_checksummed_jour
         journal.update(fixture=True, execution_origin="http://127.0.0.1:1")
     elif change == "readback_url":
         journal["readback_url"] = "https://example.org/wrong"
+    elif change in {"declared_tags", "effective_tags"}:
+        proof[change + "_sha256"] = "b" * 64
+    elif change == "platform_tags":
+        proof["platform_added_tags"] = ["Текст"]  # Image snapshots cannot claim a text-only label.
+    elif change == "tag_policy":
+        proof["tag_policy"] = "unreviewed-policy"
+    elif change == "tag_source":
+        proof["tag_policy_source"] = "https://example.org/unreviewed"
+    elif change == "old_contract":
+        proof["contract"] = "pikabu-public-story-dom-v2"
     _atomic(receipt[3], journal)
     value = _result(journal, fixture=journal["fixture"])
     monkeypatch.setattr(adapter, "_call", lambda *args, **kwargs: value)

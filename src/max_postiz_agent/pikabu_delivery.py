@@ -22,7 +22,9 @@ from .pikabu_metadata import metadata, story_url
 
 
 CONTRACT = "pikabu-exact-package-v1"
-READBACK_CONTRACT = "pikabu-public-story-dom-v2"
+READBACK_CONTRACT = "pikabu-public-story-dom-v3"
+TAG_POLICY = "pikabu-native-text-tag-v1"
+TAG_POLICY_SOURCE = "https://help.pikabu.ru/article/39889"
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _HASH = re.compile(r"[a-f0-9]{64}")
 
@@ -32,6 +34,27 @@ def editor_body(snapshot):
     title, body = snapshot["title"], snapshot["body"]
     prefix = title + "\n\n"
     return body[len(prefix):] if body.startswith(prefix) else body
+
+
+def public_tag_contract(snapshot, platform_added_tags):
+    """Bind declared tags separately from one documented native format label.
+
+    https://help.pikabu.ru/article/39889, section 4: Pikabu can add «Текст»
+    automatically to text-only posts. This never authorizes editorial extras.
+    """
+    declared = sorted(tag.strip().casefold() for tag in metadata(
+        snapshot["title"], snapshot.get("metadata"))["tags"])
+    if (not isinstance(platform_added_tags, list)
+            or not (platform_added_tags == [] or (
+                platform_added_tags == ["Текст"] and snapshot.get("media") == []
+                and "текст" not in declared))):
+        raise AgentError("PIKABU_READBACK_TAGS_MISMATCH")
+    effective = sorted(declared + [tag.casefold() for tag in platform_added_tags])
+    return {"tag_policy": TAG_POLICY, "tag_policy_source": TAG_POLICY_SOURCE,
+            "tags_sha256": fingerprint(declared),
+            "declared_tags_sha256": fingerprint(declared),
+            "effective_tags_sha256": fingerprint(effective),
+            "platform_added_tags": list(platform_added_tags)}
 
 
 def check_body_links(links, body, *, base_url, sources=(), image_urls=()):
@@ -332,8 +355,11 @@ def parse_public_story(raw, url, snapshot, expected_owner, *, encoding=None):
         raise AgentError("PIKABU_READBACK_BODY_MISMATCH")
     expected_tags = metadata(snapshot["title"], snapshot.get("metadata"))["tags"]
     actual_tags = [node.get_text(strip=True) for node in article.select(".tags__tag")]
-    if sorted(tag.strip().casefold() for tag in expected_tags) != sorted(
-            tag.strip().casefold() for tag in actual_tags):
+    declared = sorted(tag.strip().casefold() for tag in expected_tags)
+    observed = sorted(tag.strip().casefold() for tag in actual_tags)
+    added = [] if observed == declared else ["Текст"]
+    tag_contract = public_tag_contract(snapshot, added)
+    if fingerprint(observed) != tag_contract["effective_tags_sha256"]:
         raise AgentError("PIKABU_READBACK_TAGS_MISMATCH")
     images = content.select(".story-image__image")
     if (len(images) != len(snapshot.get("media", []))
@@ -364,7 +390,7 @@ def parse_public_story(raw, url, snapshot, expected_owner, *, encoding=None):
     return {"contract": READBACK_CONTRACT, "external_id": ident, "permalink": url,
             "owner": expected_owner, "body_sha256": _sha(body.encode("utf-8")),
             "title_sha256": _sha(snapshot["title"].encode("utf-8")),
-            "tags_sha256": fingerprint(sorted(tag.strip().casefold() for tag in expected_tags)),
+            **tag_contract,
             "source_urls_sha256": fingerprint([source.get("url") for source in snapshot.get("sources", [])]),
             "snapshot_sha256": fingerprint(snapshot), "image_urls": image_urls,
             "html_sha256": _sha(raw), "verification": "text_owner_links_tags_exact"}

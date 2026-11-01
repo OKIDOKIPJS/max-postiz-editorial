@@ -1,6 +1,9 @@
 param([ValidateSet('start', 'stop', 'status', 'check')][string]$Action = 'status')
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
+if (Test-Path -LiteralPath (Join-Path $projectRoot 'data\four-platform\isolation.json')) {
+    throw 'ISOLATED_LEGACY_POSTIZ_FORBIDDEN: this command owns the legacy max-postiz project and port 4007'
+}
 $dockerPaths = @(
     "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe",
     "$env:LOCALAPPDATA\Docker\resources\bin\docker.exe",

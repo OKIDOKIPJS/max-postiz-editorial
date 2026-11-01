@@ -9,7 +9,7 @@ import os
 import re
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -224,22 +224,41 @@ def inspect_page(page, options, *, origin=ORIGIN):
              and all(counts.get(key) == 1 for key in {
                  "account", "title", "body", "tags_input", "publish", "community_input"}))
     community_empty = False
+    title_empty = body_empty = editor_supported = pending_tag = editor_empty = False
     if ready:
         community = _community_state(page, selectors)
         community_empty = not community["value"] and not community["label"]
-        ready = community_empty
+        snapshot = _editor_snapshot(page, selectors)
+        editor_supported = not snapshot["structure"]["unsupported"]
+        title_empty = snapshot["title"] == ""
+        body_empty = snapshot["body"] == "" and editor_supported
+        pending_tag = bool(_one(page, selectors["tags_input"], "PIKABU_TAG_INPUT_AMBIGUOUS").input_value())
+        editor_empty = (title_empty and body_empty and not snapshot["tags"]
+                        and not snapshot["images"] and community_empty and not pending_tag)
+    blockers = []
+    if not ready:
+        blockers.append("PIKABU_DOM_CONTRACT_REQUIRED")
+    if ready and not editor_supported:
+        blockers.append("PIKABU_EDITOR_UNSUPPORTED_CONTENT")
+    if ready and not editor_empty:
+        blockers.append("PIKABU_EDITOR_NOT_EMPTY")
+    if pending_tag:
+        blockers.append("PIKABU_EDITOR_PENDING_TAG")
+    if options.get("dom_contract_verified") is not True:
+        blockers.append("PIKABU_DOM_CONTRACT_UNVERIFIED")
     return {"state": "available" if ready else "dom_contract_required",
-            "publish": ready and options.get("dom_contract_verified") is True,
+            "publish": ready and editor_supported and editor_empty
+                       and options.get("dom_contract_verified") is True,
             "owner": options["owner"], "live_verified": False,
             "dom_contract_sha256": fingerprint(selectors), "selector_counts": counts,
-            "community_empty": community_empty,
+            "community_empty": community_empty, "title_empty": title_empty, "body_empty": body_empty,
+            "editor_empty": editor_empty, "editor_supported": editor_supported, "pending_tag": pending_tag,
+            "readiness_blockers": blockers,
             "media_contract_verified": options.get("media_contract_verified") is True,
             "contract_verified": options.get("dom_contract_verified") is True}
 
 
-def _editor_content(editor, image_selector):
-    """One DOM tree: admit observed paragraph wrappers, never flatten arbitrary DIVs."""
-    return editor.evaluate("""(root, selector) => {
+_EDITOR_CONTENT_SCRIPT = """(root, selector) => {
       let unsupported=false;
       const selected=[...document.querySelectorAll(selector)];
       const images=[...root.querySelectorAll('img')],paragraphs=[],mappedImages=[],chromeNodes=new Set();
@@ -354,7 +373,95 @@ def _editor_content(editor, image_selector):
           visible:visible(n),
           original:n.getAttribute('data-large-image')||n.getAttribute('data-original')||n.currentSrc||n.src||'',
           width:n.naturalWidth||0,height:n.naturalHeight||0}))};
-    }""", image_selector)
+    }"""
+
+
+def _editor_content(editor, image_selector):
+    """One DOM tree: admit observed paragraph wrappers, never flatten arbitrary DIVs."""
+    return editor.evaluate(_EDITOR_CONTENT_SCRIPT, image_selector)
+
+
+def _atomic_action_state(page, selectors):
+    """No locator waits, network, focus changes or DOM writes in this final capture."""
+    script = """args=>{
+      const content=""" + _EDITOR_CONTENT_SCRIPT + """;
+      const all=s=>[...document.querySelectorAll(s)];
+      const one=s=>{const nodes=all(s);if(nodes.length!==1)throw Error('ATOMIC_SELECTOR');return nodes[0];};
+      const visible=n=>{
+        const box=n.getBoundingClientRect();if(box.width<=0 || box.height<=0)return false;
+        for(let current=n;current;current=current.parentElement){const s=getComputedStyle(current);
+          if(s.display==='none' || s.visibility!=='visible' || Number(s.opacity)===0)return false;
+        }return true;
+      };
+      const editor=one(args.body),data=content(editor,args.uploaded_images);
+      const community=one(args.community_input),control=community.closest('[role="combobox"]');
+      const account=one(args.account),button=one(args.publish),tagInput=one(args.tags_input);
+      const selected=getSelection(),active=document.activeElement;
+      const modes=['setting-scheduled','setting-anonymous','setting-nsfw','setting-my','setting-authors-content'];
+      return {url:location.href,document_title:document.title,
+        snapshot:{title:one(args.title).value,body:data.body,links:data.links,images:data.images,
+          structure:data.structure,tags:all(args.tag_values).map(n=>n.textContent),
+          community:args.community?all(args.community).length:0,
+          community_value:community.value,community_label:control?control.innerText.trim():null},
+        account:{href:account.getAttribute('href')||'',visible:visible(account)},
+        button:{visible:visible(button),enabled:!button.matches(':disabled')
+          && button.getAttribute('aria-disabled')!=='true',label:button.innerText.trim()},
+        captcha:args.captcha?all(args.captcha).some(visible):false,
+        errors:args.errors?all(args.errors).some(n=>visible(n)&&n.innerText.trim()):false,
+        selected_mode:modes.some(mode=>all('[data-test="'+mode+'"]').some(n=>n.checked
+          || n.getAttribute('aria-checked')==='true' || n.querySelector('input:checked,[aria-checked=true]'))),
+        editor_focus:(active===editor || editor.contains(active)) && selected && selected.rangeCount===1
+          && selected.isCollapsed && editor.contains(selected.anchorNode) && editor.contains(selected.focusNode),
+        tag_focus:active===tagInput,tag_value:tagInput.value};
+    }"""
+    try:
+        return page.evaluate(script, selectors)
+    except Exception as exc:
+        raise AgentError("PIKABU_ATOMIC_CONTEXT_INVALID") from exc
+
+
+def _action_guard(page, options, selectors, authorize, expected, *, origin,
+                  focus=None, tag=None, publish=False, action):
+    """Authorize after slow guards, then issue one native action within one second.
+
+    This bounds the local authorization window; it is not an atomic transaction
+    across SQL and the browser. Native keyboard commands have no actionability
+    waits, so their deadline is checked immediately before protocol dispatch.
+    """
+    deadline = time.monotonic() + 1.0
+    authorize()
+    if time.monotonic() >= deadline:
+        raise AgentError("PIKABU_ACTION_GUARD_EXPIRED")
+    actual = _atomic_action_state(page, selectors)
+    if actual["url"] != origin + "/add":
+        raise AgentError("PIKABU_EDITOR_URL_CHANGED")
+    if actual["captcha"] or any(value in actual["document_title"].casefold()
+                                 for value in ("captcha", "just a moment", "доступ ограничен")):
+        raise AgentError("PIKABU_CAPTCHA_OR_ACCESS_BLOCKED", 403)
+    if not actual["account"]["visible"]:
+        raise AgentError("PIKABU_ACCOUNT_MISMATCH", 403)
+    _account_href(actual["account"]["href"], owner_name(options.get("owner")), origin)
+    if actual["snapshot"] != expected:
+        raise AgentError("PIKABU_EDITOR_CHANGED_BEFORE_PUBLISH" if publish else "PIKABU_EDITOR_CHANGED_BEFORE_ACTION")
+    if actual["errors"]:
+        raise AgentError("PIKABU_EDITOR_REJECTED")
+    if actual["selected_mode"]:
+        raise AgentError("PIKABU_PUBLISH_MODE_UNEXPECTED")
+    if focus == "editor" and not actual["editor_focus"]:
+        raise AgentError("PIKABU_EDITOR_FOCUS_CHANGED")
+    if focus == "tag" and (not actual["tag_focus"] or actual["tag_value"] != tag):
+        raise AgentError("PIKABU_EDITOR_FOCUS_CHANGED")
+    if publish:
+        if actual["tag_value"]:
+            raise AgentError("PIKABU_EDITOR_PENDING_TAG")
+        if not actual["button"]["visible"] or not actual["button"]["enabled"]:
+            raise AgentError("PIKABU_PUBLISH_BUTTON_DISABLED")
+        if actual["button"]["label"] != "Опубликовать пост":
+            raise AgentError("PIKABU_PUBLISH_MODE_UNEXPECTED")
+    remaining = deadline - time.monotonic()
+    if remaining < 0.001:
+        raise AgentError("PIKABU_ACTION_GUARD_EXPIRED")
+    return action(int(remaining * 1000))
 
 
 def _community_state(page, selectors):
@@ -450,17 +557,19 @@ def _fill_editor(page, plan, options, selectors, journal_path, journal, authoriz
         raise AgentError("PIKABU_EDITOR_NOT_EMPTY", 409)
     authorize()
     _save(journal_path, journal, "editor_mutation_intent")
-    authorize()
     _editor_account(page, options, selectors, origin=origin)
     if _editor_snapshot(page, selectors) != initial:
         raise AgentError("PIKABU_EDITOR_CHANGED_BEFORE_EDIT")
-    _one(page, selectors["title"], "PIKABU_EDITOR_TITLE_AMBIGUOUS").fill(plan["title"])
+    title = _one(page, selectors["title"], "PIKABU_EDITOR_TITLE_AMBIGUOUS")
+    _action_guard(page, options, selectors, authorize, initial, origin=origin,
+                  action=lambda budget: title.fill(plan["title"], timeout=budget))
     editor = _one(page, selectors["body"], "PIKABU_EDITOR_BODY_AMBIGUOUS")
     # Plain HTML clipboard input uses the public paste handler and preserves exact
     # paragraph breaks without calling framework/private application APIs.
     # Focus the public contenteditable directly. A click at a wrapper's centre
     # can target node controls; the exact collapsed selection is checked before keys.
-    editor.focus()
+    _action_guard(page, options, selectors, authorize, _editor_snapshot(page, selectors), origin=origin,
+                  action=lambda budget: editor.focus(timeout=budget))
     for image_index, item in enumerate(plan["media"]):
         authorize()
         raw = inside(Path(journal["root"]), item["path"]).read_bytes()
@@ -468,16 +577,18 @@ def _fill_editor(page, plan, options, selectors, journal_path, journal, authoriz
             raise AgentError("PIKABU_IMAGE_HASH_CHANGED")
         upload_before = _editor_snapshot(page, selectors)
         _save(journal_path, journal, "image_upload_intent", upload_sha256=item["sha256"])
-        authorize()
         _editor_account(page, options, selectors, origin=origin)
         if _editor_snapshot(page, selectors) != upload_before:
             raise AgentError("PIKABU_EDITOR_CHANGED_BEFORE_UPLOAD")
-        editor.evaluate("""(e, file) => {
+        paste = """(e, file) => {
           const bytes=Uint8Array.from(atob(file.bytes),c=>c.charCodeAt(0));
           const data=new DataTransfer();data.items.add(new File([bytes],file.name,{type:file.mime}));
           e.dispatchEvent(new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true}));
-        }""", {"name": item["name"], "mime": item["mime"],
-               "bytes": base64.b64encode(raw).decode("ascii")})
+        }"""
+        file = {"name": item["name"], "mime": item["mime"],
+                "bytes": base64.b64encode(raw).decode("ascii")}
+        _action_guard(page, options, selectors, authorize, upload_before, origin=origin,
+                      action=lambda budget, paste=paste, file=file: editor.evaluate(paste, file, timeout=budget))
         page.wait_for_function("""arg => {
           const images=[...document.querySelectorAll(arg.selector)];
           return images.length===arg.count && images.every(n=>n.complete && n.naturalWidth>0
@@ -489,27 +600,28 @@ def _fill_editor(page, plan, options, selectors, journal_path, journal, authoriz
     # trailing paragraph after upload; never silently move an existing draft.
     for index, paragraph in enumerate(plan["body"].split("\n\n")):
         if index:
-            authorize()
             _typing_context(page, editor, options, selectors, origin=origin)
-            page.keyboard.press("Enter")
+            _action_guard(page, options, selectors, authorize, _editor_snapshot(page, selectors),
+                          origin=origin, focus="editor", action=lambda budget: page.keyboard.press("Enter"))
         for line_index, line in enumerate(paragraph.split("\n")):
             if line_index:
-                authorize()
                 _typing_context(page, editor, options, selectors, origin=origin)
-                page.keyboard.press("Shift+Enter")
-            authorize()
+                _action_guard(page, options, selectors, authorize, _editor_snapshot(page, selectors),
+                              origin=origin, focus="editor", action=lambda budget: page.keyboard.press("Shift+Enter"))
             _typing_context(page, editor, options, selectors, origin=origin)
-            page.keyboard.insert_text(line)
+            _action_guard(page, options, selectors, authorize, _editor_snapshot(page, selectors),
+                          origin=origin, focus="editor", action=lambda budget, line=line: page.keyboard.insert_text(line))
     for tag in plan["tags"]:
-        authorize()
         _editor_account(page, options, selectors, origin=origin)
         tag_input = _one(page, selectors["tags_input"], "PIKABU_TAG_INPUT_AMBIGUOUS")
-        tag_input.fill(tag)
-        authorize()
+        _action_guard(page, options, selectors, authorize, _editor_snapshot(page, selectors), origin=origin,
+                      action=lambda budget, tag_input=tag_input, tag=tag: tag_input.fill(tag, timeout=budget))
         _editor_account(page, options, selectors, origin=origin)
         if tag_input.input_value() != tag or not tag_input.evaluate("n=>document.activeElement===n"):
             raise AgentError("PIKABU_EDITOR_FOCUS_CHANGED")
-        tag_input.press("Enter")
+        _action_guard(page, options, selectors, authorize, _editor_snapshot(page, selectors),
+                      origin=origin, focus="tag", tag=tag,
+                      action=lambda budget, tag_input=tag_input: tag_input.press("Enter", timeout=budget))
     _check_editor(page, plan, options, selectors, origin=origin)
     _save(journal_path, journal, "prepared", editor_snapshot_sha256=fingerprint(plan), editor_url=page.url)
 
@@ -659,11 +771,11 @@ def _submit(page, plan, options, selectors, path, journal, authorize, *, origin)
     # Image reads may take long enough for approval, pause or lease to change.
     authorize()
     _save(path, journal, "click_intent", clicks=1)
-    # The durable write itself is also outside the database transaction.
-    authorize()
+    # Finish the slow locator guards before the final SQL authorization window.
     button = _final_editor(page, expected, options, selectors, origin=origin,
                            changed_code="PIKABU_EDITOR_CHANGED_BEFORE_PUBLISH")
-    button.click(timeout=1000, no_wait_after=True)
+    _action_guard(page, options, selectors, authorize, expected, origin=origin, publish=True,
+                  action=lambda budget: button.click(timeout=budget, no_wait_after=True))
     page.wait_for_url(re.compile(re.escape(origin) + r"/story/[A-Za-z0-9_-]+_\d+$"))
     url = page.url
     _save(path, journal, "readback_pending", permalink=url, readback_url=url)
@@ -739,10 +851,41 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
     return _result(journal, fixture=fixture)
 
 
+def _safe_failure_code(error):
+    """Public operation reasons are constants; never promote arbitrary child text."""
+    failure_codes = {
+        "TARGET_PAUSED": "PIKABU_TARGET_PAUSED", "TARGET_DISABLED": "PIKABU_TARGET_DISABLED",
+        "EDITORIAL_PAUSED": "PIKABU_EDITORIAL_PAUSED", "APPROVAL_STALE": "PIKABU_APPROVAL_STALE",
+        "ROUTE_DISPATCH_LEASE_LOST": "PIKABU_DISPATCH_LEASE_LOST",
+        "ROUTE_CONFIGURATION_CHANGED": "PIKABU_CONFIGURATION_CHANGED",
+        "ROUTE_RUNTIME_RESTART_REQUIRED": "PIKABU_RUNTIME_RESTART_REQUIRED",
+        "BROWSER_PROFILE_BUSY": "PIKABU_PROFILE_BUSY",
+        "PIKABU_RUNTIME_RESTART_REQUIRED": "PIKABU_RUNTIME_RESTART_REQUIRED",
+        "PIKABU_ACTION_GUARD_EXPIRED": "PIKABU_ACTION_GUARD_EXPIRED",
+        "PIKABU_EDITOR_NOT_EMPTY": "PIKABU_EDITOR_NOT_EMPTY",
+        "PIKABU_EDITOR_FOCUS_CHANGED": "PIKABU_EDITOR_FOCUS_CHANGED",
+        "PIKABU_EDITOR_URL_CHANGED": "PIKABU_EDITOR_URL_CHANGED",
+        "PIKABU_EDITOR_PENDING_TAG": "PIKABU_EDITOR_PENDING_TAG",
+        "PIKABU_CAPTCHA_OR_ACCESS_BLOCKED": "PIKABU_CAPTCHA_OR_ACCESS_BLOCKED",
+        "PIKABU_DISPATCH_NOT_APPROVED": "PIKABU_DISPATCH_NOT_APPROVED",
+    }
+    for code in ("PIKABU_PROFILE_BUSY", "PIKABU_LOGIN_REQUIRED", "PIKABU_ACCOUNT_MISMATCH",
+                 "PIKABU_TARGET_NOT_CONFIGURED", "PIKABU_CONFIGURATION_CHANGED",
+                 "PIKABU_DOM_CONTRACT_UNVERIFIED", "PIKABU_DOM_CONTRACT_INVALID",
+                 "PIKABU_EDITOR_UNSUPPORTED_CONTENT", "PIKABU_EDITOR_REJECTED",
+                 "PIKABU_EDITOR_CHANGED_BEFORE_ACTION", "PIKABU_EDITOR_CHANGED_BEFORE_PUBLISH",
+                 "PIKABU_PUBLISH_MODE_UNEXPECTED", "PIKABU_PUBLISH_BUTTON_DISABLED",
+                 "PIKABU_ATOMIC_CONTEXT_INVALID", "PIKABU_UNAPPROVED_LINK"):
+        failure_codes[code] = code
+    return (failure_codes.get(error, "PIKABU_OPERATION_UNCONFIRMED") if isinstance(error, str)
+            else "PIKABU_OPERATION_UNCONFIRMED")
+
+
 def _result(journal, *, fixture=False):
     if journal.get("fixture") is not fixture:
         raise AgentError("PIKABU_JOURNAL_CONFLICT", 409)
     state = journal.get("state")
+    failure_code = _safe_failure_code(journal.get("error")) if state not in {"confirmed", "prepared"} else None
     return {"state": state if state in {"confirmed", "prepared", "failed"} else "unknown",
             "external_id": journal.get("external_id"), "permalink": journal.get("permalink"),
             "verified": state == "confirmed" and not fixture and journal.get("execution_origin") == ORIGIN,
@@ -754,7 +897,8 @@ def _result(journal, *, fixture=False):
                          "dom_contract_sha256": journal["dom_contract_sha256"],
                          "snapshot_sha256": journal["snapshot_sha256"],
                          "state": state, "clicks": journal.get("clicks", 0),
-                         "error": journal.get("error"), "proof": journal.get("proof")}}
+                         "error": journal.get("error"), "failure_code": failure_code,
+                         "proof": journal.get("proof")}}
 
 
 def reconcile(page, root, options, destination, request_id, *, origin=ORIGIN, fixture=False):
@@ -816,38 +960,56 @@ def target_options(root, destination):
     return rows[0].get("options", {})
 
 
-def authorize(root, payload, options, *, expected_lease_owner=None):
-    """Only a currently leased exact dispatch can mutate the remote editor."""
+@contextmanager
+def _authority_runtime(root):
+    """Capture one process runtime before browser startup; never sync/init a DB."""
     from .config import Settings
-    from .db import Database, now
+    from .db import Database
     from .hub import HubService
-    from .hub_models import Dispatch
-    from .server_state import require_running
     settings = Settings.load(root)
     db = Database(settings)
     service = None
     try:
-        with db.session() as transaction:
-            row = transaction.get(Dispatch, payload.get("request_id"))
-            if (row is None or row.state != "sending" or not row.owner
-                    or (expected_lease_owner is not None and row.owner != expected_lease_owner)
-                    or not math.isfinite(row.lease_until) or row.lease_until <= now() + 3
-                    or row.due_at > now()):
-                raise AgentError("PIKABU_DISPATCH_NOT_APPROVED", 403)
-            service = HubService(settings, db, bootstrap_targets=False)
-            require_running(service, transaction)
-            variant, target = service._valid_dispatch(transaction, row)
-            if (target.platform != "pikabu" or target.route != "pikabu_browser"
-                    or target.destination != payload.get("destination")
-                    or fingerprint(target.options) != fingerprint(options)
-                    or fingerprint(row.snapshot) != fingerprint(payload.get("snapshot"))
-                    or fingerprint(service.snapshot(variant, target)) != fingerprint(row.snapshot)):
-                raise AgentError("PIKABU_DISPATCH_NOT_APPROVED", 403)
-            return row.owner
+        service = HubService(settings, db, bootstrap_targets=False)
+        yield service
     finally:
         if service is not None:
             service.close()
         db.engine.dispose()
+
+
+def authorize(root, payload, options, *, expected_lease_owner=None, authority_core=None):
+    """Only a currently leased exact dispatch can mutate the remote editor."""
+    from .db import now
+    from .hub_models import Dispatch
+    from .server_state import require_running
+    if authority_core is None:
+        with _authority_runtime(root) as owned:
+            return authorize(root, payload, options, expected_lease_owner=expected_lease_owner,
+                             authority_core=owned)
+    service, db = authority_core, authority_core.db
+    if Path(service.settings.root).resolve() != Path(root).resolve():
+        raise AgentError("PIKABU_AUTHORITY_ROOT_MISMATCH", 403)
+    with db.session() as transaction:
+        row = transaction.get(Dispatch, payload.get("request_id"))
+        if (row is None or row.state != "sending" or not row.owner
+                or (expected_lease_owner is not None and row.owner != expected_lease_owner)
+                or not math.isfinite(row.lease_until) or row.lease_until <= now() + 3
+                or row.due_at > now()):
+            raise AgentError("PIKABU_DISPATCH_NOT_APPROVED", 403)
+        frozen_owner, frozen_hash = row.owner, row.snapshot_hash
+        require_running(service, transaction)
+        variant, target = service._valid_dispatch(transaction, row)
+        if (target.platform != "pikabu" or target.route != "pikabu_browser"
+                or target.destination != payload.get("destination")
+                or fingerprint(target.options) != fingerprint(options)
+                or fingerprint(row.snapshot) != fingerprint(payload.get("snapshot"))
+                or fingerprint(service.snapshot(variant, target)) != fingerprint(row.snapshot)):
+            raise AgentError("PIKABU_DISPATCH_NOT_APPROVED", 403)
+    # The final cheap fence uses a new SQL session, after expensive quality
+    # checks and after releasing the original session's identity map.
+    return service.authorize_dispatch_fence(payload.get("request_id"),
+        expected_owner=frozen_owner, expected_snapshot_hash=frozen_hash)
 
 
 def main(argv=None):
@@ -892,20 +1054,27 @@ def main(argv=None):
         action = payload.get("action")
         if action not in {"inspect", "probe", "publish", "prepare", "reconcile"}:
             raise AgentError("PIKABU_ACTION_INVALID")
-        lease_owner = None
-        if action in {"publish", "prepare"}:
-            lease_owner = authorize(root, payload, options)
-        with session(root, options) as page:
-            if action == "inspect":
-                value = inspect_page(page, options)
-            elif action == "probe":
-                value = probe_page(page, options)
-            elif action == "reconcile":
-                value = reconcile(page, root, options, payload["destination"], payload["request_id"])
-            else:
-                value = run_publish(page, root, options, payload,
-                                    lambda: authorize(root, payload, options,
-                                                      expected_lease_owner=lease_owner))
+        writing = action in {"publish", "prepare"}
+        if writing and (not isinstance(payload.get("runtime_generation"), str)
+                        or not re.fullmatch(r"[a-f0-9]{64}", payload["runtime_generation"])):
+            raise AgentError("PIKABU_RUNTIME_RESTART_REQUIRED", 409)
+        with _authority_runtime(root) if writing else nullcontext(None) as authority:
+            lease_owner = None
+            if writing:
+                if payload["runtime_generation"] != authority.route_runtime_generation():
+                    raise AgentError("PIKABU_RUNTIME_RESTART_REQUIRED", 409)
+                lease_owner = authorize(root, payload, options, authority_core=authority)
+            with session(root, options) as page:
+                if action == "inspect":
+                    value = inspect_page(page, options)
+                elif action == "probe":
+                    value = probe_page(page, options)
+                elif action == "reconcile":
+                    value = reconcile(page, root, options, payload["destination"], payload["request_id"])
+                else:
+                    value = run_publish(page, root, options, payload,
+                                        lambda: authorize(root, payload, options, authority_core=authority,
+                                                          expected_lease_owner=lease_owner))
         print(json.dumps(value, ensure_ascii=True))
     except Exception as exc:
         print(json.dumps({"code": exc.code if isinstance(exc, AgentError)

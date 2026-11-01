@@ -114,20 +114,26 @@ def main():
 
     run([sys.executable, "-m", "ruff", "check", "src", "tests", "scripts"], "RUFF")
     tests = [] if full else ["tests/test_telegram_publisher.py", "tests/test_vk_publisher.py",
-        "tests/test_pikabu_delivery.py", "tests/test_pikabu_offline_probe.py",
+        "tests/test_pikabu_delivery.py", "tests/test_pikabu_native_tags.py", "tests/test_pikabu_offline_probe.py",
         "tests/test_pikabu_browser_receipts.py",
         "tests/test_pikabu_editor_contract.py",
         "tests/test_four_platform_hub.py", "tests/test_route_isolation.py", "tests/test_routes_api.py",
         "tests/test_owner_original.py", "tests/test_route_credentials.py",
         "tests/test_route_dispatch_postgres.py", "tests/test_route_evidence_kind.py",
-        "tests/test_routes_cli_schedule.py"]
+        "tests/test_routes_cli_schedule.py", "tests/test_route_details.py",
+        "tests/test_route_readiness.py", "tests/test_route_recovery.py",
+        "tests/test_route_authority_fence.py", "tests/test_browser_process.py",
+        "tests/test_four_platform_installers.py", "tests/test_report_files.py",
+        "tests/test_pikabu_action_guard.py", "tests/test_pikabu_inspection.py",
+        "tests/test_pikabu_worker_runtime.py"]
     if not full:
         tests.extend(path.relative_to(root).as_posix()
                      for path in sorted((root / "tests").glob("test_vk_browser*.py")))
     run([sys.executable, "-m", "pytest", *tests, "--basetemp=.test-state/four-platform-pytest",
          "--junitxml=.test-state/four-platform-tests.xml"], "PYTEST")
     if ui:
-        run([shutil.which("node"), "--test", "deployment/postiz-max/test-editorial-contract.cjs"], "UI")
+        run([shutil.which("node"), "--test", "deployment/postiz-max/test-editorial-contract.cjs",
+             "deployment/postiz-max/test-production-build.cjs"], "UI")
     run([sys.executable, "-m", "pip", "check"], "DEPENDENCIES")
     print("Four-platform checks passed; external delivery was not tested.")
     if not ui:

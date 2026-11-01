@@ -51,6 +51,8 @@ class PlatformRoutes:
             else:
                 raise AgentError("TARGET_ROUTE_UNSUPPORTED")
             self.cache[key] = adapter
+        if target.route in {"vk_browser", "pikabu_browser"}:
+            self.cache[key].runtime_generation = self.core.route_runtime_generation()
         return self.cache[key]
 
     def validate(self, target, snapshot):
@@ -80,9 +82,12 @@ class PlatformRoutes:
                     or fingerprint(dispatch.snapshot) != fingerprint(original.snapshot)):
                 raise AgentError("ROUTE_DISPATCH_LEASE_LOST", 409)
             self.core._valid_dispatch(session, dispatch)
+        return self.core.authorize_dispatch_fence(original.id, expected_owner=original.owner,
+                                                  expected_snapshot_hash=original.snapshot_hash)
 
     def inspect(self, target):
         if target.route in DIRECT_ROUTES:
+            self.core._assert_current_route_runtime()
             return self.publisher(target).inspect(target.destination)
         if target.route in {"max_browser", "max_api"}:
             return self.core.publisher.inspect(target.destination)

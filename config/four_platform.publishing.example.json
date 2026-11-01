@@ -11,6 +11,7 @@
      "destination": "", "enabled": false, "options": {"max_chars": 16384,
        "profile_dir": "data/vk-browser", "channel": "chrome", "headless": true,
        "operation_timeout_seconds": 180, "dom_contract_verified": false,
+       "dom_contract_profile": "personal-text-v1",
        "media_contract_verified": false}},
     {"id": "pikabu_test", "profile_id": "test", "platform": "pikabu", "route": "pikabu_browser",
      "destination": "", "enabled": false, "options": {"max_chars": 15000,

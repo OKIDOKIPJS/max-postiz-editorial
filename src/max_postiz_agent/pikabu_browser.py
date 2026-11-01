@@ -11,8 +11,9 @@ import time
 from pathlib import Path
 
 from .adapters import Delivery
+from .browser_process import run_browser_worker
 from .config import AgentError, fingerprint, inside
-from .pikabu_delivery import READBACK_CONTRACT, PikabuDelivery, owner_name
+from .pikabu_delivery import READBACK_CONTRACT, PikabuDelivery, owner_name, public_tag_contract
 from .pikabu_metadata import story_url
 
 
@@ -22,6 +23,7 @@ class PikabuBrowser:
     def __init__(self, root, options=None):
         self.root = Path(root).resolve()
         self.options = options or {}
+        self.runtime_generation = None
         self.preparation = PikabuDelivery(self.root, self.options)
 
     def validate(self, destination, snapshot):
@@ -38,25 +40,27 @@ class PikabuBrowser:
         return plan
 
     def _call(self, action, destination, **payload):
+        request = {"action": action, "destination": destination,
+                   "options_sha256": fingerprint(self.options), **payload}
+        if action in {"publish", "prepare"}:
+            if (not isinstance(self.runtime_generation, str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", self.runtime_generation)):
+                raise AgentError("PIKABU_RUNTIME_RESTART_REQUIRED", 409)
+            request["runtime_generation"] = self.runtime_generation
         try:
-            result = subprocess.run(
+            result = run_browser_worker(
                 [sys.executable, "-m", "max_postiz_agent.pikabu_browser_worker",
                  "--root", str(self.root)],
-                input=json.dumps({"action": action, "destination": destination,
-                                  "options_sha256": fingerprint(self.options), **payload}),
-                text=True, encoding="utf-8", capture_output=True, check=False,
-                timeout=min(360, int(self.options.get("operation_timeout_seconds", 180))) + 60,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                input=json.dumps(request),
+                timeout=min(360, int(self.options.get("operation_timeout_seconds", 180))) + 60)
             value = json.loads(result.stdout)
             if not isinstance(value, dict):
                 raise ValueError
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
             raise AgentError("PIKABU_BROWSER_OPERATION_UNKNOWN", 503) from exc
         if "code" in value:
-            code = value["code"]
-            if not isinstance(code, str) or not code.startswith("PIKABU_"):
-                code = "PIKABU_BROWSER_OPERATION_UNKNOWN"
-            raise AgentError(code, 409)
+            from .pikabu_browser_worker import _safe_failure_code
+            raise AgentError(_safe_failure_code(value["code"]), 409)
         return value
 
     def inspect(self, destination):
@@ -120,6 +124,7 @@ class PikabuBrowser:
                     "source_urls_sha256": fingerprint([source.get("url") for source in snapshot.get("sources", [])]),
                     "image_sha256": [item["sha256"] for item in plan["media"]],
                     "verification": "independent_reload_exact_text_owner_links_tags_image_sha256"}
+                expected.update(public_tag_contract(snapshot, proof.get("platform_added_tags")))
                 if any(proof.get(key) != expected_value for key, expected_value in expected.items()):
                     raise ValueError
                 for key in ("html_sha256", "public_dom_sha256"):
@@ -146,9 +151,15 @@ class PikabuBrowser:
         try:
             return self._delivery(self._call("publish", destination, snapshot=snapshot,
                                              request_id=request_id), destination, snapshot, request_id)
-        except AgentError:
+        except AgentError as exc:
             # Worker failure alone does not establish whether upload/click occurred.
-            return Delivery("unknown", verified=False)
+            return self._worker_error(exc)
+
+    @staticmethod
+    def _worker_error(exc):
+        from .pikabu_browser_worker import _safe_failure_code
+        return Delivery("unknown", verified=False, evidence={"kind": "browser_worker_error",
+                        "failure_code": _safe_failure_code(exc.code)})
 
     def prepare(self, destination, snapshot, request_id):
         self.validate(destination, snapshot)
@@ -162,8 +173,8 @@ class PikabuBrowser:
             started = time.time()
             return self._delivery(self._call("reconcile", destination, request_id=request_id),
                                   destination, snapshot, request_id, fresh_after=started)
-        except AgentError:
-            return Delivery("unknown", verified=False)
+        except AgentError as exc:
+            return self._worker_error(exc)
 
     def close(self):
         pass

@@ -113,7 +113,7 @@ test('four-route BFF uses fixed paths and exact action envelopes without forward
   await instance.routes(req);
   assert.equal(calls[0][0], `${env.EDITORIAL_INTERNAL_URL}/routes`);
   assert.equal(calls[0][1].method, 'GET');
-  for (const action of ['inspect', 'preflight', 'preview', 'pause', 'resume', 'reconcile']) {
+  for (const action of ['inspect', 'details', 'preflight', 'preview', 'pause', 'resume', 'reconcile']) {
     await instance.routeAction(req, { action, id: 'saved-object_123' });
     assert.equal(calls.at(-1)[0], `${env.EDITORIAL_INTERNAL_URL}/route-action`);
     assert.deepEqual(JSON.parse(calls.at(-1)[1].body), { action, id: 'saved-object_123' });
@@ -172,6 +172,19 @@ test('port selection remains a two-value allowlist and does not relax URL or own
   const req = request(); req.user.id = 'someone-else';
   await rejected(instance.state(req), 'EDITORIAL_OWNER_REQUIRED');
   assert.equal(calls.length, 0);
+});
+
+test('route pages forward only bounded fixed query fields and reject arbitrary or ambiguous input', async () => {
+  const { instance, calls } = controller();
+  const req = request(); req.query = { variant_page: '12', dispatch_page: '3', dispatch_filter: 'unresolved' };
+  await instance.routes(req);
+  assert.equal(calls[0][0], `${env.EDITORIAL_INTERNAL_URL}/routes?variant_page=12&dispatch_page=3&dispatch_filter=unresolved`);
+  for (const query of [{ url: 'http://other' }, { limit: '1000' }, { variant_page: '-1' },
+    { dispatch_page: '1000001' }, { variant_page: '01' }, { variant_page: ['0', '1'] },
+    { variant_page: true }, { dispatch_filter: 'unknown' }]) {
+    await rejected(Promise.resolve().then(() => instance.routes({ ...request(), query })), 'EDITORIAL_ROUTE_LIST_INVALID', 422);
+  }
+  assert.equal(calls.length, 1);
 });
 
 test('four-route actions reject arbitrary publish, URL/credential keys, malformed IDs and stale schedules', async () => {
@@ -366,6 +379,67 @@ const routeTarget = { id: 'vk_target', platform: 'vk', route: 'vk_api', destinat
   credentials_configured: true, adapter_mode: 'live' };
 const routeVariant = { id: 'variant-123', target_id: 'vk_target', title: 'Полный материал', body: 'Начало\n\nКонец материала',
   revision: 2, state: 'ready', content_hash: 'd'.repeat(64), media_count: 1, source_count: 2 };
+const routeDetailsFixture = (variant = routeVariant, target = routeTarget) => ({
+  variant_id: variant.id, target_id: variant.target_id, title: variant.title, body: variant.body,
+  revision: variant.revision, content_hash: variant.content_hash, destination: target.destination,
+  platform: target.platform, route: target.route, binding_hash: target.binding_hash,
+  metadata: { tags: ['Точный тег'], community: '', ai_generated: true },
+  media: Array.from({ length: variant.media_count }, () => ({ path: 'data/media/fixture.jpg', mime: 'image/jpeg', sha256: 'a'.repeat(64) })),
+  sources: Array.from({ length: variant.source_count }, () => ({ url: 'https://example.test/source' })),
+  read_only: true, manual_approval_allowed: variant.manual_approval_allowed !== false,
+});
+
+test('full details require exact version, recipient, binding and complete bounded posting metadata', () => {
+  const ui = routeUi();
+  assert.equal(ui.routeDetailsResult(routeDetailsFixture(), routeVariant, routeTarget).body, routeVariant.body);
+  for (const patch of [{ revision: 3 }, { content_hash: '0'.repeat(64) }, { destination: 'other' },
+    { binding_hash: '0'.repeat(64) }, { target_id: 'other' }, { title: 'Another title' }]) {
+    assert.throws(() => ui.routeDetailsResult({ ...routeDetailsFixture(), ...patch }, routeVariant, routeTarget), /APPROVAL_STALE/);
+  }
+  for (const patch of [{ body: null }, { read_only: false }, { metadata: [] }, { media: [] },
+    { sources: [] }, { manual_approval_allowed: 'true' }, { metadata: { huge: 'я'.repeat(450000) } }]) {
+    assert.throws(() => ui.routeDetailsResult({ ...routeDetailsFixture(), ...patch }, routeVariant, routeTarget), /EDITORIAL_ROUTE_DETAILS_INVALID/);
+  }
+});
+
+test('inventory body cannot open approval; exact details render complete escaped text and Pika metadata', () => {
+  const React = require(path.join(tooling, 'react'));
+  const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
+  const ui = routeUi();
+  const props = { variant: { ...routeVariant, body: 'UNTRUSTED-INVENTORY-BODY' }, target: routeTarget,
+    pending: false, onAction: async () => true, onDetails: async () => undefined };
+  const unloaded = renderToStaticMarkup(React.createElement(ui.RouteDraft, props));
+  assert.ok(unloaded.includes('Открыть полный материал')); assert.ok(!unloaded.includes('UNTRUSTED-INVENTORY-BODY'));
+  assert.ok(!unloaded.includes('type="checkbox"')); assert.ok(!unloaded.includes('Согласовать версию и дату'));
+  const details = routeDetailsFixture(); details.body += '\n<script>unsafe</script>\nEND-OF-EXACT-BODY';
+  details.metadata = { tags: ['Физика', 'Точный тег'], community: 'точное сообщество', ai_generated: false };
+  const loaded = renderToStaticMarkup(React.createElement(ui.RouteDraft, { ...props, details }));
+  for (const text of ['END-OF-EXACT-BODY', 'Физика', 'точное сообщество', 'ai_generated', 'false', 'data/media/fixture.jpg']) assert.ok(loaded.includes(text));
+  assert.ok(loaded.includes('&lt;script&gt;')); assert.ok(!loaded.includes('<script>')); assert.ok(!loaded.includes('checked=""'));
+  const stale = renderToStaticMarkup(React.createElement(ui.RouteDraft, { ...props, details: { ...details, revision: 1 } }));
+  assert.ok(!stale.includes('type="checkbox"')); assert.ok(!stale.includes('END-OF-EXACT-BODY'));
+});
+
+test('pagination exposes totals, next and previous pages and the old unresolved filter without silent clipping', () => {
+  const ui = routeUi(), calls = [];
+  const pagination = { page_size: 50, variant_page: 1, variant_count: 124, variant_active_count: 6, variant_has_next: true,
+    dispatch_page: 0, dispatch_count: 121, dispatch_active_count: 1, dispatch_has_next: true, dispatch_filter: 'all' };
+  const tree = ui.EditorialRoutes({ inventory: { targets: [], variants: [], dispatches: [], pagination }, pending: false,
+    onAction: async () => true, onPage: value => calls.push(value) });
+  function walk(node) {
+    if (!node || typeof node !== 'object') return [];
+    if (Array.isArray(node)) return node.flatMap(walk);
+    return [...(node.type === 'button' ? [node] : []), ...walk(node.props?.children)];
+  }
+  const buttons = walk(tree);
+  buttons.find(button => button.props.children === 'Следующие материалы').props.onClick();
+  buttons.find(button => button.props.children === 'Только незавершённые').props.onClick();
+  assert.equal(ui.routeListPath(calls[0]), 'routes?variant_page=2&dispatch_page=0&dispatch_filter=all');
+  assert.equal(ui.routeListPath(calls[1]), 'routes?variant_page=1&dispatch_page=0&dispatch_filter=unresolved');
+  assert.equal(buttons.find(button => button.props.children === 'Предыдущие отправки').props.disabled, true);
+  assert.equal(ui.routeListPath({ variant_page: 0, dispatch_page: 0, dispatch_filter: 'all' }), 'routes');
+  assert.throws(() => ui.routeListPath({ variant_page: -1, dispatch_page: 0, dispatch_filter: 'all' }), /EDITORIAL_ROUTE_LIST_INVALID/);
+});
 
 test('real Telegram access-only inspect confirms access and permissions without claiming delivery', () => {
   const ui = routeUi();
@@ -442,6 +516,44 @@ test('actual panel inspect handler displays the real access result after its rea
   }
 });
 
+test('actual panel loads exact details separately, never auto-preflights, and drops review when paging', async () => {
+  const React = require(path.join(tooling, 'react')), values = [], refs = [], calls = [];
+  let index = 0, refIndex = 0;
+  const hooks = { ...React,
+    useState(initial) { const key = index++; if (!(key in values)) values[key] = initial;
+      return [values[key], next => { values[key] = typeof next === 'function' ? next(values[key]) : next; }]; },
+    useEffect() {}, useCallback(callback) { return callback; },
+    useRef(value) { const key = refIndex++; if (!(key in refs)) refs[key] = { current: value }; return refs[key]; },
+  };
+  const summary = { ...routeVariant }; delete summary.body;
+  const ui = routeUi(hooks, { fetch: async (url, options) => {
+    calls.push([url, options]);
+    let body;
+    if (url === '/api/editorial/route-action') {
+      const action = JSON.parse(options.body);
+      body = action.action === 'details' ? routeDetailsFixture() : { access: { fixture: true }, delivery_verified: false };
+      assert.ok(['inspect', 'details'].includes(action.action));
+    } else if (url === '/api/editorial/state') body = { revision: 1, paused: true };
+    else if (url.startsWith('/api/editorial/routes')) body = { targets: [routeTarget], variants: [summary], dispatches: [] };
+    else assert.fail(`Unexpected request ${url}`);
+    return { ok: true, json: async () => body };
+  } });
+  function elements(node) {
+    if (!node || typeof node !== 'object') return [];
+    if (Array.isArray(node)) return node.flatMap(elements);
+    return [...(node.type === ui.EditorialRoutes ? [node] : []), ...elements(node.props?.children)];
+  }
+  function render() { index = 0; refIndex = 0; return elements(ui.EditorialPanel())[0].props; }
+  await render().onAction({ action: 'inspect', id: routeTarget.id });
+  assert.deepEqual(Object.keys(render().detailsById), []);
+  await render().onDetails(summary);
+  assert.equal(render().detailsById[summary.id].body, routeVariant.body);
+  assert.deepEqual(calls.filter(([url]) => url.endsWith('/route-action')).map(([, options]) => JSON.parse(options.body).action), ['inspect', 'details']);
+  await render().onPage({ variant_page: 1, dispatch_page: 0, dispatch_filter: 'unresolved' });
+  assert.deepEqual(Object.keys(render().detailsById), []);
+  assert.ok(calls.some(([url]) => url === '/api/editorial/routes?variant_page=1&dispatch_page=0&dispatch_filter=unresolved'));
+});
+
 test('owner schedule is parsed as Moscow regardless of browser timezone; invalid dates fail closed', () => {
   const ui = routeUi(); const clock = Date.UTC(2026, 9, 31, 0, 0);
   assert.equal(ui.moscowSchedule('2026-10-31T06:15', clock), Date.UTC(2026, 9, 31, 3, 15) / 1000);
@@ -462,8 +574,10 @@ test('route cards and exact full drafts render safely without credentials, auto-
     token: 'never-render-this-token' }));
   targets.push({ ...routeTarget, id: 'disabled-reddit', platform: 'reddit', route: 'postiz', destination: 'UNMANAGED-REDDIT' });
   const lastLine = 'END-OF-COMPLETE-APPROVED-TEXT';
+  const candidate = { ...routeVariant, body: `<script>alert(1)</script>\n${'Полный текст '.repeat(500)}${lastLine}` };
   const markup = renderToStaticMarkup(React.createElement(ui.EditorialRoutes, { pending: false,
-    inventory: { targets, variants: [{ ...routeVariant, body: `<script>alert(1)</script>\n${'Полный текст '.repeat(500)}${lastLine}` }],
+    detailsById: { [candidate.id]: routeDetailsFixture(candidate, targets[2]) },
+    inventory: { targets, variants: [candidate],
       dispatches: [{ id: 'dispatch-123', target_id: 'vk_target', title: 'API receipt', state: 'published',
         due_at: 1867111200, verified: false, evidence_kind: 'api_receipt', external_id: '-123456_77', attempts: 1,
         snapshot_hash: 'e'.repeat(64), permalink: 'javascript:alert(1)' },
@@ -578,7 +692,8 @@ function routeDraftHarness(onAction) {
   };
   const ui = routeUi(hooks);
   const props = { variant: { ...routeVariant, media_count: 0 }, target: { ...routeTarget, paused: false }, pending: false, onAction };
-  function render() { index = 0; effectIndex = 0; queued = []; const tree = ui.RouteDraft(props);
+  function render() { index = 0; effectIndex = 0; queued = []; const tree = ui.RouteDraft({ ...props,
+      details: props.details === undefined ? routeDetailsFixture(props.variant, props.target) : props.details });
     for (const effect of queued) effect(); return tree; }
   function elements(node, matches) {
     if (!node || typeof node !== 'object') return [];

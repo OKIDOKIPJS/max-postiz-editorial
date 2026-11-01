@@ -106,6 +106,7 @@
               "headless": {"type": "boolean"},
               "operation_timeout_seconds": {"type": "integer", "minimum": 30, "maximum": 600},
               "dom_contract_verified": {"type": "boolean"},
+              "dom_contract_profile": {"enum": ["personal-text-v1"]},
               "media_contract_verified": {"type": "boolean"},
               "dom_contract": {"type": "object", "additionalProperties": {"type": "string", "maxLength": 1000}},
               "postiz_integration_id": {

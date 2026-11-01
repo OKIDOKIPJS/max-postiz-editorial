@@ -91,13 +91,13 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     setup = sub.add_parser("init")
     setup.add_argument("--source-root", type=Path, required=True)
-    for name in ("status", "dispatch-once"):
+    for name in ("status", "doctor", "dispatch-once"):
         sub.add_parser(name)
     worker = sub.add_parser("worker")
     worker.add_argument("--interval", type=int, default=5, choices=range(2, 61))
     for name, field in (("inspect", "target_id"), ("login", "target_id"),
                         ("pause", "target_id"), ("resume", "target_id"),
-                        ("preflight", "variant_id"), ("reconcile", "dispatch_id"),
+                        ("preflight", "variant_id"), ("details", "variant_id"), ("reconcile", "dispatch_id"),
                         ("evidence", "dispatch_id")):
         sub.add_parser(name).add_argument(field)
     sub.add_parser("variants").add_argument("draft_id")
@@ -117,6 +117,13 @@ def main(argv=None):
     try:
         if args.command == "init":
             result = initialize_copy(root, args.source_root)
+        elif args.command == "doctor":
+            from .route_readiness import readiness
+
+            assert_isolated(root, environment=False)
+            load_env(root)
+            assert_isolated(root)
+            result = readiness(root)
         else:
             assert_isolated(root, environment=False)
             load_env(root)
@@ -126,6 +133,10 @@ def main(argv=None):
                 result = route_state(core)
             elif args.command == "preflight":
                 result = preflight(core, args.variant_id)
+            elif args.command == "details":
+                from .route_details import details
+
+                result = details(core, args.variant_id)
             elif args.command == "variants":
                 result = {"variant_ids": core.make_variants(args.draft_id)}
             elif args.command == "create-original":

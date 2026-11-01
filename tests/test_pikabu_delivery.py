@@ -170,7 +170,8 @@ def browser_fixture(tmp_path, post):
              "wrong_account": False, "hang_after_click": False, "requests": [],
              "selected_community": False, "community_value": False,
              "missing_community_input": False, "renamed_community_input": False,
-             "delayed_controls": False, "wrapped_paragraphs": False, "external_navigation_blocked": []}
+             "delayed_controls": False, "wrapped_paragraphs": False, "external_navigation_blocked": [],
+             "native_public_tags": []}
     raw_image = (tmp_path / post["media"][0]["path"]).read_bytes()
     different = io.BytesIO()
     Image.new("RGB", (32, 24), "red").save(different, "PNG")
@@ -192,7 +193,12 @@ def browser_fixture(tmp_path, post):
             if self.path.startswith("/story/"):
                 state["readbacks"] += 1
                 body = "Подменённый текст" if state["wrong_body"] else None
-                return self.send(_story_html(origin, post, body=body).encode())
+                rendered = _story_html(origin, post, body=body)
+                if state["native_public_tags"]:
+                    rendered = rendered.replace('</div></article>', ''.join(
+                        '<a class="tags__tag">' + html.escape(tag) + '</a>'
+                        for tag in state["native_public_tags"]) + '</div></article>')
+                return self.send(rendered.encode())
             owner = "someone_else" if state["wrong_account"] else "fixture_owner"
             template = EDITOR_HTML.replace("__OWNER__", owner)
             if state["wrapped_paragraphs"]:
@@ -333,6 +339,37 @@ def test_real_browser_text_only_automatic_publication_and_readback(tmp_path, pos
     assert state["posts"] == 1 and state["uploads"] == 0
     assert state["readbacks"] >= 2 and not state["external_navigation_blocked"]
     assert result["evidence"]["proof"]["image_sha256"] == []
+
+
+def test_native_text_auto_tag_confirms_once_without_changing_declared_snapshot(tmp_path, post, browser_fixture):
+    page, origin, options, state = browser_fixture
+    post["media"], post["sources"] = [], []
+    state["native_public_tags"] = ["Текст"]
+    original = fingerprint(post)
+    payload = {"destination": "fixture_owner", "request_id": "native-text-once", "snapshot": post}
+    result = run_publish(page, tmp_path, options, payload, lambda: None, origin=origin, fixture=True)
+    assert result["state"] == "confirmed" and result["verified"] is False
+    assert result["evidence"]["proof"]["platform_added_tags"] == ["Текст"]
+    assert result["evidence"]["proof"]["declared_tags_sha256"] == result["evidence"]["proof"]["tags_sha256"]
+    assert state["posts"] == 1 and state["uploads"] == 0
+    assert fingerprint(post) == original
+    before = list(state["requests"])
+    assert run_publish(page, tmp_path, options, payload, lambda: None, origin=origin, fixture=True) == result
+    assert state["requests"] == before and state["posts"] == 1
+
+
+def test_native_tag_mismatch_reconcile_only_reads_existing_story_without_second_publish(tmp_path, post, browser_fixture):
+    page, origin, options, state = browser_fixture
+    post["media"], post["sources"] = [], []
+    state["native_public_tags"] = ["Текст", "Несогласованный тег"]
+    payload = {"destination": "fixture_owner", "request_id": "native-tag-reconcile", "snapshot": post}
+    failed = run_publish(page, tmp_path, options, payload, lambda: None, origin=origin, fixture=True)
+    assert failed["state"] == "unknown" and state["posts"] == 1
+    state["native_public_tags"] = ["Текст"]
+    result = reconcile(page, tmp_path, options, "fixture_owner", payload["request_id"], origin=origin, fixture=True)
+    assert result["state"] == "confirmed" and result["verified"] is False
+    assert result["evidence"]["proof"]["platform_added_tags"] == ["Текст"]
+    assert state["posts"] == 1 and state["uploads"] == 0
 
 
 @pytest.mark.parametrize("ending", ["\n", "\n\n"])
@@ -574,6 +611,33 @@ def test_worker_rechecks_exact_database_dispatch_and_original_lease_owner(hub):
         transaction.get(Dispatch, ident).lease_until = now() - 1
     with pytest.raises(AgentError, match="PIKABU_DISPATCH_NOT_APPROVED"):
         authorize(hub.settings.root, payload, options)
+
+
+def test_final_fence_reads_pause_committed_during_expensive_quality_in_a_new_session(hub, monkeypatch):
+    from max_postiz_agent.db import now
+    from max_postiz_agent.hub import HubService
+    from max_postiz_agent.hub_models import Dispatch
+    options = {"owner": "fixture_owner", "dom_contract_verified": True}
+    config = hub.publishing
+    target = next(item for item in config["targets"] if item["id"] == "pikabu")
+    target.update(route="pikabu_browser", destination="fixture_owner", options=options)
+    (hub.settings.root / "config/publishing.json").write_text(json.dumps(config), encoding="utf-8")
+    hub.activate()
+    hub.pause_target("pikabu", False)
+    ident = approve(hub, variants(hub)["pikabu"])
+    with hub.db.session.begin() as session:
+        row = session.get(Dispatch, ident)
+        row.state, row.owner, row.lease_until = "sending", "original-owner", now() + 120
+        snapshot = row.snapshot
+    original = HubService._valid_dispatch
+    def quality_and_pause(core, session, row):
+        result = original(core, session, row)
+        hub.pause_target("pikabu", True)
+        return result
+    monkeypatch.setattr(HubService, "_valid_dispatch", quality_and_pause)
+    with pytest.raises(AgentError, match="TARGET_PAUSED"):
+        authorize(hub.settings.root, {"request_id": ident, "destination": "fixture_owner",
+                                     "snapshot": snapshot}, options)
 
 
 def test_readonly_dom_probe_never_fills_uploads_or_publishes(tmp_path, post, browser_fixture):
@@ -930,6 +994,7 @@ def test_revoked_authorization_during_durable_intent_stops_next_external_action(
     ("mode", "PIKABU_PUBLISH_MODE_UNEXPECTED"),
     ("owner", "PIKABU_ACCOUNT_MISMATCH"),
     ("disabled", "PIKABU_PUBLISH_BUTTON_DISABLED"),
+    ("pending_tag", "PIKABU_EDITOR_PENDING_TAG"),
 ])
 def test_final_authorizer_dom_change_is_checked_before_single_publish_click(
         tmp_path, post, browser_fixture, change, code):
@@ -941,6 +1006,7 @@ def test_final_authorizer_dom_change_is_checked_before_single_publish_click(
         "mode": "document.body.insertAdjacentHTML('beforeend','<input type=checkbox data-test=setting-anonymous checked>')",
         "owner": "document.querySelector('.account').href='/@someone_else'",
         "disabled": "document.querySelector('[data-test=story-publish]').disabled=true",
+        "pending_tag": "document.querySelector('#tags').value='Несогласованный тег'",
     }
     def authorizer():
         path = tmp_path / "data/pikabu-operations/last-auth-dom-change.json"
@@ -950,7 +1016,60 @@ def test_final_authorizer_dom_change_is_checked_before_single_publish_click(
     assert result["state"] == "unknown" and result["verified"] is False
     assert result["evidence"]["error"] == code
     assert state["uploads"] == 1 and state["posts"] == 0
+
     assert _read_journal(tmp_path, payload["request_id"])[1]["clicks"] == 1
     assert run_publish(page, tmp_path, options, payload, lambda: None,
                        origin=origin, fixture=True)["state"] == "unknown"
     assert state["uploads"] == 1 and state["posts"] == 0
+
+
+@pytest.mark.parametrize("code", ["TARGET_PAUSED", "APPROVAL_STALE", "PIKABU_DISPATCH_NOT_APPROVED"])
+def test_revocation_during_slow_final_dom_guard_is_authorized_again_before_publish(
+        tmp_path, post, browser_fixture, monkeypatch, code):
+    import max_postiz_agent.pikabu_browser_worker as worker
+    page, origin, options, state = browser_fixture
+    post["media"] = []
+    path = tmp_path / "data/pikabu-operations/slow-final-revoke.json"
+    original = worker._final_editor
+    flags = {"revoked": False, "checked_after_revoke": 0}
+    def final(*args, **kwargs):
+        button = original(*args, **kwargs)
+        if path.exists() and json.loads(path.read_text(encoding="utf-8"))["state"] == "click_intent":
+            flags["revoked"] = True
+        return button
+    def authorizer():
+        if flags["revoked"]:
+            flags["checked_after_revoke"] += 1
+            raise AgentError(code, 409)
+    monkeypatch.setattr(worker, "_final_editor", final)
+    payload = {"destination": "fixture_owner", "request_id": "slow-final-revoke", "snapshot": post}
+    result = run_publish(page, tmp_path, options, payload, authorizer, origin=origin, fixture=True)
+    assert result["state"] == "unknown" and result["verified"] is False
+    assert result["evidence"]["error"] == code and flags["checked_after_revoke"] == 1
+    assert state["posts"] == state["uploads"] == 0
+    assert run_publish(page, tmp_path, options, payload, lambda: None,
+                       origin=origin, fixture=True)["state"] == "unknown"
+    assert state["posts"] == state["uploads"] == 0
+
+
+def test_slow_atomic_final_capture_expires_before_native_publish(tmp_path, post, browser_fixture, monkeypatch):
+    import time
+    import max_postiz_agent.pikabu_browser_worker as worker
+    page, origin, options, state = browser_fixture
+    post["media"] = []
+    path = tmp_path / "data/pikabu-operations/slow-atomic.json"
+    original = worker._atomic_action_state
+    def delayed(*args, **kwargs):
+        captured = original(*args, **kwargs)
+        if path.exists() and json.loads(path.read_text(encoding="utf-8"))["state"] == "click_intent":
+            time.sleep(1.05)
+        return captured
+    monkeypatch.setattr(worker, "_atomic_action_state", delayed)
+    payload = {"destination": "fixture_owner", "request_id": "slow-atomic", "snapshot": post}
+    result = run_publish(page, tmp_path, options, payload, lambda: None, origin=origin, fixture=True)
+    assert result["state"] == "unknown" and result["evidence"]["error"] == "PIKABU_ACTION_GUARD_EXPIRED"
+    assert state["posts"] == state["uploads"] == 0
+    assert _read_journal(tmp_path, payload["request_id"])[1]["clicks"] == 1
+    assert run_publish(page, tmp_path, options, payload, lambda: None,
+                       origin=origin, fixture=True)["state"] == "unknown"
+    assert state["posts"] == state["uploads"] == 0

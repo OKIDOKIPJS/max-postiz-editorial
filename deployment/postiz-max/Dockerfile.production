@@ -1,0 +1,17 @@
+# Fresh immutable upstream: no historical local image or precompiled adapter is trusted.
+FROM ghcr.io/gitroomhq/postiz-app@sha256:d2b37802e96757729fdea2d3d71287f841c2b619faa1cb4c21dac07df657fde1
+ARG PUBLIC_ORIGIN
+ENV MAIN_URL=$PUBLIC_ORIGIN FRONTEND_URL=$PUBLIC_ORIGIN NEXT_PUBLIC_BACKEND_URL=$PUBLIC_ORIGIN/api
+ENV NEXT_PUBLIC_UPLOAD_DIRECTORY=/uploads NEXT_PUBLIC_UPLOAD_STATIC_DIRECTORY=/uploads STORAGE_PROVIDER=local IS_GENERAL=true NOT_SECURED=true
+ENV NODE_OPTIONS=--max-old-space-size=6144 NEXT_TELEMETRY_DISABLED=1
+COPY source-manifest.json patch-image.cjs max-browser.provider.ts max-browser.guard.ts max-browser.editor.tsx max-browser.png /adapter/
+COPY editorial-manifest.json patch-editorial.cjs editorial.controller.ts editorial.page.tsx editorial-panel.tsx editorial-form.ts editorial.module.css /adapter/
+RUN test -n "$PUBLIC_ORIGIN" && node /adapter/patch-image.cjs
+# Both official API/menu source hashes are still checked. Historical compiled API
+# hashes are deliberately unused: all three native targets are rebuilt below.
+RUN node -e "const fs=require('node:fs'),path=require('node:path');const {planPatch}=require('/adapter/patch-editorial.cjs');const m=JSON.parse(fs.readFileSync('/adapter/editorial-manifest.json'));const p=planPatch('/app','/adapter',{...m,compiled:{}});for(const [name,text]of p.plans){const dest=path.join('/app',name);fs.mkdirSync(path.dirname(dest),{recursive:true});fs.writeFileSync(dest,text);}"
+WORKDIR /app
+# Client generation only; no db push/migration, model, worker or application start.
+RUN pnpm exec prisma generate --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
+RUN pnpm --filter ./apps/backend build && pnpm --filter ./apps/orchestrator build
+RUN pnpm --filter ./apps/frontend exec next build --webpack

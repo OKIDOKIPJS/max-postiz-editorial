@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .adapters import Delivery
+from .browser_process import run_browser_worker
 from .config import AgentError, fingerprint, inside
 
 
@@ -19,7 +20,7 @@ ORIGIN = "https://vk.ru"
 CONTRACT = "vk-browser-single-click-v1"
 # Только элементы, наблюдавшиеся в авторизованной вкладке с разрешения владельца
 # при чтении профиля, composer и settings с подготовленным частным черновиком
-# без отправки 31.10.2026. Согласование текста владельцем ещё ожидается.
+# без отправки 31.10.2026. На момент этого наблюдения текст ещё не был согласован.
 # Это наблюдение UI, не human-attestation или доказательство живой публикации.
 # Отдельные recipient/author anchors в settings не наблюдались и не угадываются.
 OBSERVED_DOM = {
@@ -40,6 +41,23 @@ OBSERVED_DOM = {
     "story_switch": '[data-testid="posting_settings_repost_to_story_switch"]',
     "coauthors": '[data-testid="posting_coowners_cell"]',
     "visibility": '[data-testid="posting_settings_visibility"]',
+}
+# Explicit opt-in for the observed personal-wall text editor. Media stays
+# unsupported by this preset even if an operator toggles the separate media flag.
+PERSONAL_TEXT_DOM = {
+    **OBSERVED_DOM,
+    "identity_contract": "personal-wall-settings-v1",
+    "text_contract": "vk-native-text-v2",
+    "story_toggle_label": 'label:has(> input[data-testid="posting_settings_repost_to_story_switch"])',
+    "wall_ready": '[data-testid="posting_create_post_button"]',
+    "uploaded_images": '[data-testid="posting_modal_box"] img',
+    "preview_images": '[data-testid="posting_modal_box"] img',
+    "post_images": '[data-testid="post-content-container"] img',
+    "extra_attachments": '[data-testid="posting_modal_box"] :is(video,audio,iframe,object,embed,a[download],[data-testid="chip-attachment"])',
+    "post_extra_attachments": '[data-testid="post-content-container"] :is(video,audio,iframe,object,embed,svg image,[data-testid="chip-attachment"])',
+    "forbidden_settings": '[data-testid="posting_modal_box"] input[type="radio"]:checked',
+    "blocked": 'iframe[src*="captcha" i],[data-testid="captcha"]',
+    "errors": '[data-testid="posting_modal_box"] :is([role="alert"],[aria-invalid="true"])',
 }
 REQUIRED_DOM = {"account", "open_editor", "editor", "upload_input", "uploaded_images",
                 "recipient", "preview_author", "preview_text", "preview_images", "publish", "publish_label",
@@ -86,11 +104,14 @@ def wall_url(destination, options):
 
 
 def dom_contract(options, *, publish=False):
+    profile = options.get("dom_contract_profile")
+    if profile not in {None, "personal-text-v1"}:
+        raise AgentError("VK_BROWSER_DOM_PROFILE_UNSUPPORTED")
     extra = options.get("dom_contract", {})
     if (not isinstance(extra, dict) or any(not isinstance(key, str) or not isinstance(value, str)
             or not value.strip() or len(value) > 1000 for key, value in extra.items())):
         raise AgentError("VK_BROWSER_DOM_CONTRACT_INVALID")
-    selectors = {**OBSERVED_DOM, **extra}
+    selectors = {**(PERSONAL_TEXT_DOM if profile else OBSERVED_DOM), **extra}
     identity = selectors.get("identity_contract", "explicit-v1")
     if identity not in {"explicit-v1", "personal-wall-settings-v1"}:
         raise AgentError("VK_BROWSER_IDENTITY_CONTRACT_INVALID")
@@ -98,7 +119,7 @@ def dom_contract(options, *, publish=False):
     if identity == "personal-wall-settings-v1":
         required = (REQUIRED_DOM - {"recipient", "preview_author"}) | {
             "modal", "preview_scope", "story_switch", "coauthors", "visibility", "text_contract"}
-        if selectors.get("text_contract") != "vk-spacer-div-v1":
+        if selectors.get("text_contract") not in {"vk-spacer-div-v1", "vk-native-text-v2"}:
             raise AgentError("VK_BROWSER_TEXT_CONTRACT_UNVERIFIED")
     if publish and (options.get("dom_contract_verified") is not True
                     or not required <= selectors.keys()):
@@ -154,6 +175,8 @@ def prepare(root, options, destination, snapshot):
     media = snapshot.get("media", [])
     if not isinstance(media, list) or len(media) > 1:
         raise AgentError("VK_BROWSER_SINGLE_PHOTO_REQUIRED")
+    if media and options.get("dom_contract_profile") == "personal-text-v1":
+        raise AgentError("VK_BROWSER_TEXT_PROFILE_MEDIA_UNSUPPORTED")
     if media and options.get("media_contract_verified") is not True:
         raise AgentError("VK_BROWSER_MEDIA_CONTRACT_UNVERIFIED")
     checked = []
@@ -225,13 +248,13 @@ class VKBrowser:
         return {**plan, "preflight_only": True, "live_verified": False}
 
     def _call(self, action, destination, **payload):
+        if action == "publish":
+            payload["runtime_generation"] = getattr(self, "runtime_generation", None)
         try:
-            result = subprocess.run([sys.executable, "-m", "max_postiz_agent.vk_browser_worker",
+            result = run_browser_worker([sys.executable, "-m", "max_postiz_agent.vk_browser_worker",
                 "--root", str(self.root)], input=json.dumps({"action": action,
                 "destination": destination, "options_sha256": fingerprint(self.options), **payload}),
-                text=True, encoding="utf-8", capture_output=True, check=False,
-                timeout=min(360, self.options.get("operation_timeout_seconds", 180)) + 60,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                timeout=min(360, self.options.get("operation_timeout_seconds", 180)) + 60)
             value = json.loads(result.stdout)
             if not isinstance(value, dict):
                 raise ValueError
@@ -239,6 +262,14 @@ class VKBrowser:
             raise AgentError("VK_BROWSER_OPERATION_UNKNOWN", 503) from None
         if "code" in value:
             code = value["code"]
+            if not isinstance(code, str):
+                code = "VK_BROWSER_OPERATION_UNKNOWN"
+            elif code in {"ROUTE_RUNTIME_RESTART_REQUIRED", "ROUTE_CONFIGURATION_CHANGED"}:
+                code = "VK_BROWSER_RUNTIME_GENERATION_CHANGED"
+            elif code in {"ROUTE_DISPATCH_LEASE_LOST", "ROUTE_DISPATCH_FENCE_INVALID", "APPROVAL_STALE",
+                          "TARGET_PAUSED", "TARGET_DISABLED", "PROFILE_NOT_PUBLISHABLE",
+                          "EDITORIAL_PAUSED", "BRIDGE_EDIT_IN_PROGRESS"}:
+                code = "VK_BROWSER_DISPATCH_NOT_APPROVED"
             if not isinstance(code, str) or not re.fullmatch(r"VK_BROWSER_[A-Z_]{1,80}", code):
                 code = "VK_BROWSER_OPERATION_UNKNOWN"
             raise AgentError(code, 409)

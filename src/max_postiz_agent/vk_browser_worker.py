@@ -19,6 +19,9 @@ from .vk_browser import (
 )
 
 
+WORKER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
 def _path(root, request_id):
     if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
         raise AgentError("VK_BROWSER_REQUEST_ID_INVALID")
@@ -33,6 +36,8 @@ def _seal(journal):
 
 def _save(path, journal, state, **fields):
     journal.update(state=state, updated_at=time.time(), **fields)
+    if state.endswith("_intent"):
+        journal["last_action_intent"] = state
     _seal(journal)
     pending = path.with_suffix(".pending")
     with pending.open("x", encoding="utf-8") as stream:
@@ -73,19 +78,30 @@ def _text(node):
 
 
 def _rendered_text(node, selectors):
-    if selectors.get("text_contract") != "vk-spacer-div-v1":
+    if selectors.get("text_contract") not in {"vk-spacer-div-v1", "vk-native-text-v2"}:
         return _text(node)
-    result = node.evaluate("""root => {
+    result = node.evaluate("""(root,nativeV2) => {
       let invalid=false;
+      const nativeText=n=>!!n&&['showmoretext-in','showmoretext-in-expanded'].includes(n.getAttribute('data-testid'));
+      if(nativeV2){
+        for(let n=root;n;n=n.parentElement){const s=getComputedStyle(n);
+          if(s.display==='none'||s.visibility!=='visible'||Number(s.opacity)===0)invalid=true;}
+      }
       const read=(n,allowBlock=false)=>{
         if(n.nodeType===Node.TEXT_NODE)return n.textContent;
         if(n.nodeType!==Node.ELEMENT_NODE){invalid=true;return '';}
         const style=getComputedStyle(n);
-        if(style.display==='none'||style.visibility==='hidden'){invalid=true;return '';}
+        if(style.display==='none'||style.visibility==='hidden'
+           ||nativeV2&&(style.visibility!=='visible'||Number(style.opacity)===0)){invalid=true;return '';}
         if(n.tagName==='BR')return '\\n';
         if(!['DIV','SPAN','A'].includes(n.tagName)){invalid=true;return '';}
-        if(n.tagName==='DIV'&&style.display!=='block'
-           ||n.tagName!=='DIV'&&style.display!=='inline'){invalid=true;return '';}
+        const nativeWrapper=nativeV2&&allowBlock&&n.tagName==='DIV'&&(
+          nativeText(n)&&['inline','flow-root'].includes(style.display)
+          ||nativeText(n.parentElement)&&n.parentElement.children.length===1&&style.display==='inline');
+        const nativePost=nativeV2&&n===root&&n.tagName==='SPAN'
+          &&n.getAttribute('data-testid')==='post_text'&&style.display==='block';
+        if(!nativeWrapper&&!nativePost&&(n.tagName==='DIV'&&style.display!=='block'
+           ||n.tagName!=='DIV'&&style.display!=='inline')){invalid=true;return '';}
         const children=[...n.childNodes];
         const br=children.filter(c=>c.nodeType===Node.ELEMENT_NODE&&c.tagName==='BR');
         // Native VK settings renderer inserts exactly this empty spacing DIV
@@ -93,7 +109,8 @@ def _rendered_text(node, selectors):
         if(n.tagName==='DIV'&&br.length===1&&children.every(c=>c===br[0]
           ||c.nodeType===Node.TEXT_NODE&&!c.textContent.trim())){
           const brStyle=getComputedStyle(br[0]);
-          if(brStyle.display==='none'||brStyle.visibility==='hidden'){invalid=true;return '';}
+          if(brStyle.display==='none'||brStyle.visibility==='hidden'
+             ||nativeV2&&(brStyle.visibility!=='visible'||Number(brStyle.opacity)===0)){invalid=true;return '';}
           return '\\n\\n';
         }
         if(n.tagName==='DIV'&&!allowBlock){invalid=true;return '';}
@@ -105,7 +122,7 @@ def _rendered_text(node, selectors):
         return children.map(c=>read(c,wrapper)).join('');
       };
       return {text:read(root,true),invalid};
-    }""")
+    }""", selectors.get("text_contract") == "vk-native-text-v2")
     if result["invalid"]:
         raise AgentError("VK_BROWSER_RENDERED_TEXT_UNSUPPORTED")
     return result["text"]
@@ -142,8 +159,124 @@ def _navigate(page, url):
 
 def _ready(page, selectors):
     page.locator(selectors["account"]).wait_for(state="visible", timeout=10000)
+    # The native SPA first renders a visible BUTTON with an empty href, then
+    # hydrates the account link. Visibility alone does not prove identity.
+    page.wait_for_function("""selector => {
+      const nodes=document.querySelectorAll(selector);
+      return nodes.length===1&&typeof nodes[0].getAttribute('href')==='string'
+        &&nodes[0].getAttribute('href').trim()!==''&&nodes[0].getAttribute('href')!=='#';
+    }""", arg=selectors["account"], timeout=10000)
     if "wall_ready" in selectors:
         page.locator(selectors["wall_ready"]).wait_for(state="visible", timeout=10000)
+
+
+def _editor_ready(page, selectors, *, timeout=10000):
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    try:
+        page.locator(selectors["open_editor"]).wait_for(state="visible", timeout=timeout)
+    except PlaywrightTimeoutError:
+        return False
+    node = _one(page, selectors["open_editor"], "VK_BROWSER_EDITOR_OPEN_AMBIGUOUS")
+    return node.is_visible() and node.is_enabled()
+
+
+def _wait_control_ready(page, selector, code, *, timeout=10000):
+    """Wait for a native SPA transition without granting another mutation."""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    node = page.locator(selector)
+    if node.count() > 1:
+        raise AgentError(code)
+    try:
+        node.wait_for(state="visible", timeout=timeout)
+        page.wait_for_function("""selector => {
+          const nodes=document.querySelectorAll(selector);
+          return nodes.length===1&&!nodes[0].matches(':disabled')
+            &&nodes[0].getAttribute('aria-disabled')!=='true';
+        }""", arg=selector, timeout=timeout)
+    except PlaywrightTimeoutError:
+        raise AgentError(code) from None
+    return _one(page, selector, code)
+
+
+def _wait_story_disabled(page, selectors, *, timeout=10000):
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    try:
+        page.wait_for_function("""selector => {
+          const nodes=document.querySelectorAll(selector);
+          return nodes.length===1&&nodes[0].checked===false
+            &&nodes[0].getAttribute('aria-checked')==='false';
+        }""", arg=selectors["story_switch"], timeout=timeout)
+    except PlaywrightTimeoutError:
+        raise AgentError("VK_BROWSER_STORY_SHARE_NOT_DISABLED") from None
+
+
+def _mutation_stamp(page, selectors):
+    """One read-only DOM capture; no locator actionability waits after SQL fencing."""
+    keys = ("account", "open_editor", "editor", "modal", "upload_input", "uploaded_images",
+            "next", "recipient", "preview_author", "preview_text", "preview_images", "publish",
+            "story_switch", "story_toggle_label", "coauthors", "visibility", "forbidden_settings", "extra_attachments",
+            "blocked", "errors")
+    try:
+        result = page.evaluate("""selectors => {
+          const state = e => {
+            const s=getComputedStyle(e), r=e.getBoundingClientRect();
+            return {value:'value' in e?e.value:null,checked:'checked' in e?e.checked:null,
+              disabled:'disabled' in e?e.disabled:null,inert:e.inert,
+              files:e.files?[...e.files].map(f=>[f.name,f.size,f.lastModified]):null,
+              visible:r.width>0&&r.height>0,display:s.display,visibility:s.visibility,
+              opaque:Number(s.opacity)>0,pointerEvents:s.pointerEvents,clip:s.clip,clipPath:s.clipPath};
+          };
+          const capture = e => {
+            const nodes=[e,...e.querySelectorAll('*')];
+            if(nodes.length>2000)throw new Error('unbounded');
+            const parents=[];for(let n=e.parentElement;n;n=n.parentElement)parents.push(state(n));
+            return {html:e.outerHTML,states:nodes.map(state),parents};
+          };
+          const modals=selectors.modal?[...document.querySelectorAll(selectors.modal)]:[];
+          const inComposer=modals.length===1&&state(modals[0]).visible
+            &&state(modals[0]).display!=='none'&&state(modals[0]).visibility==='visible'
+            &&state(modals[0]).opaque;
+          const result={url:location.href,title:document.title,
+            phase:inComposer?'composer':'wall',nodes:{}};
+          for(const [key,selector] of Object.entries(selectors)) {
+            // Фоновая CTA после открытия формы обновляется независимо от неё.
+            // Сама форма, содержимое, настройки и текущий аккаунт остаются в снимке.
+            if(inComposer&&key==='open_editor')continue;
+            const nodes=[...document.querySelectorAll(selector)];
+            if(nodes.length>100)throw new Error('unbounded');
+            result.nodes[key]=nodes.map(capture);
+          }
+          if(JSON.stringify(result).length>2000000)throw new Error('unbounded');
+          return result;
+        }""", {key: selectors[key] for key in keys if key in selectors})
+        return fingerprint(result)
+    except Exception:
+        raise AgentError("VK_BROWSER_MUTATION_STATE_UNAVAILABLE") from None
+
+
+def _mutate(page, plan, selectors, authorize, check, action, *, origin):
+    """Expensive guards precede a fresh SQL fence and a bounded native action."""
+    stamp = _mutation_stamp(page, selectors)
+    _context(page, plan, selectors, origin=origin)
+    check()
+    if stamp != _mutation_stamp(page, selectors):
+        raise AgentError("VK_BROWSER_STATE_CHANGED_DURING_GUARD")
+    deadline = time.monotonic() + 1
+    authorize()
+    if time.monotonic() >= deadline:
+        raise AgentError("VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED")
+    if stamp != _mutation_stamp(page, selectors):
+        # Keep precise account/text rejection when a callback changed the DOM.
+        _context(page, plan, selectors, origin=origin)
+        check()
+        raise AgentError("VK_BROWSER_STATE_CHANGED_AFTER_AUTHORIZATION")
+    remaining = int((deadline - time.monotonic()) * 1000)
+    if remaining < 1:
+        raise AgentError("VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED")
+    return action(min(1000, remaining))
 
 
 def _link_path(value, origin, *, author_tracking=False):
@@ -169,6 +302,27 @@ def _context(page, plan, selectors, *, origin):
     if (not account.is_visible()
             or _link_path(account.get_attribute("href"), origin) != "/id" + plan["owner"]):
         raise AgentError("VK_BROWSER_ACCOUNT_MISMATCH", 403)
+
+
+def _restore_login_wall(page, plan, selectors, *, origin):
+    """The owner login may redirect once to /feed; return only a proven owner."""
+    _origin(page, origin)
+    _blocked(page, selectors)
+    if urlsplit(page.url).path != "/feed":
+        return False
+    account = page.locator(selectors["account"])
+    if account.count() != 1 or not account.is_visible():
+        return False
+    href = account.get_attribute("href")
+    if not href:
+        return False
+    try:
+        if _link_path(href, origin) != "/id" + plan["owner"]:
+            return False
+    except AgentError:
+        return False
+    _navigate(page, plan["wall_url"].replace(ORIGIN, origin, 1))
+    return True
 
 
 def _recipient(page, plan, selectors, *, origin):
@@ -206,6 +360,12 @@ def _personal_settings(page, plan, selectors, *, origin, require_story_disabled=
         raise AgentError("VK_BROWSER_STORY_SWITCH_INVALID")
     if require_story_disabled and state["checked"]:
         raise AgentError("VK_BROWSER_STORY_SHARE_NOT_DISABLED")
+    if "story_toggle_label" in selectors:
+        label = _one(modal, selectors["story_toggle_label"], "VK_BROWSER_STORY_LABEL_AMBIGUOUS")
+        if (not label.is_visible() or not label.evaluate("""(e,selector)=>e.tagName==='LABEL'
+                &&e.querySelectorAll(selector).length===1&&e.querySelector(selector).parentElement===e""",
+                selectors["story_switch"])):
+            raise AgentError("VK_BROWSER_STORY_LABEL_INVALID")
     other_checked = modal.evaluate("""(root, storySelector)=>[...root.querySelectorAll(
       'input[type=checkbox],input[type=radio],[role=switch],[role=checkbox],[role=radio]')].filter(n=>{
         const visible=n.getClientRects().length&&getComputedStyle(n).visibility!=='hidden';
@@ -349,6 +509,26 @@ def _post_id(post, plan, selectors, *, origin):
     return match.group(1) + "_" + match.group(2)
 
 
+def _could_match_text(node, expected):
+    """Only exclude different history; hidden/decorative text stays conservative."""
+    raw = node.text_content()
+    if not isinstance(raw, str) or len(raw) > 200000:
+        raise AgentError("VK_BROWSER_POST_TEXT_UNBOUNDED")
+    needle = "".join(expected.split())
+    if not needle:
+        return True
+    position = 0
+    # A supported renderer emits text-node characters plus whitespace. Keep
+    # even unsupported nodes whose raw text could contain the exact candidate,
+    # including hidden additions interleaved between its visible characters.
+    for char in raw:
+        if char == needle[position]:
+            position += 1
+            if position == len(needle):
+                return True
+    return False
+
+
 def _matches(page, plan, selectors, *, origin):
     posts = page.locator(selectors["posts"])
     if posts.count() > 200:
@@ -356,7 +536,12 @@ def _matches(page, plan, selectors, *, origin):
     matches = []
     for post in posts.all():
         text = post.locator(selectors["post_text"])
-        if text.count() == 1 and text.is_visible() and _rendered_text(text, selectors) == plan["text"]:
+        if text.count() != 1 or not text.is_visible():
+            continue
+        if (selectors.get("text_contract") in {"vk-spacer-div-v1", "vk-native-text-v2"}
+                and not _could_match_text(text, plan["text"])):
+            continue
+        if _rendered_text(text, selectors) == plan["text"]:
             matches.append((post, _post_id(post, plan, selectors, origin=origin)))
     return matches
 
@@ -384,11 +569,29 @@ def _post_snapshot(page, plan, selectors, expected_id, *, origin):
             "post_href": post.locator(selectors["post_link"]).get_attribute("href")}
 
 
-def _readback(page, plan, selectors, expected_id, *, origin):
+def _wait_readback_post(page, plan, selectors, expected_id, *, origin, timeout=10000):
+    """Read-only SPA hydration wait; readiness never replaces the full proof."""
+    deadline = time.monotonic() + timeout / 1000
+    while True:
+        _context(page, plan, selectors, origin=origin)
+        matches = _matches(page, plan, selectors, origin=origin)
+        if matches:
+            # Check ALL exact native candidates. Never filter down to a preferred ID.
+            if len(matches) != 1 or matches[0][1] != expected_id:
+                raise AgentError("VK_BROWSER_READBACK_NOT_EXACTLY_ONE")
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AgentError("VK_BROWSER_READBACK_NOT_EXACTLY_ONE")
+        page.wait_for_timeout(min(100, max(1, int(remaining * 1000))))
+
+
+def _readback(page, plan, selectors, expected_id, *, origin, timeout=10000):
     proofs = []
     for _ in range(2):
         _navigate(page, plan["wall_url"].replace(ORIGIN, origin, 1))
         _ready(page, selectors)
+        _wait_readback_post(page, plan, selectors, expected_id, origin=origin, timeout=timeout)
         before = _post_snapshot(page, plan, selectors, expected_id, origin=origin)
         hashes = _image_proof(page, before["images"], plan["media"], origin=origin)
         # Rechecking only text would miss an image/attachment/account swap while
@@ -436,6 +639,7 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
     selectors = dom_contract(options, publish=True)
     authorize()
     journal = {"contract": CONTRACT, "root": str(root), "request_id": payload["request_id"],
+        "worker_code_sha256": WORKER_SOURCE_SHA256,
         "destination": plan["destination"], "snapshot": payload["snapshot"],
         "snapshot_sha256": plan["snapshot_sha256"], "options_sha256": fingerprint(options),
         "dom_contract_sha256": fingerprint(selectors), "state": "intent", "clicks": 0,
@@ -449,45 +653,55 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
         _navigate(page, plan["wall_url"].replace(ORIGIN, origin, 1))
         _ready(page, selectors)
         _context(page, plan, selectors, origin=origin)
+        if not _editor_ready(page, selectors):
+            raise AgentError("VK_BROWSER_EDITOR_UNAVAILABLE")
+        _context(page, plan, selectors, origin=origin)
         if _matches(page, plan, selectors, origin=origin):
             raise AgentError("VK_BROWSER_DUPLICATE_POST")
         authorize()
         _save(path, journal, "editor_open_intent")
-        authorize()
+        open_button = _one(page, selectors["open_editor"], "VK_BROWSER_EDITOR_OPEN_AMBIGUOUS")
+        def check_open():
+            if selectors.get("identity_contract") == "personal-wall-settings-v1":
+                if any(node.is_visible() for node in page.locator(selectors["modal"]).all()):
+                    raise AgentError("VK_BROWSER_EDITOR_ALREADY_OPEN")
+
+        _mutate(page, plan, selectors, authorize, check_open,
+                lambda timeout: open_button.click(timeout=timeout), origin=origin)
+        transition_timeout = min(10000, options.get("operation_timeout_seconds", 180) * 1000)
+        editor = _wait_control_ready(page, selectors["editor"], "VK_BROWSER_EDITOR_AMBIGUOUS",
+                                     timeout=transition_timeout)
         _context(page, plan, selectors, origin=origin)
-        if selectors.get("identity_contract") == "personal-wall-settings-v1":
-            if any(node.is_visible() for node in page.locator(selectors["modal"]).all()):
-                raise AgentError("VK_BROWSER_EDITOR_ALREADY_OPEN")
-        _one(page, selectors["open_editor"], "VK_BROWSER_EDITOR_OPEN_AMBIGUOUS").click(timeout=1000)
-        _context(page, plan, selectors, origin=origin)
-        editor = _one(page, selectors["editor"], "VK_BROWSER_EDITOR_AMBIGUOUS")
         if _text(editor) or _images(page, selectors["uploaded_images"]):
             raise AgentError("VK_BROWSER_EDITOR_NOT_EMPTY")
         authorize()
         _save(path, journal, "fill_intent")
-        authorize()
-        _context(page, plan, selectors, origin=origin)
-        if not editor.is_visible() or _text(editor) or _images(page, selectors["uploaded_images"]):
-            raise AgentError("VK_BROWSER_EDITOR_NOT_EMPTY")
-        if selectors.get("identity_contract") == "personal-wall-settings-v1":
-            modal = _one(page, selectors["modal"], "VK_BROWSER_MODAL_AMBIGUOUS")
-            if not modal.is_visible() or modal.get_attribute("aria-label") != "Форма постинга":
-                raise AgentError("VK_BROWSER_MODAL_CONTRACT_INVALID")
-            _all_preview_media(page, plan, selectors, [])
-        editor.fill(plan["text"])
+        def check_fill():
+            if not editor.is_visible() or _text(editor) or _images(page, selectors["uploaded_images"]):
+                raise AgentError("VK_BROWSER_EDITOR_NOT_EMPTY")
+            if selectors.get("identity_contract") == "personal-wall-settings-v1":
+                modal = _one(page, selectors["modal"], "VK_BROWSER_MODAL_AMBIGUOUS")
+                if not modal.is_visible() or modal.get_attribute("aria-label") != "Форма постинга":
+                    raise AgentError("VK_BROWSER_MODAL_CONTRACT_INVALID")
+                _all_preview_media(page, plan, selectors, [])
+
+        _mutate(page, plan, selectors, authorize, check_fill,
+                lambda timeout: editor.fill(plan["text"], timeout=timeout), origin=origin)
         for media in plan["media"]:
             authorize()
             raw = private_path(root, media["path"]).read_bytes()
             if hashlib.sha256(raw).hexdigest() != media["sha256"]:
                 raise AgentError("VK_BROWSER_IMAGE_HASH_CHANGED")
             _save(path, journal, "upload_intent")
-            authorize()
-            _context(page, plan, selectors, origin=origin)
-            if not editor.is_visible() or _text(editor) != plan["text"] or _images(page, selectors["uploaded_images"]):
-                raise AgentError("VK_BROWSER_EDITOR_CHANGED_BEFORE_UPLOAD")
-            _one(page, selectors["upload_input"], "VK_BROWSER_UPLOAD_AMBIGUOUS").set_input_files(
-                {"name": "approved.jpg" if media["mime"] == "image/jpeg" else "approved.png",
-                 "mimeType": media["mime"], "buffer": raw})
+            upload_input = _one(page, selectors["upload_input"], "VK_BROWSER_UPLOAD_AMBIGUOUS")
+            def check_upload():
+                if not editor.is_visible() or _text(editor) != plan["text"] or _images(page, selectors["uploaded_images"]):
+                    raise AgentError("VK_BROWSER_EDITOR_CHANGED_BEFORE_UPLOAD")
+
+            _mutate(page, plan, selectors, authorize, check_upload,
+                    lambda timeout, media=media, raw=raw, upload_input=upload_input: upload_input.set_input_files(
+                        {"name": "approved.jpg" if media["mime"] == "image/jpeg" else "approved.png",
+                         "mimeType": media["mime"], "buffer": raw}, timeout=timeout), origin=origin)
             page.wait_for_function("""selector => {
               const images=[...document.querySelectorAll(selector)];
               return images.length===1 && images.every(n=>n.complete && n.naturalWidth>0
@@ -496,24 +710,30 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
             _save(path, journal, "uploaded")
         _editor_check(page, plan, selectors)
         next_button = page.locator(selectors.get("next", "[data-vk-never-match]"))
+        if selectors.get("identity_contract") == "personal-wall-settings-v1":
+            next_button = _wait_control_ready(page, selectors["next"], "VK_BROWSER_NEXT_AMBIGUOUS",
+                                             timeout=transition_timeout)
         if next_button.count():
             if next_button.count() != 1 or not next_button.is_visible() or not next_button.is_enabled():
                 raise AgentError("VK_BROWSER_NEXT_AMBIGUOUS")
             authorize()
             _save(path, journal, "next_intent")
-            authorize()
-            _context(page, plan, selectors, origin=origin)
-            _editor_check(page, plan, selectors)
-            next_button.click(timeout=1000)
+            _mutate(page, plan, selectors, authorize, lambda: _editor_check(page, plan, selectors),
+                    lambda timeout: next_button.click(timeout=timeout), origin=origin)
         page.locator(selectors["preview_text"]).wait_for(state="visible", timeout=10000)
         if selectors.get("identity_contract") == "personal-wall-settings-v1":
             settings = _personal_settings(page, plan, selectors, origin=origin, require_story_disabled=False)
             if settings["story_checked"]:
                 authorize()
                 _save(path, journal, "story_disable_intent")
-                authorize()
-                _personal_settings(page, plan, selectors, origin=origin, require_story_disabled=False)
-                _one(page, selectors["story_switch"], "VK_BROWSER_STORY_SWITCH_AMBIGUOUS").uncheck(timeout=1000)
+                story_switch = _one(page, selectors["story_switch"], "VK_BROWSER_STORY_SWITCH_AMBIGUOUS")
+                story_label = (_one(page, selectors["story_toggle_label"], "VK_BROWSER_STORY_LABEL_AMBIGUOUS")
+                               if "story_toggle_label" in selectors else None)
+                _mutate(page, plan, selectors, authorize,
+                        lambda: _personal_settings(page, plan, selectors, origin=origin, require_story_disabled=False),
+                        lambda timeout: (story_label.click(timeout=timeout, no_wait_after=True) if story_label is not None
+                                         else story_switch.uncheck(timeout=timeout)), origin=origin)
+                _wait_story_disabled(page, selectors, timeout=transition_timeout)
             _personal_settings(page, plan, selectors, origin=origin)
         before = _final_snapshot(page, plan, selectors, origin=origin)
         _image_proof(page, before["images"], plan["media"], origin=origin)
@@ -521,10 +741,13 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
             raise AgentError("VK_BROWSER_PREVIEW_CHANGED_DURING_IMAGE_READ")
         authorize()
         _save(path, journal, "click_intent", clicks=1, personal_settings=before.get("personal_settings"))
-        authorize()
-        if before != _final_snapshot(page, plan, selectors, origin=origin):
-            raise AgentError("VK_BROWSER_PREVIEW_CHANGED_BEFORE_CLICK")
-        _one(page, selectors["publish"], "VK_BROWSER_PUBLISH_AMBIGUOUS").click(timeout=1000, no_wait_after=True)
+        publish_button = _one(page, selectors["publish"], "VK_BROWSER_PUBLISH_AMBIGUOUS")
+        def check_final():
+            if before != _final_snapshot(page, plan, selectors, origin=origin):
+                raise AgentError("VK_BROWSER_PREVIEW_CHANGED_BEFORE_CLICK")
+
+        _mutate(page, plan, selectors, authorize, check_final,
+                lambda timeout: publish_button.click(timeout=timeout, no_wait_after=True), origin=origin)
         deadline = time.monotonic() + min(30, options.get("operation_timeout_seconds", 180))
         while True:
             matches = _matches(page, plan, selectors, origin=origin)
@@ -536,7 +759,8 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
             page.wait_for_timeout(100)
         _save(path, journal, "readback_pending", external_id=external_id,
               permalink=ORIGIN + "/wall" + external_id)
-        proof = _readback(page, plan, selectors, external_id, origin=origin)
+        proof = _readback(page, plan, selectors, external_id, origin=origin,
+                          timeout=min(10000, options.get("operation_timeout_seconds", 180) * 1000))
         _save(path, journal, "confirmed", proof=proof)
     except Exception as exc:
         code = exc.code if isinstance(exc, AgentError) else "VK_BROWSER_OPERATION_UNKNOWN"
@@ -563,7 +787,8 @@ def reconcile(page, root, options, destination, request_id, *, origin=ORIGIN, fi
     # it must never promote cached evidence to a current readback.
     plan = prepare(root, options, destination, journal["snapshot"])
     try:
-        proof = _readback(page, plan, dom_contract(options, publish=True), journal["external_id"], origin=origin)
+        proof = _readback(page, plan, dom_contract(options, publish=True), journal["external_id"], origin=origin,
+                          timeout=min(10000, options.get("operation_timeout_seconds", 180) * 1000))
         _save(path, journal, "confirmed", proof=proof, failure_code=None)
     except Exception as exc:
         _save(path, journal, "unknown", failure_code=exc.code if isinstance(exc, AgentError)
@@ -579,16 +804,22 @@ def inspect_page(page, options, destination, *, origin=ORIGIN, fixture=False):
     _navigate(page, plan["wall_url"].replace(ORIGIN, origin, 1))
     _ready(page, selectors)
     _context(page, plan, selectors, origin=origin)
+    editor_ready = _editor_ready(page, selectors)
+    _context(page, plan, selectors, origin=origin)
     create = page.locator(selectors["open_editor"])
     try:
         dom_contract(options, publish=True)
         contract_valid = selectors.get("identity_contract") != "personal-wall-settings-v1" or destination == owner_id(options)
     except AgentError:
         contract_valid = False
-    return {"state": "access_only", "publish": contract_valid and create.count() == 1 and create.is_visible(),
+    blockers = ([] if editor_ready else ["VK_BROWSER_EDITOR_UNAVAILABLE"])
+    if not contract_valid:
+        blockers.append("VK_BROWSER_DOM_CONTRACT_UNVERIFIED")
+    return {"state": "access_only", "publish": contract_valid and editor_ready,
             "owner": plan["owner"], "destination": destination,
             "live_verified": False, "external_mutations": 0, "fixture": fixture,
-            "create_button_count": create.count()}
+            "create_button_count": create.count(), "editor_ready": editor_ready,
+            "contract_verified": contract_valid, "blockers": blockers}
 @contextmanager
 def session(root, options, *, visible=False):
     from playwright.sync_api import sync_playwright
@@ -619,15 +850,27 @@ def target_options(root, destination):
     return targets[0].get("options", {})
 
 
-def authorize(root, payload, options, *, expected_lease_owner=None):
+def _authority_core(root):
     from .config import Settings
-    from .db import Database, now
+    from .db import Database
     from .hub import HubService
+
+    settings = Settings.load(Path(root))
+    db = Database(settings)
+    try:
+        return HubService(settings, db, bootstrap_targets=False)
+    except Exception:
+        db.engine.dispose()
+        raise
+
+
+def authorize(root, payload, options, *, expected_lease_owner=None, authority_core=None):
+    from .db import now
     from .hub_models import Dispatch
     from .server_state import require_running
 
-    settings = Settings.load(Path(root))
-    db, core = Database(settings), None
+    core = authority_core or _authority_core(root)
+    db = core.db
     try:
         with db.session() as transaction:
             row = transaction.get(Dispatch, payload.get("request_id"))
@@ -636,7 +879,7 @@ def authorize(root, payload, options, *, expected_lease_owner=None):
                     or not math.isfinite(row.lease_until) or row.lease_until <= now() + 3
                     or row.due_at > now()):
                 raise AgentError("VK_BROWSER_DISPATCH_NOT_APPROVED", 403)
-            core = HubService(settings, db, bootstrap_targets=False)
+            original_owner, original_snapshot_hash = row.owner, row.snapshot_hash
             require_running(core, transaction)
             variant, target = core._valid_dispatch(transaction, row)
             if (target.platform != "vk" or target.route != "vk_browser"
@@ -645,11 +888,12 @@ def authorize(root, payload, options, *, expected_lease_owner=None):
                     or fingerprint(row.snapshot) != fingerprint(payload.get("snapshot"))
                     or fingerprint(core.snapshot(variant, target)) != fingerprint(row.snapshot)):
                 raise AgentError("VK_BROWSER_DISPATCH_NOT_APPROVED", 403)
-            return row.owner
+        return core.authorize_dispatch_fence(payload.get("request_id"), expected_owner=original_owner,
+                                              expected_snapshot_hash=original_snapshot_hash)
     finally:
-        if core is not None:
+        if authority_core is None:
             core.close()
-        db.engine.dispose()
+            db.engine.dispose()
 
 
 def main(argv=None):
@@ -658,6 +902,7 @@ def main(argv=None):
     parser.add_argument("--login")
     args = parser.parse_args(argv)
     root = args.root.resolve()
+    authority = None
     try:
         from .cli import load_env
         load_env(root)
@@ -666,6 +911,7 @@ def main(argv=None):
             with session(root, options, visible=True) as page:
                 _navigate(page, wall_url(args.login, options))
                 deadline = time.monotonic() + 900
+                restored_wall = False
                 while time.monotonic() < deadline:
                     try:
                         plan = {"wall_url": wall_url(args.login, options), "owner": owner_id(options)}
@@ -674,8 +920,11 @@ def main(argv=None):
                         return 0
                     except AgentError as exc:
                         if exc.code not in {"VK_BROWSER_ACCOUNT_AMBIGUOUS", "VK_BROWSER_ACCOUNT_MISMATCH",
-                                            "VK_BROWSER_WRONG_ORIGIN", "VK_BROWSER_WALL_MISMATCH"}:
+                                            "VK_BROWSER_WRONG_ORIGIN", "VK_BROWSER_WALL_MISMATCH",
+                                            "VK_BROWSER_LINK_INVALID"}:
                             raise
+                        if not restored_wall and exc.code == "VK_BROWSER_WALL_MISMATCH":
+                            restored_wall = _restore_login_wall(page, plan, dom_contract(options), origin=ORIGIN)
                         page.wait_for_timeout(500)
                 raise AgentError("VK_BROWSER_LOGIN_TIMEOUT")
         payload = parse_json(sys.stdin.read(4 * 1024 * 1024))
@@ -684,7 +933,13 @@ def main(argv=None):
         options = target_options(root, payload.get("destination"))
         if payload.get("options_sha256") != fingerprint(options):
             raise AgentError("VK_BROWSER_CONFIG_CHANGED")
-        lease_owner = authorize(root, payload, options) if payload["action"] == "publish" else None
+        if payload["action"] == "publish":
+            authority = _authority_core(root)
+            if payload.get("runtime_generation") != authority.route_runtime_generation():
+                raise AgentError("VK_BROWSER_RUNTIME_GENERATION_CHANGED", 409)
+            lease_owner = authorize(root, payload, options, authority_core=authority)
+        else:
+            lease_owner = None
         with session(root, options) as page:
             if payload["action"] == "inspect":
                 result = inspect_page(page, options, payload["destination"])
@@ -692,12 +947,17 @@ def main(argv=None):
                 result = reconcile(page, root, options, payload["destination"], payload["request_id"])
             else:
                 result = run_publish(page, root, options, payload,
-                    lambda: authorize(root, payload, options, expected_lease_owner=lease_owner))
+                    lambda: authorize(root, payload, options, expected_lease_owner=lease_owner,
+                                      authority_core=authority))
         print(json.dumps(result, ensure_ascii=True))
         return 0
     except Exception as exc:
         print(json.dumps({"code": exc.code if isinstance(exc, AgentError) else "VK_BROWSER_OPERATION_UNKNOWN"}))
         return 1
+    finally:
+        if authority is not None:
+            authority.close()
+            authority.db.engine.dispose()
 
 
 if __name__ == "__main__":
