@@ -3,5 +3,5 @@
   "version": "0.2.0",
   "private": true,
   "description": "Pinned OpenCode runtime for the MAX editorial service",
-  "dependencies": { "@opencode/cli": "2.0.17" }
+  "dependencies": { "@opencode/cli": "2.2.1" }
 }
