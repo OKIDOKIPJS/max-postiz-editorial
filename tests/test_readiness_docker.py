@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import socket
+import ssl
 import tarfile
 from types import SimpleNamespace
 
@@ -64,6 +65,12 @@ def test_official_archive_and_binary_pins_are_shared_with_engine(tools):
     assert tools.ARCHIVE_BYTES == readiness_engine.BUNDLE_BYTES == 86374273
     assert tools.MEMBERS == readiness_engine.BUNDLE_FILES
     assert set(tools.BUNDLE_BINARY_SHA256) == tools.MEMBERS
+
+
+def test_download_tls_requires_hostname_certificate_and_tls12_or_newer(tools):
+    context = tools.tls_context()
+    assert context.check_hostname is True and context.verify_mode == ssl.CERT_REQUIRED
+    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
 
 
 @pytest.mark.parametrize("address", ["127.0.0.1", "10.20.30.45", "192.168.1.1", "169.254.169.254", "0.0.0.0"])  # noqa: S104 - rejected DNS data, never a bind.

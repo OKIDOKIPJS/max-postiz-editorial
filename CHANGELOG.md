@@ -1,5 +1,15 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: явный TLS для временного набора Docker
+
+- После CodeQL на следующем кандидате в downloader явно зафиксирован минимум
+  TLS 1.2. Проверка сертификата и hostname сохраняется; источник, SNI, SHA и
+  отсутствие redirects/proxies не меняются. Suppression не добавлен.
+- Все 23 pure-теста downloader прошли, включая certificate/hostname/minimum
+  TLS; Ruff/diff-check прошли. Новый CodeQL и нативный run требуются для точного
+  исправленного commit. Предыдущий незавершённый native-кандидат заменяется этим
+  по source identity, а не считается успешной либо неуспешной сборкой приложения.
+
 ## 0.14.0 — 2026-11-02: закреплённый Docker для нативного стенда
 
 - Native run 41354862919 прошёл bootstrap/dependencies/pinned pulls и подтвердил

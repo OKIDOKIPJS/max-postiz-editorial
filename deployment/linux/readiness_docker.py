@@ -58,12 +58,18 @@ def public_address():
         raise DockerToolsError("DOCKER_TOOLS_PUBLIC_ENDPOINT_REQUIRED") from None
 
 
+def tls_context():
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
 def download(path):
     connection = None
     transport = None
     try:
         address = public_address()
-        context = ssl.create_default_context()
+        context = tls_context()
         transport = socket.create_connection((address, 443), timeout=30)
         connection = http.client.HTTPSConnection(HOST, timeout=30, context=context)
         connection.sock = context.wrap_socket(transport, server_hostname=HOST)
