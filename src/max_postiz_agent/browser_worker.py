@@ -411,6 +411,8 @@ def receipt(page, state, *, _load_deadline=None):
             image_proof = illustrated_receipt(posts.last, state)
         if image_proof is None:
             return None
+        if _matched_posts(page, state["text"], illustrated=True).count() != state["before_count"] + 1:
+            return None
         result["image_proof"] = image_proof
     else:
         selector = ('video, [aria-label^="Прикрепленные"]' if state.get("attachment_type") == "browser-video"
@@ -450,13 +452,14 @@ def _illustrated_title(post, state):
 
 def _scroll_illustration(post, state):
     """Только чтение/прокрутка фото выше точной подписи в одном найденном посте."""
-    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
     title = _illustrated_title(post, state)
     if not title or type(title.get("title_top")) not in {int, float}:
         return False
     elements = post.locator(".image-placeholder, img")
     for index in range(elements.count()):
         element = elements.nth(index)
+        anchor = None
         try:
             box = element.bounding_box()
             if (not element.is_visible() or not box or box["width"] < 120 or box["height"] < 60
@@ -465,13 +468,81 @@ def _scroll_illustration(post, state):
             info = element.evaluate("element => ({placeholder: element.classList.contains('image-placeholder'), source: element.currentSrc || element.src || ''})")
             if not info.get("placeholder") and not _max_image_source(info.get("source")):
                 continue
-            element.scroll_into_view_if_needed(timeout=1000)
+            anchor = element.element_handle(timeout=1000)
+            if anchor is None:
+                return False
+            try:
+                element.scroll_into_view_if_needed(timeout=1000)
+            except PlaywrightTimeoutError:
+                return _scroll_timed_out_illustration(post.page, anchor, state)
             return True
         except PlaywrightError:
             # Lazy replacement can detach the placeholder; the caller re-reads
             # the exact post and never treats the placeholder itself as proof.
             return True
+        finally:
+            if anchor is not None:
+                try:
+                    anchor.dispose()
+                except PlaywrightError:
+                    pass
     return False
+
+
+def _scroll_timed_out_illustration(page, anchor, state):
+    """После timeout прокручиваем только прежний узел в заново проверенном посте."""
+    posts = _matched_posts(page, state["text"], illustrated=True)
+    if posts.count() != 1:
+        return False
+    post = posts.last
+    title = _illustrated_title(post, state)
+    if not title or type(title.get("title_top")) not in {int, float} or not math.isfinite(title["title_top"]):
+        return False
+    info = anchor.evaluate("""image => ({tag: image.tagName,
+      placeholder: image.classList.contains('image-placeholder'),
+      current: image.currentSrc || image.src || '', declared: image.src || ''})""")
+    if info["tag"] == "IMG":
+        if not _max_image_source(info["current"]) or not _max_image_source(info["declared"]):
+            return False
+    elif not info["placeholder"]:
+        return False
+    return page.get_by_role("listitem").evaluate_all("""(posts, expected) => {
+      const exact = node => node.innerText === expected.text || node.textContent === expected.text;
+      const matches = posts.filter(post => [post, ...post.querySelectorAll('*')].some(node =>
+        exact(node) && node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0));
+      if (matches.length !== 1) return false;
+      const post = matches[0], image = expected.image;
+      if (!post.isConnected || !image.isConnected || !post.contains(image) ||
+          image.tagName !== expected.tag || image.classList.contains('image-placeholder') !== expected.placeholder ||
+          (image.currentSrc || image.src || '') !== expected.current || (image.src || '') !== expected.declared) return false;
+      const captions = [post, ...post.querySelectorAll('*')].filter(node => exact(node) &&
+        ![...node.children].some(exact) && node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0);
+      if (captions.length !== 1) return false;
+      const caption = captions[0], walker = document.createTreeWalker(caption, NodeFilter.SHOW_TEXT);
+      const nodes = []; let node;
+      while ((node = walker.nextNode())) nodes.push(node);
+      if (!nodes.length || !nodes.map(n => n.textContent).join('').startsWith(expected.title)) return false;
+      let remaining = expected.title.length, last = null, end = 0, body = false;
+      for (const text of nodes) {
+        const value = text.textContent, length = Math.max(0, Math.min(value.length, remaining));
+        const first = value.slice(0, length), rest = value.slice(length);
+        const weight = Number.parseFloat(getComputedStyle(text.parentElement).fontWeight);
+        if (first.trim() && !(weight >= 600) || rest.trim() && !(weight < 600)) return false;
+        if (length) {last = text; end = length;}
+        if (rest.trim()) body = true;
+        remaining -= length;
+      }
+      if (!last || remaining || !body) return false;
+      const range = document.createRange(); range.setStart(nodes[0], 0); range.setEnd(last, end);
+      const top = range.getBoundingClientRect().top, box = image.getBoundingClientRect();
+      const style = getComputedStyle(image), captionStyle = getComputedStyle(caption);
+      if (![top, box.x, box.y, box.width, box.height].every(Number.isFinite) ||
+          style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility) ||
+          ['hidden', 'collapse'].includes(captionStyle.visibility) ||
+          box.width < 120 || box.height < 60 || box.bottom > top + 4) return false;
+      image.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+      return true;
+    }""", {**info, "image": anchor, "text": state["text"], "title": state["title_text"]})
 
 
 def illustrated_receipt(post, state):

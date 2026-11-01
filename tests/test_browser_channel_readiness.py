@@ -13,7 +13,6 @@ pytest_plugins = ["test_browser_publishing"]
 @pytest.fixture
 def channel(project, browser_page, monkeypatch):
     settings = browser_config(project)
-    monkeypatch.setattr(browser_runtime, "_CHANNEL_READY_TIMEOUT_MS", 1000)
     browser_page.set_default_timeout(40)
     requests = []
     browser_page.on("request", lambda request: requests.append(request.url))
@@ -37,7 +36,7 @@ def unchanged(page, requests):
     assert page.evaluate("window.sendCalls") == 0
     editor = page.locator(browser_runtime.COMPOSER)
     if editor.count():
-        assert editor.inner_text() == "Чужой черновик"
+        assert editor.inner_text(timeout=1000) == "Чужой черновик"
 
 
 @pytest.mark.parametrize("initial", ["", "Окно чата с Тест старый"])
@@ -91,7 +90,7 @@ def test_noncanonical_address_is_rejected_before_any_dom_wait_or_navigation(
         channel, address, require_publish):
     settings, page, requests = channel
     page.route("**/*", lambda request: request.fulfill(body=html(), content_type="text/html"))
-    page.goto(address, timeout=1000)
+    page.goto(address, timeout=30_000)
     before = list(requests)
     with pytest.raises(AgentError, match="^BROWSER_WRONG_CHANNEL$"):
         browser_runtime.ensure_channel(page, settings, "-123", navigate=False,

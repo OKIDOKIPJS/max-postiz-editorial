@@ -490,6 +490,187 @@ def test_loaded_receipt_waits_for_caption_hydration_after_each_reload_without_se
         assert page.evaluate("events.filter(event=>event==='send').length") == 1
 
 
+def test_scroll_timeout_rechecks_exact_image_and_loads_real_lazy_photo(
+        receipt_state, lazy_page, monkeypatch):
+    from playwright.sync_api import Locator, TimeoutError as PlaywrightTimeoutError
+
+    page = lazy_page(image_delay_ms=2400)
+    delivered_lazy_post(page, receipt_state)
+    original_state = copy.deepcopy(receipt_state)
+    before = page.evaluate("document.querySelector('#history').scrollTop")
+    timeouts = []
+
+    def timed_out(_element, *, timeout):
+        timeouts.append(timeout)
+        raise PlaywrightTimeoutError("forced original scroll stability timeout")
+
+    monkeypatch.setattr(Locator, "scroll_into_view_if_needed", timed_out)
+    browser_worker.receipt(page, receipt_state)
+    assert timeouts == [1000]
+    assert page.evaluate("document.querySelector('#history').scrollTop") != before
+    page.wait_for_function("""() => {
+      const image = document.querySelector('#exact-post img');
+      return image && image.complete && image.naturalWidth === 1920 && image.naturalHeight === 1440;
+    }""", timeout=15000)
+    proof = browser_worker.receipt(page, receipt_state)
+    assert proof["state"] == "confirmed"
+    assert proof["image_proof"]["image_before_caption"] is True
+    assert proof["image_proof"]["title_proof"]["title_bold"] is True
+    assert proof["image_proof"]["title_proof"]["body_unbold"] is True
+    assert page.locator("#decoy img").count() == 0
+    assert page.evaluate("events.filter(event=>event==='send').length") == 1
+    assert receipt_state == original_state
+
+
+@pytest.mark.parametrize("change", [
+    "changed_post", "duplicate_post", "plain_title", "below_caption",
+    "untrusted_current", "untrusted_declared", "detached", "replaced",
+])
+def test_scroll_timeout_refuses_changed_post_candidate_or_image_origin(
+        receipt_state, lazy_page, monkeypatch, change):
+    from playwright.sync_api import Locator, TimeoutError as PlaywrightTimeoutError
+
+    page = lazy_page()
+    delivered_lazy_post(page, receipt_state)
+    original_state = copy.deepcopy(receipt_state)
+    if change in {"untrusted_current", "untrusted_declared"}:
+        page.evaluate("""() => {
+          const old = document.querySelector('#exact-post .image-placeholder');
+          const image = document.createElement('img'); image.className = 'image-placeholder';
+          image.style.cssText = 'display:block;width:464px;height:348px';
+          image.src = 'https://i.oneme.ru/fixture-photo.jpg?token=private-fixture-query';
+          old.replaceWith(image);
+        }""")
+        page.wait_for_function("""() => {
+          const image = document.querySelector('#exact-post img');
+          return image.complete && image.naturalWidth === 1920;
+        }""")
+    page.evaluate("""() => {
+      window.fallbackScrolls = 0; const original = Element.prototype.scrollIntoView;
+      Element.prototype.scrollIntoView = function(...args) {
+        fallbackScrolls++; return original.apply(this, args);
+      };
+    }""")
+    timeouts = []
+
+    def changed_then_timed_out(_element, *, timeout):
+        timeouts.append(timeout)
+        page.evaluate("""change => {
+          const post = document.querySelector('#exact-post');
+          const media = post.querySelector('.image-placeholder,img');
+          if (change === 'changed_post') post.querySelector('span').textContent = 'Changed exact caption';
+          if (change === 'duplicate_post') post.parentElement.append(post.cloneNode(true));
+          if (change === 'plain_title') post.querySelector('b').style.fontWeight = '400';
+          if (change === 'below_caption') post.append(media);
+          if (change === 'untrusted_current' || change === 'untrusted_declared') {
+            Object.defineProperty(media, change === 'untrusted_current' ? 'currentSrc' : 'src', {
+              configurable: true, get: () => 'https://evil.invalid/photo.jpg'
+            });
+          }
+          if (change === 'detached') media.remove();
+          if (change === 'replaced') media.replaceWith(media.cloneNode(true));
+        }""", change)
+        raise PlaywrightTimeoutError("forced timeout after candidate changed")
+
+    monkeypatch.setattr(Locator, "scroll_into_view_if_needed", changed_then_timed_out)
+    posts = browser_worker._matched_posts(page, receipt_state["text"], illustrated=True)
+    assert posts.count() == 1
+    assert browser_worker._scroll_illustration(posts.last, receipt_state) is False
+    assert timeouts == [1000]
+    assert page.evaluate("fallbackScrolls") == 0
+    assert browser_worker.illustrated_receipt(page.locator("#exact-post").first, receipt_state) is None
+    assert page.locator("#decoy img").count() == 0
+    assert page.evaluate("events.filter(event=>event==='send').length") == 1
+    assert receipt_state == original_state
+
+
+def test_non_timeout_scroll_error_keeps_previous_behavior_without_js_fallback(
+        receipt_state, lazy_page, monkeypatch):
+    from playwright.sync_api import Error as PlaywrightError, Locator
+
+    page = lazy_page()
+    delivered_lazy_post(page, receipt_state)
+    page.evaluate("""() => {
+      window.fallbackScrolls = 0;
+      Element.prototype.scrollIntoView = () => {fallbackScrolls++;};
+    }""")
+    timeouts = []
+
+    def failed(_element, *, timeout):
+        timeouts.append(timeout)
+        raise PlaywrightError("non-timeout detached element")
+
+    monkeypatch.setattr(Locator, "scroll_into_view_if_needed", failed)
+    posts = browser_worker._matched_posts(page, receipt_state["text"], illustrated=True)
+    assert browser_worker._scroll_illustration(posts.last, receipt_state) is True
+    assert timeouts == [1000]
+    assert page.evaluate("fallbackScrolls") == 0
+    assert browser_worker.illustrated_receipt(posts.last, receipt_state) is None
+    assert page.evaluate("events.filter(event=>event==='send').length") == 1
+
+
+def test_preloaded_image_receipt_rejects_duplicate_added_during_scroll_timeout(
+        receipt_state, lazy_page, monkeypatch):
+    from playwright.sync_api import Locator, TimeoutError as PlaywrightTimeoutError
+
+    page = lazy_page()
+    delivered_lazy_post(page, receipt_state)
+    page.locator("#exact-post .image-placeholder").evaluate("element => element.scrollIntoView({block:'center'})")
+    page.wait_for_function("""() => {
+      const image = document.querySelector('#exact-post img');
+      return image && image.complete && image.naturalWidth === 1920 && image.naturalHeight === 1440;
+    }""", timeout=15000)
+    page.evaluate("document.querySelector('#history').scrollTop = document.querySelector('#history').scrollHeight")
+    timeouts = []
+
+    def duplicated_then_timed_out(_element, *, timeout):
+        timeouts.append(timeout)
+        page.locator("#exact-post").evaluate("post => post.parentElement.append(post.cloneNode(true))")
+        raise PlaywrightTimeoutError("forced timeout after another exact post appeared")
+
+    monkeypatch.setattr(Locator, "scroll_into_view_if_needed", duplicated_then_timed_out)
+    assert browser_worker.receipt(page, receipt_state) is None
+    assert timeouts == [1000]
+    assert browser_worker._matched_posts(page, receipt_state["text"], illustrated=True).count() == 2
+    assert page.evaluate("events.filter(event=>event==='send').length") == 1
+
+
+def test_scroll_timeout_atomically_rejects_duplicate_added_after_fresh_title_check(
+        receipt_state, lazy_page, monkeypatch):
+    from playwright.sync_api import ElementHandle, Locator, TimeoutError as PlaywrightTimeoutError
+
+    page = lazy_page()
+    delivered_lazy_post(page, receipt_state)
+    page.evaluate("""() => {
+      window.fallbackScrolls = 0;
+      Element.prototype.scrollIntoView = () => {fallbackScrolls++;};
+    }""")
+    clock = SimpleNamespace(armed=False, inserted=False, timeouts=[])
+    original = ElementHandle.evaluate
+
+    def duplicate_after_anchor_observation(element, *args, **kwargs):
+        result = original(element, *args, **kwargs)
+        if clock.armed:
+            clock.armed = False
+            clock.inserted = True
+            page.locator("#exact-post").evaluate("post => post.parentElement.append(post.cloneNode(true))")
+        return result
+
+    def timed_out(_element, *, timeout):
+        clock.timeouts.append(timeout)
+        clock.armed = True
+        raise PlaywrightTimeoutError("forced original scroll timeout")
+
+    monkeypatch.setattr(ElementHandle, "evaluate", duplicate_after_anchor_observation)
+    monkeypatch.setattr(Locator, "scroll_into_view_if_needed", timed_out)
+    post = browser_worker._matched_posts(page, receipt_state["text"], illustrated=True).last
+    assert browser_worker._scroll_illustration(post, receipt_state) is False
+    assert clock.inserted and clock.timeouts == [1000]
+    assert page.evaluate("fallbackScrolls") == 0
+    assert page.locator("#exact-post img").count() == 0
+    assert page.evaluate("events.filter(event=>event==='send').length") == 1
+
+
 def test_loaded_receipt_rejects_extra_exact_post_without_waiting(receipt_state, lazy_page, monkeypatch):
     page = lazy_page()
     delivered_lazy_post(page, receipt_state)
