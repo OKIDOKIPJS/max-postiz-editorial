@@ -1089,7 +1089,9 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
                                          else story_switch.uncheck(timeout=timeout)), origin=origin)
                 _wait_story_disabled(page, selectors, timeout=transition_timeout)
             _personal_settings(page, plan, selectors, origin=origin)
-        _wait_preview_images_ready(page, selectors, len(plan["media"]), timeout=transition_timeout)
+        # Native preview has two DOM representations of the single approved photo.
+        preview_count = 2 if plan.get("image_contract") else len(plan["media"])
+        _wait_preview_images_ready(page, selectors, preview_count, timeout=transition_timeout)
         before = _final_snapshot(page, plan, selectors, origin=origin)
         if plan.get("image_contract"):
             _native_preview_proof(page, before["images"], plan, journal.get("upload_proof"), journal["request_id"], origin=origin)

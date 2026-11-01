@@ -305,6 +305,39 @@ def test_real_native_image_upload_preview_original_two_reloads_and_no_repeat(nat
     assert state == before
 
 
+@pytest.mark.parametrize("delayed_rep", [0, 1])
+def test_native_preview_waits_for_each_representation_to_decode(native_site, page, monkeypatch, delayed_rep):
+    root, options, snapshot, state, origin = native_site
+    page.context.route("**/*", lambda route: route.continue_() if route.request.url.startswith(origin + "/") else route.abort())
+    decoded, representations = [], []
+    page.expose_function("fixturePreviewDecoded", lambda: decoded.append(delayed_rep))
+    story_disabled = worker._wait_story_disabled
+
+    def delay_one_representation(*args, **kwargs):
+        result = story_disabled(*args, **kwargs)
+        selector = args[1]["preview_images"]
+        representations.append(page.locator(selector).count())
+        assert representations == [2]
+        page.evaluate("""({selector,index})=>{
+          const image=document.querySelectorAll(selector)[index];
+          Object.defineProperty(image,'complete',{configurable:true,get:()=>false});
+          setTimeout(()=>{delete image.complete;window.fixturePreviewDecoded();},400);
+        }""", {"selector": selector, "index": delayed_rep})
+        return result
+
+    monkeypatch.setattr(worker, "_wait_story_disabled", delay_one_representation)
+    payload = {"destination": "123456", "request_id": "native-image-delayed-" + str(delayed_rep), "snapshot": snapshot}
+    result = worker.run_publish(page, root, options, payload, lambda: None, origin=origin, fixture=True)
+    assert result["state"] == "confirmed", {"failure_code": result["evidence"].get("failure_code"), "result": result}
+    assert decoded == [delayed_rep] and representations == [2]
+    assert result["verified"] is False and options["operation_timeout_seconds"] == 10
+    assert state["uploads"] == state["publishes"] == 1 and state["viewer_before_publish"] == 0
+    assert state["photo_views"] == 2 and len(result["evidence"]["proof"]["reloads"]) == 2
+    before = deepcopy(state)
+    assert worker.run_publish(page, root, options, payload, lambda: None, origin=origin, fixture=True) == result
+    assert state == before
+
+
 def test_real_native_wrong_public_asset_is_unknown_and_never_reuploaded(native_site, page):
     root, options, snapshot, state, origin = native_site
     state["wrong_public_asset"] = True
