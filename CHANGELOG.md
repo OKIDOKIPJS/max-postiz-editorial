@@ -1,5 +1,42 @@
 # История версий
 
+## 0.11.10 — 2026-11-01: разбор CodeQL и исправления зависимостей
+
+- Выполнен разбор 45 CodeQL alerts по сохранённому SARIF основного Python analysis.
+  Подтверждены 7 отмеченных мест в двух связанных цепочках (3 прямых sink и
+  4 prerequisite/validation locations), остальные 38 — доказанные false positives.
+  Это не семь отдельных дефектов. Полное сопоставление всех 45 locations,
+  регрессионных тестов и 82 dependency alerts: docs/security/2026-11-01-v0.11.10.json.
+  После полной индексации манифестов Dependabot показал 82 alerts: 50 уникальных
+  advisory для шести пакетов; дубли разных манифестов учитываются отдельно.
+- Уязвимые объявленные версии заменены: Pillow 13.0.0, cryptography 50.0.2,
+  certifi 2026.10.23, setuptools 84.2.1, opentelemetry-api 1.45.2,
+  Transformers 5.17.0 и совместимый huggingface-hub 1.33.0. Минимальные/верхние
+  границы и runtime/dev/images locks согласованы с requirements-ci.txt.
+  Для advisory Transformers без first_patched_version проверено включение
+  конкретного upstream fix commit в release, а не только уязвимый диапазон.
+- Исходные CodeQL flows для env names, подписанной cookie и фиксированного argv
+  проверены отдельными synthetic controls. Значения ключей не помещаются в отчёт;
+  подтверждённые ошибки путей и ложные срабатывания фиксируются раздельно.
+- Исправлены пять функциональных дефектов: обход topic/sources namespace,
+  workflow collision с проверенными файлами, direct private JSON selection,
+  открытый неявный/перенесённый стандартный профиль и workflow=None readback.
+  Одна privacy policy защищает известные default и настроенные browser/OpenCode
+  roots, включая roots под config/. Schema poisoning не проходит предварительную
+  проверку; все targets перепроверяются до записи. Live guards sending/unknown,
+  mutation locks, восстановление прежних файлов и публикационные проверки сохранены.
+- В отдельных окружениях прошли pip check, аудит 55 core pins и 37 resolved
+  translation dependencies без Torch: 0 известных advisory в проверенных наборах.
+  Pillow formats, Fernet и CA bundle проверены smoke; synthetic Fernet ciphertext
+  совместим в обе стороны между cryptography 49.0.0 и 50.0.2. Wheel/sdist собраны.
+  Итоговый локальный набор на обновлённых зависимостях: 104 passed, 4 ожидаемых
+  Windows symlink skipped, 1 прежний Starlette/httpx warning; Ruff/pins прошли.
+  Полные GitHub pytest/CodeQL и Linux symlink-контроли обязательны перед merge.
+- Установки и проверки выполняются в отдельных локальных окружениях/временных
+  каталогах. Модели, рабочая VM, её БД, очереди, история, публикации и исходный
+  checkout не изменяются. Новая версия относится к репозиторию и ещё не установлена
+  на работающий сервер. Финальные проверки и disposition записываются в этом наборе.
+
 ## 0.11.7 — 2026-11-01: полный Windows pytest четырьмя обязательными частями
 
 - Последовательный Windows job дошёл до 88% и был остановлен по лимиту 45 минут;

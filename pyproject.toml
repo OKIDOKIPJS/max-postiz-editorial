@@ -1,24 +1,25 @@
 [build-system]
-requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+requires = ["setuptools==84.2.1", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "max-postiz-agent"
-version = "0.11.7"
+version = "0.11.10"
 description = "Автономная редакция на VM с PostgreSQL, OpenCode и управлением из Postiz"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "sqlalchemy>=2.0,<2.1",
   "psycopg[binary]>=3.2,<4", "httpx>=0.28,<1", "jsonschema>=4.23,<5",
   "beautifulsoup4>=4.13,<5", "feedparser>=6.0,<7", "tzdata>=2025.1",
-  "cryptography>=44,<50", "alembic>=1.15,<2", "imageio-ffmpeg>=0.6,<1",
-  "python-multipart==0.0.32", "Pillow>=12.3,<13"
+  "certifi>=2026.10.23", "opentelemetry-api>=1.45.2,<2",
+  "cryptography>=50.0.2,<51", "alembic>=1.15,<2", "imageio-ffmpeg>=0.6,<1",
+  "python-multipart==0.0.32", "Pillow>=13,<14"
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3,<10", "pytest-cov>=6,<8", "ruff>=0.11,<1", "build>=1.2,<2"]
 browser = ["playwright==1.63.0"]
-images = ["onnxruntime>=1.31,<1.32", "Pillow>=12.3,<13", "tokenizers>=0.23,<0.24", "numpy>=2.5,<3"]
+images = ["onnxruntime>=1.31,<1.32", "Pillow>=13,<14", "tokenizers>=0.23,<0.24", "numpy>=2.5,<3"]
 
 [project.scripts]
 hub-agent = "max_postiz_agent.hub_cli:main"

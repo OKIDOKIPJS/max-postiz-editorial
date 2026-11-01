@@ -1,0 +1,2362 @@
+{
+  "schema_version": "max-postiz-security-review-v1",
+  "date_europe_moscow": "2026-11-01",
+  "repository_version": "0.11.10",
+  "baseline_commit": "10c1e30b3e2dddfb260b8400e8234abb9171c9dd",
+  "baseline_python_sarif_analysis": 2071580522,
+  "scope": "Repository source and declared dependencies; no production changes or model inference.",
+  "production_server_modified": false,
+  "runtime_installed_versions_inspected": false,
+  "codeql": {
+    "counts": {
+      "false_positive": 38,
+      "confirmed_fixed": 7
+    },
+    "reviewed": 45,
+    "unverified": 0,
+    "direct_confirmed_alerts": [
+      34,
+      40,
+      41
+    ],
+    "related_confirmed_chain_locations": [
+      36,
+      37,
+      38,
+      39
+    ],
+    "alerts": [
+      {
+        "number": 1,
+        "rule": "py/clear-text-storage-sensitive-data",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 380
+        },
+        "classification": "false_positive",
+        "source_summary": "image_pipeline.scan source[api_key_env] (environment variable name)",
+        "guard": null,
+        "reason": "missing_env_names contains only names; os.getenv value is used as a boolean condition and is not copied into the report",
+        "chain_context": null,
+        "regression_tests": [
+          "test_missing_source_key_report_never_stores_or_logs_an_existing_key"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/1"
+      },
+      {
+        "number": 2,
+        "rule": "py/clear-text-logging-sensitive-data",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_commands.py",
+          "line": 40
+        },
+        "classification": "false_positive",
+        "source_summary": "same missing_env_names name list from scan",
+        "guard": null,
+        "reason": "CLI prints report with names, not credential values",
+        "chain_context": null,
+        "regression_tests": [
+          "test_missing_source_key_report_never_stores_or_logs_an_existing_key"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/2"
+      },
+      {
+        "number": 3,
+        "rule": "py/cookie-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/api.py",
+          "line": 213
+        },
+        "classification": "false_positive",
+        "source_summary": "api.session_login role=Depends(auth), closed owner/editor/viewer role map",
+        "guard": null,
+        "reason": "request body role is ignored; encoded JSON is base64url plus hex HMAC, emitted value excludes cookie delimiters/control characters and tampering fails",
+        "chain_context": null,
+        "regression_tests": [
+          "test_login_cookie_comes_from_authenticated_role_not_request_body",
+          "test_session_encoder_rejects_unrecognized_roles_and_tampered_hmac"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/3"
+      },
+      {
+        "number": 4,
+        "rule": "py/command-line-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 134
+        },
+        "classification": "false_positive",
+        "source_summary": "owner-only /api/v1/files/choose and loopback request, canonical confined initial path",
+        "guard": null,
+        "reason": "fixed absolute Python and package file_dialog.py; kind/purpose are whitelist constrained; path remains one argument; no shell",
+        "chain_context": null,
+        "regression_tests": [
+          "test_desktop_helpers_keep_fixed_executables_and_scalar_path_arguments",
+          "test_python_argv_metacharacters_are_not_expanded_by_a_shell"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/4"
+      },
+      {
+        "number": 5,
+        "rule": "py/command-line-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 209
+        },
+        "classification": "false_positive",
+        "source_summary": "owner-only /api/v1/files/explorer and loopback request, canonical confined path",
+        "guard": null,
+        "reason": "fixed absolute trusted SystemRoot/explorer.exe; fixed /select, prefix for a file; path is a scalar argument; shell=False. Remote/outside-root/control-character inputs fail before process creation",
+        "chain_context": null,
+        "regression_tests": [
+          "test_desktop_helpers_keep_fixed_executables_and_scalar_path_arguments",
+          "test_explorer_rejects_remote_or_invalid_paths_before_launch",
+          "test_python_argv_metacharacters_are_not_expanded_by_a_shell"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/5"
+      },
+      {
+        "number": 6,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/config.py",
+          "line": 54
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 255
+        },
+        "guard": "inside(): resolve() then is_relative_to(root.resolve()) before returning a path",
+        "reason": "Флаг стоит на композиции Path, до проверки. Это ещё не файловая операция: выходящий за root candidate не возвращается вызывающему коду. Traversal, absolute outside и existing symlink outside отвергаются.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/6"
+      },
+      {
+        "number": 7,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/holidays.py",
+          "line": 95
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 255
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/7"
+      },
+      {
+        "number": 8,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/holidays.py",
+          "line": 96
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 255
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/8"
+      },
+      {
+        "number": 9,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/holidays.py",
+          "line": 102
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 255
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/9"
+      },
+      {
+        "number": 10,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/holidays.py",
+          "line": 104
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 255
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/10"
+      },
+      {
+        "number": 11,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_schedule.py",
+          "line": 33
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 255
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/11"
+      },
+      {
+        "number": 12,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_schedule.py",
+          "line": 33
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 255
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/12"
+      },
+      {
+        "number": 13,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_schedule.py",
+          "line": 42
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 261
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/13"
+      },
+      {
+        "number": 14,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_schedule.py",
+          "line": 44
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 261
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/14"
+      },
+      {
+        "number": 15,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_schedule.py",
+          "line": 45
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 261
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/15"
+      },
+      {
+        "number": 16,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_schedule.py",
+          "line": 194
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/16"
+      },
+      {
+        "number": 17,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_schedule.py",
+          "line": 195
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/17"
+      },
+      {
+        "number": 18,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 371
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/18"
+      },
+      {
+        "number": 19,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 380
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/19"
+      },
+      {
+        "number": 20,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 513
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/20"
+      },
+      {
+        "number": 21,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 528
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/21"
+      },
+      {
+        "number": 22,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 539
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 359
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/22"
+      },
+      {
+        "number": 23,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 539
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 359
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/23"
+      },
+      {
+        "number": 24,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 725
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/24"
+      },
+      {
+        "number": 25,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 727
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/25"
+      },
+      {
+        "number": 26,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 767
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/26"
+      },
+      {
+        "number": 27,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/image_pipeline.py",
+          "line": 808
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 374
+        },
+        "guard": "validate_channel_id fullmatch [a-z][a-z0-9_-]{0,63} -> channel_path -> inside resolved containment",
+        "reason": "HTTP channel_id не допускает точек, разделителей, двоеточия, drive/UNC или пустого имени. Служебный name задаёт код, slot выводится из календарного времени; файлы изображений именуются SHA256. Все reported sinks остаются под root.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_channel_names_cannot_become_filesystem_paths"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/27"
+      },
+      {
+        "number": 28,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/media.py",
+          "line": 44
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 577
+        },
+        "guard": "inside() before media existence/size, decoder, read_bytes, copy or subprocess",
+        "reason": "Выбор проектного медиафайла владельцем разрешён. Внешний путь блокируется до PIL/ffmpeg; назначение video attachment находится в inside(media_dir) и именуется хешем проверенного содержимого.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_media_paths_are_contained_before_any_decoder_or_process"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/28"
+      },
+      {
+        "number": 29,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/media.py",
+          "line": 47
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 577
+        },
+        "guard": "inside() before media existence/size, decoder, read_bytes, copy or subprocess",
+        "reason": "Выбор проектного медиафайла владельцем разрешён. Внешний путь блокируется до PIL/ffmpeg; назначение video attachment находится в inside(media_dir) и именуется хешем проверенного содержимого.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_media_paths_are_contained_before_any_decoder_or_process"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/29"
+      },
+      {
+        "number": 30,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/media.py",
+          "line": 74
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 577
+        },
+        "guard": "inside() before media existence/size, decoder, read_bytes, copy or subprocess",
+        "reason": "Выбор проектного медиафайла владельцем разрешён. Внешний путь блокируется до PIL/ffmpeg; назначение video attachment находится в inside(media_dir) и именуется хешем проверенного содержимого.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_media_paths_are_contained_before_any_decoder_or_process"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/30"
+      },
+      {
+        "number": 31,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/media.py",
+          "line": 76
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 577
+        },
+        "guard": "inside() before media existence/size, decoder, read_bytes, copy or subprocess",
+        "reason": "Выбор проектного медиафайла владельцем разрешён. Внешний путь блокируется до PIL/ffmpeg; назначение video attachment находится в inside(media_dir) и именуется хешем проверенного содержимого.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_media_paths_are_contained_before_any_decoder_or_process"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/31"
+      },
+      {
+        "number": 32,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/media.py",
+          "line": 103
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 577
+        },
+        "guard": "inside() before media existence/size, decoder, read_bytes, copy or subprocess",
+        "reason": "Выбор проектного медиафайла владельцем разрешён. Внешний путь блокируется до PIL/ffmpeg; назначение video attachment находится в inside(media_dir) и именуется хешем проверенного содержимого.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_media_paths_are_contained_before_any_decoder_or_process"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/32"
+      },
+      {
+        "number": 33,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 70
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 282
+        },
+        "guard": "project_path -> inside resolved containment; browse additionally applies browsable before enumeration",
+        "reason": "Reported sink — is_dir для навигации внутри проекта, не чтение внешнего файла. Отдельно исправлен default-profile privacy defect в browsable; он не означает, что outside-root traversal проходил этот sink.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_default_browser_profile_is_private_when_profile_dir_is_implicit"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/33"
+      },
+      {
+        "number": 34,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 114
+        },
+        "classification": "confirmed_fixed",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 287
+        },
+        "guard": "NEW: selected applies the same browsable private-directory policy as browse before reading JSON",
+        "reason": "Подтверждён доступ к JSON внутри browser/OpenCode/private-imports через прямой files/select purpose=workflow. Root containment работал, но отсутствовала внутренняя privacy boundary. Теперь API отказывает до чтения; private selection возвращает только метаданные.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_direct_workflow_selection_cannot_read_private_directories",
+          "tests/test_security_paths.py::test_private_profile_symlink_cannot_bypass_direct_selection",
+          "tests/test_security_paths.py::test_allowed_configuration_namespaces_and_private_metadata_remain_usable"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/34"
+      },
+      {
+        "number": 35,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 101
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 287
+        },
+        "guard": "owner authentication + project_path resolved root containment; directory-only branch does not read JSON",
+        "reason": "Разветвление проверено на old baseline: kind=directory,purpose=workflow исполняет только строку101(is_dir), возвращает state/path/directory и не достигает file branch104, stat111 или read_text114. Это coarse type/existence ответ для уже известного owner-controlled проектного пути, без перечисления содержимого, private document или outside-root доступа. Поэтому35 не prerequisite JSON chain34 и не подтверждён как самостоятельный arbitrary-path read. Общая privacy policy теперь всё равно блокирует private directory selection.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_direct_workflow_selection_cannot_read_private_directories"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/35"
+      },
+      {
+        "number": 36,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 111
+        },
+        "classification": "confirmed_fixed",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 287
+        },
+        "guard": "NEW selected applies the shared private-root policy before file predicates, size check and JSON read",
+        "reason": "Подтверждённый prerequisite той же private-JSON chain34, не отдельная уязвимость. На old baseline kind=file,purpose=workflow исполняет строки104(is_file),111(stat) и114(read_text), после чего возвращает synthetic private document. stat size check сам по себе не раскрывает JSON и остаётся внутри root, но является достижимым шагом подтверждённой цепочки до чтения. Не dismiss отдельно от34 только из-за metadata-формы sink.",
+        "chain_context": "Metadata prerequisite of the private JSON read in alert 34.",
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_direct_workflow_selection_cannot_read_private_directories",
+          "tests/test_security_paths.py::test_private_profile_symlink_cannot_bypass_direct_selection"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/36"
+      },
+      {
+        "number": 37,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 104
+        },
+        "classification": "confirmed_fixed",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 287
+        },
+        "guard": "NEW selected applies the shared private-root policy before file predicates, size check and JSON read",
+        "reason": "Подтверждённый prerequisite той же private-JSON chain34, не отдельная уязвимость. На old baseline kind=file,purpose=workflow исполняет строки104(is_file),111(stat) и114(read_text), после чего возвращает synthetic private document. is_file check сам по себе не раскрывает JSON и остаётся внутри root, но является достижимым шагом подтверждённой цепочки до чтения. Не dismiss отдельно от34 только из-за metadata-формы sink.",
+        "chain_context": "Metadata prerequisite of the private JSON read in alert 34.",
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_direct_workflow_selection_cannot_read_private_directories",
+          "tests/test_security_paths.py::test_private_profile_symlink_cannot_bypass_direct_selection"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/37"
+      },
+      {
+        "number": 38,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_settings.py",
+          "line": 75
+        },
+        "classification": "confirmed_fixed",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 272
+        },
+        "guard": "NEW canonical namespace validation before trial and live writes; source-schema targets cannot be overwritten by sources/workflow payloads",
+        "reason": "Подтверждённый элемент единой namespace/validation-bypass цепочки с40/41. Источники могут быть dual-use JSON Schema: со штатным sources_path invalid trust отвергается, но traversal в schemas/sources.schema.json перезаписывает cloned schema и baseline принимает те же данные. Reported38/39 относятся к topic mkdir/write, а schema poisoned соседним atomic_json; совместный topic+sources payload воспроизведён. Поэтому sandbox здесь не достаточен для FP: его результат разрешал последующую live запись. Это дубликаты одной цепочки, не отдельные функциональные баги.",
+        "chain_context": "Validation-namespace precursor in the same request as the demonstrated neighboring JSON-schema poisoning write.",
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_settings_paths_cannot_escape_their_allowed_namespace",
+          "tests/test_security_paths.py::test_scoped_path_escape_cannot_overwrite_an_existing_project_file",
+          "tests/test_security_paths.py::test_source_payload_cannot_poison_the_schema_used_for_its_own_validation"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/38"
+      },
+      {
+        "number": 39,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_settings.py",
+          "line": 76
+        },
+        "classification": "confirmed_fixed",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 272
+        },
+        "guard": "NEW canonical namespace validation before trial and live writes; source-schema targets cannot be overwritten by sources/workflow payloads",
+        "reason": "Подтверждённый элемент единой namespace/validation-bypass цепочки с40/41. Источники могут быть dual-use JSON Schema: со штатным sources_path invalid trust отвергается, но traversal в schemas/sources.schema.json перезаписывает cloned schema и baseline принимает те же данные. Reported38/39 относятся к topic mkdir/write, а schema poisoned соседним atomic_json; совместный topic+sources payload воспроизведён. Поэтому sandbox здесь не достаточен для FP: его результат разрешал последующую live запись. Это дубликаты одной цепочки, не отдельные функциональные баги.",
+        "chain_context": "Validation-namespace precursor in the same request as the demonstrated neighboring JSON-schema poisoning write.",
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_settings_paths_cannot_escape_their_allowed_namespace",
+          "tests/test_security_paths.py::test_scoped_path_escape_cannot_overwrite_an_existing_project_file",
+          "tests/test_security_paths.py::test_source_payload_cannot_poison_the_schema_used_for_its_own_validation"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/39"
+      },
+      {
+        "number": 40,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_settings.py",
+          "line": 139
+        },
+        "classification": "confirmed_fixed",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 272
+        },
+        "guard": "NEW configuration_path canonical relative syntax + resolved topic/sources/config subtree; workflow write-target collisions rejected",
+        "reason": "Подтверждён путь config/topics/../../docs/...md: он оставался внутри root, но обходил разрешённый namespace и позволял live overwrite другого проектного файла. Теперь dot/backslash/drive/ADS и redirected symlink targets отвергаются до записи; прежний root containment сохранён.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_settings_paths_cannot_escape_their_allowed_namespace",
+          "tests/test_security_paths.py::test_scoped_path_escape_cannot_overwrite_an_existing_project_file",
+          "tests/test_security_paths.py::test_configuration_symlink_cannot_redirect_a_scoped_write",
+          "tests/test_security_paths.py::test_source_payload_cannot_poison_the_schema_used_for_its_own_validation"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/40"
+      },
+      {
+        "number": 41,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_settings.py",
+          "line": 140
+        },
+        "classification": "confirmed_fixed",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 272
+        },
+        "guard": "NEW configuration_path canonical relative syntax + resolved topic/sources/config subtree; workflow write-target collisions rejected",
+        "reason": "Подтверждён путь config/topics/../../docs/...md: он оставался внутри root, но обходил разрешённый namespace и позволял live overwrite другого проектного файла. Теперь dot/backslash/drive/ADS и redirected symlink targets отвергаются до записи; прежний root containment сохранён.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_security_paths.py::test_settings_paths_cannot_escape_their_allowed_namespace",
+          "tests/test_security_paths.py::test_scoped_path_escape_cannot_overwrite_an_existing_project_file",
+          "tests/test_security_paths.py::test_configuration_symlink_cannot_redirect_a_scoped_write",
+          "tests/test_security_paths.py::test_source_payload_cannot_poison_the_schema_used_for_its_own_validation"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/41"
+      },
+      {
+        "number": 42,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 189
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 287
+        },
+        "guard": "owner + local_client + project_path -> inside resolved containment; fixed Explorer executable and argument array",
+        "reason": "Reported exists/is_file/is_dir используются для локального открытия проверенного проектного пути. Внешние/скрытые/ключевые пути блокируются, shell не используется. Обоснование command-line injection4/5 оформляет отдельный flow_triage.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_panel_files.py::test_cancel_remote_fallback_and_explorer_arguments"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/42"
+      },
+      {
+        "number": 43,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 204
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 287
+        },
+        "guard": "owner + local_client + project_path -> inside resolved containment; fixed Explorer executable and argument array",
+        "reason": "Reported exists/is_file/is_dir используются для локального открытия проверенного проектного пути. Внешние/скрытые/ключевые пути блокируются, shell не используется. Обоснование command-line injection4/5 оформляет отдельный flow_triage.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_panel_files.py::test_cancel_remote_fallback_and_explorer_arguments"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/43"
+      },
+      {
+        "number": 44,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 207
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 287
+        },
+        "guard": "owner + local_client + project_path -> inside resolved containment; fixed Explorer executable and argument array",
+        "reason": "Reported exists/is_file/is_dir используются для локального открытия проверенного проектного пути. Внешние/скрытые/ключевые пути блокируются, shell не используется. Обоснование command-line injection4/5 оформляет отдельный flow_triage.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_panel_files.py::test_cancel_remote_fallback_and_explorer_arguments"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/44"
+      },
+      {
+        "number": 45,
+        "rule": "py/path-injection",
+        "baseline_location": {
+          "file": "src/max_postiz_agent/panel_files.py",
+          "line": 213
+        },
+        "classification": "false_positive",
+        "source_summary": {
+          "path": "src/max_postiz_agent/api.py",
+          "line": 287
+        },
+        "guard": "owner + local_client + project_path -> inside resolved containment; fixed Explorer executable and argument array",
+        "reason": "Reported exists/is_file/is_dir используются для локального открытия проверенного проектного пути. Внешние/скрытые/ключевые пути блокируются, shell не используется. Обоснование command-line injection4/5 оформляет отдельный flow_triage.",
+        "chain_context": null,
+        "regression_tests": [
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_parent_traversal",
+          "tests/test_security_paths.py::test_existing_project_containment_blocks_external_absolute_and_symlink_paths",
+          "tests/test_panel_files.py::test_cancel_remote_fallback_and_explorer_arguments"
+        ],
+        "alert_url": "https://github.com/vovkmic-wq/max-postiz-editorial/security/code-scanning/45"
+      }
+    ]
+  },
+  "confirmed_functional_findings": [
+    {
+      "id": "PATH-CONFIG-NAMESPACE",
+      "related_alerts": [
+        38,
+        39,
+        40,
+        41
+      ],
+      "finding": "topic/sources prefix checks accepted traversal to other project namespaces; sources payload could overwrite the cloned source schema and bypass strict trial validation",
+      "fix": "Canonical relative paths + resolved target checked against the exact allowed subtree/fixed file, rechecked under locks before commit",
+      "tests": [
+        "test_settings_paths_cannot_escape_their_allowed_namespace",
+        "test_scoped_path_escape_cannot_overwrite_an_existing_project_file",
+        "test_source_payload_cannot_poison_the_schema_used_for_its_own_validation"
+      ],
+      "baseline_chain_evidence": ".test-state/security-audit/trial-schema-chain-replay.json"
+    },
+    {
+      "id": "PATH-WORKFLOW-COLLISION",
+      "related_alerts": [],
+      "finding": "Workflow could replace an already validated app/sources/image_channels/holidays document after trial validation",
+      "fix": "Protected resolved targets cannot be workflow destinations; workflow is included in trial writes; validate and save use the same target policy",
+      "tests": [
+        "test_workflow_target_cannot_escape_or_replace_validated_configuration",
+        "test_workflow_collision_is_rejected_before_live_configuration_changes"
+      ]
+    },
+    {
+      "id": "PATH-PRIVATE-JSON",
+      "related_alerts": [
+        34,
+        36,
+        37
+      ],
+      "finding": "Direct files/select purpose=workflow read private browser/OpenCode/import JSON while browse hid these paths",
+      "fix": "selected checks browsable first; known opencode.private.json is forbidden; private-purpose metadata remains supported",
+      "tests": [
+        "test_direct_workflow_selection_cannot_read_private_directories",
+        "test_known_private_configuration_is_not_a_selectable_workflow"
+      ],
+      "baseline_chain_evidence": ".test-state/security-audit/metadata-and-json-chain-replay.json"
+    },
+    {
+      "id": "PATH-DEFAULT-PROFILE",
+      "related_alerts": [],
+      "finding": "Implicit default browser profile was missing from the private directory list",
+      "fix": "Shared privacy catalogue protects known default and configured browser/OpenCode roots, including after relocation; purpose=private still returns metadata only.",
+      "tests": [
+        "test_default_browser_profile_is_private_when_profile_dir_is_implicit",
+        "test_known_default_private_roots_remain_private_after_relocation"
+      ]
+    },
+    {
+      "id": "PATH-WORKFLOW-NONE-READBACK",
+      "related_alerts": [],
+      "finding": "workflow=None could bypass workflow_path checking and arrange later settings reads from private paths, including browser/OpenCode state configured under config/",
+      "fix": "A shared pure private_roots(root, app, purpose) resolves configured browser/OpenCode/private-import roots. Workflow targets always reject these roots independently of their physical namespace; browse and selected reuse the same policy. snapshot rejects before read_text.",
+      "tests": [
+        "test_workflow_none_does_not_allow_a_private_path_to_be_read_on_next_snapshot",
+        "test_configured_private_profile_cannot_be_workflow_with_none_document",
+        "test_configured_private_profile_snapshot_is_rejected_before_file_read",
+        "test_configured_private_roots_keep_metadata_and_sibling_contracts",
+        "test_private_imports_resolved_into_config_cannot_be_read_as_workflow"
+      ]
+    }
+  ],
+  "dependencies": {
+    "previously_reported_count": 6,
+    "snapshot_open_count": 82,
+    "unique_reviewed_advisories": 50,
+    "packages": 6,
+    "withdrawn_advisories": 0,
+    "alerts": [
+      {
+        "number": 83,
+        "advisory": "GHSA-6q48-6c7w-9gw2",
+        "package": "certifi",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "2026.7.22",
+        "fixed_version": "2026.10.23",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-6q48-6c7w-9gw2"
+      },
+      {
+        "number": 82,
+        "advisory": "GHSA-5x8w-8jj5-q52h",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-5x8w-8jj5-q52h"
+      },
+      {
+        "number": 81,
+        "advisory": "GHSA-654x-cwwv-5j9c",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-654x-cwwv-5j9c"
+      },
+      {
+        "number": 80,
+        "advisory": "GHSA-xmj3-9gf7-h52w",
+        "package": "setuptools",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "84.0.0",
+        "fixed_version": "84.2.1",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-xmj3-9gf7-h52w"
+      },
+      {
+        "number": 79,
+        "advisory": "GHSA-78g4-xqwv-q3g8",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-78g4-xqwv-q3g8"
+      },
+      {
+        "number": 78,
+        "advisory": "GHSA-xcq7-p3pf-p88h",
+        "package": "opentelemetry-api",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "1.45.0",
+        "fixed_version": "1.45.2",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-xcq7-p3pf-p88h"
+      },
+      {
+        "number": 77,
+        "advisory": "GHSA-g7cr-3p24-7wf7",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-g7cr-3p24-7wf7"
+      },
+      {
+        "number": 76,
+        "advisory": "GHSA-9v9v-9qvf-h2hj",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-9v9v-9qvf-h2hj"
+      },
+      {
+        "number": 75,
+        "advisory": "GHSA-g4qv-2jxx-769h",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-g4qv-2jxx-769h"
+      },
+      {
+        "number": 74,
+        "advisory": "GHSA-3j72-p6qg-6xp7",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-3j72-p6qg-6xp7"
+      },
+      {
+        "number": 73,
+        "advisory": "GHSA-4rm8-3hmm-39fg",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-4rm8-3hmm-39fg"
+      },
+      {
+        "number": 72,
+        "advisory": "GHSA-mrfp-p49p-3hf2",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-mrfp-p49p-3hf2"
+      },
+      {
+        "number": 71,
+        "advisory": "GHSA-v9pv-5gc8-w2m6",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-v9pv-5gc8-w2m6"
+      },
+      {
+        "number": 70,
+        "advisory": "GHSA-24rc-8hj2-v98c",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-24rc-8hj2-v98c"
+      },
+      {
+        "number": 69,
+        "advisory": "GHSA-g842-9rc4-69pw",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-g842-9rc4-69pw"
+      },
+      {
+        "number": 68,
+        "advisory": "GHSA-p8hx-v2p6-rp84",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-p8hx-v2p6-rp84"
+      },
+      {
+        "number": 67,
+        "advisory": "GHSA-xvh5-g6gv-559v",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-xvh5-g6gv-559v"
+      },
+      {
+        "number": 66,
+        "advisory": "GHSA-332p-7hrc-92wf",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-332p-7hrc-92wf"
+      },
+      {
+        "number": 65,
+        "advisory": "GHSA-4rr5-89j8-mwwm",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-4rr5-89j8-mwwm"
+      },
+      {
+        "number": 64,
+        "advisory": "GHSA-f2g6-542v-9j58",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-f2g6-542v-9j58"
+      },
+      {
+        "number": 63,
+        "advisory": "GHSA-5xm2-6676-qcp9",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-5xm2-6676-qcp9"
+      },
+      {
+        "number": 62,
+        "advisory": "GHSA-gg2r-wvfm-q9rx",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-gg2r-wvfm-q9rx"
+      },
+      {
+        "number": 61,
+        "advisory": "GHSA-jg86-v3jv-hrpm",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-jg86-v3jv-hrpm"
+      },
+      {
+        "number": 60,
+        "advisory": "GHSA-254f-3936-288h",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-254f-3936-288h"
+      },
+      {
+        "number": 59,
+        "advisory": "GHSA-xgh8-jp6q-p5x8",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-xgh8-jp6q-p5x8"
+      },
+      {
+        "number": 58,
+        "advisory": "GHSA-rfgq-q3w2-pmv2",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-rfgq-q3w2-pmv2"
+      },
+      {
+        "number": 57,
+        "advisory": "GHSA-74r2-7ff9-mjj2",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-74r2-7ff9-mjj2"
+      },
+      {
+        "number": 56,
+        "advisory": "GHSA-22hg-r758-rrw9",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-22hg-r758-rrw9"
+      },
+      {
+        "number": 55,
+        "advisory": "GHSA-fc9g-5qg7-mf45",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-fc9g-5qg7-mf45"
+      },
+      {
+        "number": 54,
+        "advisory": "GHSA-27h8-gf7j-v5hc",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-27h8-gf7j-v5hc"
+      },
+      {
+        "number": 53,
+        "advisory": "GHSA-cp9v-662q-vvx9",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-cp9v-662q-vvx9"
+      },
+      {
+        "number": 52,
+        "advisory": "GHSA-j4m9-6w36-pw47",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-j4m9-6w36-pw47"
+      },
+      {
+        "number": 51,
+        "advisory": "GHSA-7mwm-ghpf-9vrm",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-7mwm-ghpf-9vrm"
+      },
+      {
+        "number": 50,
+        "advisory": "GHSA-4558-3h8r-v8xp",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-4558-3h8r-v8xp"
+      },
+      {
+        "number": 49,
+        "advisory": "GHSA-w889-685w-c8fh",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-w889-685w-c8fh"
+      },
+      {
+        "number": 48,
+        "advisory": "GHSA-58r4-6rv3-gfh8",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-58r4-6rv3-gfh8"
+      },
+      {
+        "number": 47,
+        "advisory": "GHSA-65qm-jvmh-6pqg",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-65qm-jvmh-6pqg"
+      },
+      {
+        "number": 46,
+        "advisory": "GHSA-vx6w-vv9f-6gvg",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-vx6w-vv9f-6gvg"
+      },
+      {
+        "number": 45,
+        "advisory": "GHSA-q45j-58j2-45rg",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-q45j-58j2-45rg"
+      },
+      {
+        "number": 44,
+        "advisory": "GHSA-pchr-8j38-3x4p",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-pchr-8j38-3x4p"
+      },
+      {
+        "number": 43,
+        "advisory": "GHSA-p4wg-p73j-c528",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-p4wg-p73j-c528"
+      },
+      {
+        "number": 42,
+        "advisory": "GHSA-462x-pgg6-55fp",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-462x-pgg6-55fp"
+      },
+      {
+        "number": 41,
+        "advisory": "GHSA-c6hw-5grf-ff96",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-c6hw-5grf-ff96"
+      },
+      {
+        "number": 40,
+        "advisory": "GHSA-8g5g-8vmr-9782",
+        "package": "pillow",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-8g5g-8vmr-9782"
+      },
+      {
+        "number": 39,
+        "advisory": "GHSA-g6cj-pr64-35w5",
+        "package": "cryptography",
+        "manifest": "requirements-ci.txt",
+        "baseline_repository_pin": "49.0.0",
+        "fixed_version": "50.0.2",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-g6cj-pr64-35w5"
+      },
+      {
+        "number": 38,
+        "advisory": "GHSA-654x-cwwv-5j9c",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-654x-cwwv-5j9c"
+      },
+      {
+        "number": 37,
+        "advisory": "GHSA-78g4-xqwv-q3g8",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-78g4-xqwv-q3g8"
+      },
+      {
+        "number": 36,
+        "advisory": "GHSA-g7cr-3p24-7wf7",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-g7cr-3p24-7wf7"
+      },
+      {
+        "number": 35,
+        "advisory": "GHSA-9v9v-9qvf-h2hj",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-9v9v-9qvf-h2hj"
+      },
+      {
+        "number": 34,
+        "advisory": "GHSA-g4qv-2jxx-769h",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-g4qv-2jxx-769h"
+      },
+      {
+        "number": 33,
+        "advisory": "GHSA-3j72-p6qg-6xp7",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-3j72-p6qg-6xp7"
+      },
+      {
+        "number": 32,
+        "advisory": "GHSA-4rm8-3hmm-39fg",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-4rm8-3hmm-39fg"
+      },
+      {
+        "number": 31,
+        "advisory": "GHSA-mrfp-p49p-3hf2",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-mrfp-p49p-3hf2"
+      },
+      {
+        "number": 30,
+        "advisory": "GHSA-v9pv-5gc8-w2m6",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-v9pv-5gc8-w2m6"
+      },
+      {
+        "number": 29,
+        "advisory": "GHSA-24rc-8hj2-v98c",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-24rc-8hj2-v98c"
+      },
+      {
+        "number": 28,
+        "advisory": "GHSA-g842-9rc4-69pw",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-g842-9rc4-69pw"
+      },
+      {
+        "number": 27,
+        "advisory": "GHSA-p8hx-v2p6-rp84",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-p8hx-v2p6-rp84"
+      },
+      {
+        "number": 26,
+        "advisory": "GHSA-332p-7hrc-92wf",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-332p-7hrc-92wf"
+      },
+      {
+        "number": 25,
+        "advisory": "GHSA-4rr5-89j8-mwwm",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-4rr5-89j8-mwwm"
+      },
+      {
+        "number": 24,
+        "advisory": "GHSA-f2g6-542v-9j58",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-f2g6-542v-9j58"
+      },
+      {
+        "number": 23,
+        "advisory": "GHSA-5xm2-6676-qcp9",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-5xm2-6676-qcp9"
+      },
+      {
+        "number": 22,
+        "advisory": "GHSA-gg2r-wvfm-q9rx",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-gg2r-wvfm-q9rx"
+      },
+      {
+        "number": 21,
+        "advisory": "GHSA-jg86-v3jv-hrpm",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-jg86-v3jv-hrpm"
+      },
+      {
+        "number": 20,
+        "advisory": "GHSA-254f-3936-288h",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-254f-3936-288h"
+      },
+      {
+        "number": 19,
+        "advisory": "GHSA-rfgq-q3w2-pmv2",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-rfgq-q3w2-pmv2"
+      },
+      {
+        "number": 18,
+        "advisory": "GHSA-74r2-7ff9-mjj2",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-74r2-7ff9-mjj2"
+      },
+      {
+        "number": 17,
+        "advisory": "GHSA-22hg-r758-rrw9",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-22hg-r758-rrw9"
+      },
+      {
+        "number": 16,
+        "advisory": "GHSA-fc9g-5qg7-mf45",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-fc9g-5qg7-mf45"
+      },
+      {
+        "number": 15,
+        "advisory": "GHSA-cp9v-662q-vvx9",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-cp9v-662q-vvx9"
+      },
+      {
+        "number": 14,
+        "advisory": "GHSA-j4m9-6w36-pw47",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-j4m9-6w36-pw47"
+      },
+      {
+        "number": 13,
+        "advisory": "GHSA-w889-685w-c8fh",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-w889-685w-c8fh"
+      },
+      {
+        "number": 12,
+        "advisory": "GHSA-65qm-jvmh-6pqg",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-65qm-jvmh-6pqg"
+      },
+      {
+        "number": 11,
+        "advisory": "GHSA-q45j-58j2-45rg",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-q45j-58j2-45rg"
+      },
+      {
+        "number": 10,
+        "advisory": "GHSA-p4wg-p73j-c528",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-p4wg-p73j-c528"
+      },
+      {
+        "number": 9,
+        "advisory": "GHSA-462x-pgg6-55fp",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-462x-pgg6-55fp"
+      },
+      {
+        "number": 8,
+        "advisory": "GHSA-c6hw-5grf-ff96",
+        "package": "pillow",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "12.3.0",
+        "fixed_version": "13.0.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-c6hw-5grf-ff96"
+      },
+      {
+        "number": 7,
+        "advisory": "GHSA-g6cj-pr64-35w5",
+        "package": "cryptography",
+        "manifest": "pyproject.toml",
+        "baseline_repository_pin": "49.0.0",
+        "fixed_version": "50.0.2",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-g6cj-pr64-35w5"
+      },
+      {
+        "number": 5,
+        "advisory": "GHSA-x9r9-c232-4q39",
+        "package": "transformers",
+        "manifest": "deployment/translation/requirements.txt",
+        "baseline_repository_pin": "4.57.6",
+        "fixed_version": "5.17.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-x9r9-c232-4q39"
+      },
+      {
+        "number": 4,
+        "advisory": "GHSA-xrqw-3rrv-vx5w",
+        "package": "transformers",
+        "manifest": "deployment/translation/requirements.txt",
+        "baseline_repository_pin": "4.57.6",
+        "fixed_version": "5.17.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-xrqw-3rrv-vx5w"
+      },
+      {
+        "number": 3,
+        "advisory": "GHSA-fgcw-684q-jj6r",
+        "package": "transformers",
+        "manifest": "deployment/translation/requirements.txt",
+        "baseline_repository_pin": "4.57.6",
+        "fixed_version": "5.17.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-fgcw-684q-jj6r"
+      },
+      {
+        "number": 2,
+        "advisory": "GHSA-29pf-2h5f-8g72",
+        "package": "transformers",
+        "manifest": "deployment/translation/requirements.txt",
+        "baseline_repository_pin": "4.57.6",
+        "fixed_version": "5.17.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-29pf-2h5f-8g72"
+      },
+      {
+        "number": 1,
+        "advisory": "GHSA-69w3-r845-3855",
+        "package": "transformers",
+        "manifest": "deployment/translation/requirements.txt",
+        "baseline_repository_pin": "4.57.6",
+        "fixed_version": "5.17.0",
+        "classification": "confirmed_vulnerable_dependency_version_updated",
+        "advisory_url": "https://github.com/advisories/GHSA-69w3-r845-3855"
+      }
+    ],
+    "advisories": [
+      {
+        "ghsa": "GHSA-22hg-r758-rrw9",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-22hg-r758-rrw9",
+        "vulnerable_range": ">= 7.2.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-24rc-8hj2-v98c",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-24rc-8hj2-v98c",
+        "vulnerable_range": ">= 9.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-254f-3936-288h",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-254f-3936-288h",
+        "vulnerable_range": ">= 5.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-27h8-gf7j-v5hc",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-27h8-gf7j-v5hc",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-29pf-2h5f-8g72",
+        "package": "transformers",
+        "source_url": "https://github.com/advisories/GHSA-29pf-2h5f-8g72",
+        "vulnerable_range": "< 5.3.0",
+        "target": "5.17.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-332p-7hrc-92wf",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-332p-7hrc-92wf",
+        "vulnerable_range": ">= 2.0.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-3j72-p6qg-6xp7",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-3j72-p6qg-6xp7",
+        "vulnerable_range": "< 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-4558-3h8r-v8xp",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-4558-3h8r-v8xp",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-462x-pgg6-55fp",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-462x-pgg6-55fp",
+        "vulnerable_range": ">= 8.2.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-4rm8-3hmm-39fg",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-4rm8-3hmm-39fg",
+        "vulnerable_range": "< 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-4rr5-89j8-mwwm",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-4rr5-89j8-mwwm",
+        "vulnerable_range": ">= 11.3.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-58r4-6rv3-gfh8",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-58r4-6rv3-gfh8",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-5x8w-8jj5-q52h",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-5x8w-8jj5-q52h",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-5xm2-6676-qcp9",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-5xm2-6676-qcp9",
+        "vulnerable_range": ">= 8.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-654x-cwwv-5j9c",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-654x-cwwv-5j9c",
+        "vulnerable_range": ">= 11.2.1, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-65qm-jvmh-6pqg",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-65qm-jvmh-6pqg",
+        "vulnerable_range": ">= 9.2.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-69w3-r845-3855",
+        "package": "transformers",
+        "source_url": "https://github.com/advisories/GHSA-69w3-r845-3855",
+        "vulnerable_range": "< 5.0.0rc3",
+        "target": "5.17.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-6q48-6c7w-9gw2",
+        "package": "certifi",
+        "source_url": "https://github.com/advisories/GHSA-6q48-6c7w-9gw2",
+        "vulnerable_range": ">= 2019.03.09, < 2026.10.18",
+        "target": "2026.10.23",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-74r2-7ff9-mjj2",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-74r2-7ff9-mjj2",
+        "vulnerable_range": ">= 5.4.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-78g4-xqwv-q3g8",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-78g4-xqwv-q3g8",
+        "vulnerable_range": ">= 11.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-7mwm-ghpf-9vrm",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-7mwm-ghpf-9vrm",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-8g5g-8vmr-9782",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-8g5g-8vmr-9782",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-9v9v-9qvf-h2hj",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-9v9v-9qvf-h2hj",
+        "vulnerable_range": "< 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-c6hw-5grf-ff96",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-c6hw-5grf-ff96",
+        "vulnerable_range": ">= 8.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-cp9v-662q-vvx9",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-cp9v-662q-vvx9",
+        "vulnerable_range": ">= 12.0.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-f2g6-542v-9j58",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-f2g6-542v-9j58",
+        "vulnerable_range": ">= 5.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-fc9g-5qg7-mf45",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-fc9g-5qg7-mf45",
+        "vulnerable_range": ">= 9.2.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-fgcw-684q-jj6r",
+        "package": "transformers",
+        "source_url": "https://github.com/advisories/GHSA-fgcw-684q-jj6r",
+        "vulnerable_range": "< 5.5.0",
+        "target": "5.17.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-g4qv-2jxx-769h",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-g4qv-2jxx-769h",
+        "vulnerable_range": ">= 11.0.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-g6cj-pr64-35w5",
+        "package": "cryptography",
+        "source_url": "https://github.com/advisories/GHSA-g6cj-pr64-35w5",
+        "vulnerable_range": ">= 44.0.0, < 50.0.0",
+        "target": "50.0.2",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-g7cr-3p24-7wf7",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-g7cr-3p24-7wf7",
+        "vulnerable_range": ">= 9.4.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-g842-9rc4-69pw",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-g842-9rc4-69pw",
+        "vulnerable_range": "< 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-gg2r-wvfm-q9rx",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-gg2r-wvfm-q9rx",
+        "vulnerable_range": ">= 4.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-j4m9-6w36-pw47",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-j4m9-6w36-pw47",
+        "vulnerable_range": ">= 10.0.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-jg86-v3jv-hrpm",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-jg86-v3jv-hrpm",
+        "vulnerable_range": ">= 5.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-mrfp-p49p-3hf2",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-mrfp-p49p-3hf2",
+        "vulnerable_range": ">= 5.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-p4wg-p73j-c528",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-p4wg-p73j-c528",
+        "vulnerable_range": ">= 5.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-p8hx-v2p6-rp84",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-p8hx-v2p6-rp84",
+        "vulnerable_range": "< 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-pchr-8j38-3x4p",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-pchr-8j38-3x4p",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-q45j-58j2-45rg",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-q45j-58j2-45rg",
+        "vulnerable_range": ">= 5.3.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-rfgq-q3w2-pmv2",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-rfgq-q3w2-pmv2",
+        "vulnerable_range": ">= 9.1.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-v9pv-5gc8-w2m6",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-v9pv-5gc8-w2m6",
+        "vulnerable_range": ">= 11.0.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-vx6w-vv9f-6gvg",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-vx6w-vv9f-6gvg",
+        "vulnerable_range": ">= 2.3.0, <= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-w889-685w-c8fh",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-w889-685w-c8fh",
+        "vulnerable_range": ">= 2.6.0, < 13.0.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-x9r9-c232-4q39",
+        "package": "transformers",
+        "source_url": "https://github.com/advisories/GHSA-x9r9-c232-4q39",
+        "vulnerable_range": ">= 4.49.0, <= 5.8.1",
+        "target": "5.17.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-xcq7-p3pf-p88h",
+        "package": "opentelemetry-api",
+        "source_url": "https://github.com/advisories/GHSA-xcq7-p3pf-p88h",
+        "vulnerable_range": "<= 1.45.0",
+        "target": "1.45.2",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-xgh8-jp6q-p5x8",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-xgh8-jp6q-p5x8",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-xmj3-9gf7-h52w",
+        "package": "setuptools",
+        "source_url": "https://github.com/advisories/GHSA-xmj3-9gf7-h52w",
+        "vulnerable_range": ">= 38.2.2, < 84.1.0",
+        "target": "84.2.1",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-xrqw-3rrv-vx5w",
+        "package": "transformers",
+        "source_url": "https://github.com/advisories/GHSA-xrqw-3rrv-vx5w",
+        "vulnerable_range": "< 5.10.0",
+        "target": "5.17.0",
+        "target_outside_affected_range": true
+      },
+      {
+        "ghsa": "GHSA-xvh5-g6gv-559v",
+        "package": "pillow",
+        "source_url": "https://github.com/advisories/GHSA-xvh5-g6gv-559v",
+        "vulnerable_range": "<= 12.3.0",
+        "target": "13.0.0",
+        "target_outside_affected_range": true
+      }
+    ],
+    "compatibility_pin": {
+      "huggingface-hub": "1.33.0"
+    },
+    "transformers_fix_release_proof": {
+      "commit": "cbc1651a032b923da7f4b44b3d0e6f68e6ba6b55",
+      "selected_release": "v5.17.0",
+      "status": "ahead",
+      "ahead_by": 8,
+      "behind_by": 0,
+      "source_url": "https://api.github.com/repos/huggingface/transformers/compare/cbc1651a032b923da7f4b44b3d0e6f68e6ba6b55...v5.17.0",
+      "v5.10.0_status": "diverged",
+      "v5.10.0_behind_by": 974,
+      "source_order_verification": {
+        "v5.10.0": {
+          "source_url": "https://github.com/huggingface/transformers/blob/v5.10.0/src/transformers/generation/utils.py",
+          "cache_download_line": 465,
+          "trust_consent_line": 480,
+          "download_precedes_consent": true
+        },
+        "v5.17.0": {
+          "source_url": "https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/generation/utils.py",
+          "trust_consent_line": 630,
+          "cache_download_line": 639,
+          "consent_precedes_download": true
+        }
+      }
+    },
+    "original_alert_6": {
+      "state_before_this_fix": "fixed",
+      "fixed_at": "2026-11-01T12:49:12Z",
+      "advisory": "GHSA-xmj3-9gf7-h52w",
+      "note": "The same advisory was still present for the explicit CI setuptools pin (alert 80), fixed by this change."
+    }
+  },
+  "verification": {
+    "core_pinned_dependencies_audited": 55,
+    "core_known_advisory_count": 0,
+    "translation_resolved_dependencies_audited_without_torch": 37,
+    "translation_known_advisory_count_in_audited_subset": 0,
+    "fernet_49_0_0_to_50_0_2_bidirectional_fixture": "passed",
+    "live_models_or_conversion_tested": false,
+    "regression_modules": [
+      "tests/test_security_paths.py",
+      "tests/test_security_flow_guards.py"
+    ]
+  },
+  "limits": [
+    "CodeQL false positives are separate from confirmed bugs; dismissal does not weaken queries or branch rules.",
+    "Filesystem containment is not a claim of immunity to a privileged local writer racing path resolution.",
+    "Torch, model loading and real conversion were not run; translation checks cover the audited non-Torch dependency subset and offline imports.",
+    "This report contains no actual credentials, cookies or private runtime files; raw SARIF/advisories/logs stay in ignored local audit storage."
+  ]
+}
