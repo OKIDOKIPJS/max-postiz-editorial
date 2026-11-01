@@ -114,7 +114,7 @@ compose-файлов. Его `image` — полный `EDITORIAL_POSTIZ_IMAGE`, 
 не является разрешённым шагом и перенос остаётся `NOT_ACCEPTED`.
 
 Только после принятия безопасного startup, проверки паузы/backups и нового
-разрешения владельца:
+разрешения владельца, а также подготовки host-сервиса по разделу ниже:
 
 ```bash
 bash deployment/linux/postiz-release.sh --up
@@ -145,6 +145,85 @@ Source ZIP сначала распаковывается отдельно, а н
 прохождения source guard. Несовпадение source/runtime policy требует отдельной
 аудируемой миграции с сохранением прежних hashes; приватные политики не отправляются в CI.
 
+**Обновить нужно и host-сервис, и Postiz.** Docker archive содержит Postiz, но не
+Python virtualenv, host Chrome, авторизованные профили или systemd-конфигурацию.
+`postiz-release.sh --up` заменяет только контейнер Postiz; он не устанавливает
+новые owner API в уже работающий старый Python-процесс. После отдельного разрешения
+на перенос выполнить следующий порядок с существующими приватными настройками:
+
+1. Сохранить приватный снимок состояния и backups, убедиться в общей паузе и паузе
+   всех адресатов. Дождаться отсутствия активных model/send/mutation claims и
+   владельцев; неизвестные исходы сохранить. Только после этого остановить
+   **существующий** `max-postiz-editorial.service` на короткое окно обновления.
+   Не запускать второй `serve`, старый Hub или desktop worker.
+2. Перенести проверенные публичные файлы принятого source в `/opt/max-postiz`
+   адресным diff, сохраняя `.env.local`, deployment env, конфигурации, `TOPIC.md`,
+   пути профилей, uploads, runtime/journals и права `editorial`. При конфликте
+   остановиться и согласовать миграцию; не заменять настройки безопасным примером.
+   Сохранить прежний virtualenv/список пакетов для отката. Новый source и wheel
+   должны относиться к одному принятому дереву; проверить их manifest/SHA до установки.
+3. От пользователя `editorial`, из `/opt/max-postiz`, обновить зависимости Python
+   3.12+ по закреплённым lock-файлам и установить именно проверенный wheel. Эти
+   команды не запускают сервис, миграцию или публикацию:
+
+   ```bash
+   .venv/bin/python -m pip --isolated install --index-url https://pypi.org/simple \
+     -r requirements.lock -r requirements-browser.lock -r requirements-deployment.lock
+   .venv/bin/python -m pip --isolated install --no-index --no-deps --force-reinstall \
+     '/private/release/<проверенный wheel принятого source>'
+   .venv/bin/python -m pip check
+   .venv/bin/python -c "import importlib.metadata as m, max_postiz_agent as a; print(a.__version__); print(m.version('max-postiz-agent')); print(a.__file__)"
+   .venv/bin/python -m max_postiz_agent.server_cli --root /opt/max-postiz status
+   ```
+
+   Проверить обе версии и фактический путь импорта. Старый editable install или
+   другой интерпретатор не должны незаметно оставить прежнюю реализацию API.
+4. `status` проверяет схему без её изменения. Если получен
+   `SERVER_MIGRATION_REQUIRED` или `EDITORIAL_MIGRATION_REQUIRED`, сначала проверить необходимые Alembic heads и
+   перенос ledger на восстановленном клоне существующей БД. Только после принятия
+   этого результата и backup выполнить отдельную миграцию:
+
+   ```bash
+   .venv/bin/python -m max_postiz_agent.server_cli --root /opt/max-postiz migrate
+   .venv/bin/python -m max_postiz_agent.server_cli --root /opt/max-postiz status
+   ```
+
+   `migrate` не синхронизирует адресатов и не включает отправку. Если он отказал
+   из-за outstanding/unknown delivery, не очищать её ради установки: сохранить
+   результат и остановить перенос до отдельного плана сверки. Ошибка команды не
+   доказывает отсутствие уже выполненных изменений схемы: перед любым повтором
+   отдельно сверить фактические heads и ledger. Также отдельно
+   проверить совместимость **существующей Postiz БД** с новой Prisma-схемой на
+   клоне. При необходимости изменения схемы нужен отдельный проверенный план;
+   обычный startup не выполняет `db push`.
+5. Проверить Linux browser runtime от пользователя `editorial`: закреплённый
+   Playwright из `requirements-browser.lock`, установленный Chrome для выбранного
+   `channel` либо его фактический `PLAYWRIGHT_BROWSERS_PATH`, доступные этому
+   пользователю бинарники, каталог профиля и его владельца. Если используется
+   системный Chrome, пользовательский Playwright cache его не заменяет.
+   `deployment/linux/install-browser.sh` — отдельная установка при отсутствии
+   Chrome: она пишет `max.browser.channel=chrome` и вызывает `try-restart`.
+   Применять её только при уже остановленном editorial-сервисе и соответствии
+   этого channel переносимой конфигурации. Не переносить Windows cookies и не
+   отключать sandbox. Нативный CI доказывает механизм запуска, а не авторизацию
+   Linux-аккаунтов владельца.
+6. Установить/проверить owner-portal units и активный proxy по порядку ниже,
+   выполнить `postiz-release.sh --check` и разрешённый `--up`. После этого запустить
+   только фиксированный редакционный сервис и проверить его поколение конфигурации:
+
+   ```bash
+   sudo systemctl restart max-postiz-editorial.service
+   curl --fail --silent http://127.0.0.1:8092/health
+   .venv/bin/python -m max_postiz_agent.server_cli --root /opt/max-postiz status
+   ```
+
+   Health должен показывать принятую версию, `interface=postiz_only` и
+   `worker_mode=autonomous`; это не разрешение работы цикла. В owner-сеансе Postiz
+   сверить настройки/адресатов, сохранённую общую паузу и `restart.required=false`
+   в route setup. Сравнить историю, attempts/unknown и отсутствие новых claims
+   с исходным снимком. При ошибке версии, schema, generation или bindings не
+   включать цикл и не исправлять состояние удалением записей.
+
 Не использовать этот документ как fresh-install рецепт: новый пустой CI стенд
 явно получает `publishing.targets=[]` и `tasks=[]` до первой миграции. **При переносе
 существующей VM эти массивы и существующие строки не очищаются.**
@@ -154,6 +233,33 @@ Source ZIP сначала распаковывается отдельно, а н
 Python login/restart helpers работают от `editorial`, а не от root. Установка
 проверяется `install-owner-portals.sh --check`; `--install` — отдельный разрешённый
 операторский шаг. Не импортировать Python проекта от root в привилегированные helpers.
+
+Установщик owner portal сохраняет nginx-шаблон в
+`/etc/max-postiz/editorial-postiz.nginx.conf`, **но не включает его**. Замена образа
+через `postiz-release.sh --up` также не обновляет активный публичный proxy. До
+проверки панели оператор отдельно применяет proxy-конфигурацию на разрешённой VM:
+
+1. Выполнить `nginx -T` и определить фактические файлы и включения, обслуживающие
+   именно `http://10.20.30.45:4007`. Вывод может содержать приватные настройки:
+   сохранить его только в локальном файле с правами `0600`, не в CI или публичном
+   отчёте. Не предполагать путь active config по имени шаблона.
+2. Снять приватную копию всех затрагиваемых файлов вместе с владельцами и правами.
+   Сопоставить активный listener с
+   `deployment/linux/editorial-postiz.nginx.conf` принятого source. Внести адресный
+   diff в существующий server block: owner auth, `/owner-browser/` и точный
+   `/api/editorial/route-admin` с лимитом `15m` должны соответствовать шаблону.
+   Сохранить остальные listeners и не создавать второй конкурирующий server для
+   того же адреса. Для общего файла с несколькими server blocks требуется ручное
+   слияние; целиком заменять его шаблоном нельзя.
+3. Выполнить `nginx -t`; только при успехе — `systemctl reload nginx`. Проверить
+   тот же HTTP origin и owner-session guards. При ошибке конфигурации reload не
+   выполнять; при сбое после reload восстановить сохранённые файлы, вновь
+   выполнить `nginx -t` и только затем reload прежней конфигурации.
+
+Не запускать старый `network-and-tools.sh` для этой операции: он целиком создаёт
+прежний site config и меняет другие системные настройки. Без отдельного применения
+и проверки active proxy перенос панели, загрузки изображения и owner portal
+не считается завершённым.
 
 В Postiz владелец использует свой cookie-сеанс и выбранный target:
 
