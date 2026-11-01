@@ -1,5 +1,31 @@
 # История версий
 
+## 0.13.3 — 2026-11-02: явные часы семантических VK-fixtures
+
+- CI 1672151 подтвердил normal 7042 passed/35 skips и согласованный Windows
+  partition: все 7077 случаев распределены ровно один раз. PG full и coverage
+  выявили три отказа ACTION_AUTHORIZATION_EXPIRED при подготовке fake fixture,
+  до проверяемых изменений автора/поста/изображения. Все 11 PG cases прошли;
+  старый общий CI остаётся FAILED. Диагностика не устанавливает конкретную
+  операцию, израсходовавшую окно авторизации; production fail-closed не меняется.
+- Private clock вынесен в общий неавтоматический test helper. По независимому
+  аудиту он явно подключён к 52 generic functions/98 cases и 5 native groups/9
+  cases, проверяющим содержимое/identity/media/reconciliation с fake SQL authority.
+  Чистые preflight/read-only/mock tests, real expiry/late-query и три controlled
+  expiry cases не включены. Все исходные данные и assertions сохранены.
+- Native actions по-прежнему получают реальный timeout не более 1000 мс;
+  readiness/decode/result/readback clocks и бюджеты не изменены. Реальный
+  late-query test дополнительно фиксирует original budgets 1..1000 и передаёт
+  те же значения действию. Production-код, workflow и строгие gates неизменны.
+- Helper включён в MANIFEST.in для воспроизводимого source-distribution QA.
+  Полный Windows VK/browser-image набор: 350 passed, 0 skips. Ruff, ограниченный
+  formatter и diff check прошли; независимое AST-ревью подтвердило границу
+  fixture и неизменность проверок. Отдельный Linux/coverage и новый полный
+  canonical/платформенный CI выполняются для итогового SHA перед merge.
+- Локальные browser QA выполняются последовательно; старые отчёты ошибок
+  сохранены отдельно. Рабочий сервер, действующий MAX-профиль и его runtime
+  не изменяются, новая живая доставка и развёртывание не заявляются.
+
 ## 0.13.3 — 2026-11-02: стабильные идентификаторы полного Windows-набора
 
 - CI 78d4d1c завершил все тестовые jobs успешно: normal/coverage 7041 passed,
