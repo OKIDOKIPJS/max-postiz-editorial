@@ -324,7 +324,8 @@ def test_changed_chat_kind_account_or_title_blocks_whole_batch(monitor, dom_page
     (message(timestamp="9999-12-31T00:00:00+00:00"), "TIMESTAMP_INVALID"),
     (message(reply="invalid/../id"), "REPLY_INVALID"),
     (message(ident="../id"), "MESSAGE_INVALID"),
-])
+], ids=["duplicate-message", "invalid-sender", "relative-timestamp", "timestamp-without-timezone",
+        "out-of-range-timestamp", "invalid-reply-id", "invalid-message-id"])
 def test_unstable_identity_time_or_reply_is_not_exported(monitor, dom_page, content, code):
     serve(dom_page, control_html(content))
     with pytest.raises(AgentError, match="MONITOR_CONTROL_" + code):
@@ -336,7 +337,7 @@ def test_unstable_identity_time_or_reply_is_not_exported(monitor, dom_page, cont
     message().replace('class="text"', 'class="text" style="display:none"'),
     message().replace('class="message"', 'class="message" style="display:none"'),
     message() + '<div id="chat" data-chat-id="-908" data-chat-kind="chat"></div>',
-])
+], ids=["duplicate-sender", "hidden-caption", "hidden-message", "duplicate-chat-root"])
 def test_ambiguous_or_hidden_dom_fails_closed(monitor, dom_page, content):
     serve(dom_page, control_html(content))
     with pytest.raises(AgentError, match="MONITOR_CONTROL_DOM_INVALID"):
