@@ -631,7 +631,7 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
         self.frontend = self.container("frontend", self.image, env=environment, entrypoint="node", memory="1536m", swap="3g",
             extra=["--tmpfs", "/app/apps/frontend/.next/cache:rw,nosuid,nodev,size=128m"],
             volumes=[self.upload_volume + ":/uploads"],
-            command=["/app/node_modules/next/dist/bin/next", "start", "/app/apps/frontend", "-p", "4200", "-H", "127.0.0.1"])
+            command=["/app/node_modules/next/dist/bin/next", "start", "/app/apps/frontend", "-p", "4200", "--hostname", "127.0.0.1"])
         proxy_dir = self.engine.root / "proxy"
         proxy_dir.mkdir()
         outer = (self.project / "deployment/linux/editorial-postiz.nginx.conf").read_text()

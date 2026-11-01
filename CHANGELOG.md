@@ -1,5 +1,22 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: нативная сборка подтверждена, исправлен argv стенда
+
+- R4 run 41356345817 подтвердил реальные RUN-лимиты 6 GiB RAM / 4 GiB swap /
+  4 CPU и lo-only сеть на собственном Docker 29.9.2 / BuildKit 0.34. Полностью
+  собраны backend, orchestrator и Next webpack/TypeScript; проверены native
+  artifacts, CSS и безопасный CMD. Получен image
+  sha256:5df50071b1468c11b074af60dd69689978254f78a5a48a8c655537143fe573f8.
+- Свежие PostgreSQL/Redis/Temporal/Elasticsearch готовы. Позднее native run
+  остановился до owner-authentication: Next hostname shorthand -H был отклонён
+  общим запретом Docker host overrides. В argv стенда использован --hostname;
+  Engine guard не ослаблен, production Node sources не менялись.
+- R4 не принят целиком: owner/BFF/restart/restore/default-startup приёмка и
+  portable export в нём не завершены. Для нового commit требуются полный
+  native run и CI; успешный build сам по себе не объявляется полной готовностью.
+  CodeQL всех языков и PostgreSQL CI текущего R4 прошли; local Ruff/diff-check
+  узкой argv-правки прошли. Рабочий сервер и Пикабу не изменялись.
+
 ## 0.14.0 — 2026-11-02: явный TLS для временного набора Docker
 
 - После CodeQL на следующем кандидате в downloader явно зафиксирован минимум
