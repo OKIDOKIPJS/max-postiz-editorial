@@ -75,9 +75,11 @@ def test_login_wrong_heading_missing_permission_or_ambiguous_header_fail_without
     settings, page, requests = channel
     monkeypatch.setattr(browser_runtime, "_CHANNEL_READY_TIMEOUT_MS", 150)
     route(page, content)
+    # Fixture navigation has its own startup budget; classification still has 150 ms.
+    page.goto("https://web.max.ru/-123", wait_until="domcontentloaded", timeout=5000)
     started = time.monotonic()
     with pytest.raises(AgentError, match="^" + code + "$"):
-        browser_runtime.ensure_channel(page, settings, "-123")
+        browser_runtime.ensure_channel(page, settings, "-123", navigate=False)
     assert time.monotonic() - started < 2
     unchanged(page, requests)
 
