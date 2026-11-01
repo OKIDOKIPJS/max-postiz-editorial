@@ -108,6 +108,19 @@ document.getElementById('publish').onclick=async()=>{
 };
 window.clicks=0;window.fills=0;window.opens=0;window.nexts=0;
 """
+    if getattr(state, "preview_photo_delay_ms", 0) or getattr(state, "preview_photo_invalid", False):
+        code = code.replace(
+            "document.getElementById('preview-images').innerHTML=document.getElementById('uploaded').innerHTML;",
+            "document.getElementById('preview-images').innerHTML=document.getElementById('uploaded').innerHTML.replace('/photo.png','/photo.png?preview-load=1');")
+    preview_change = getattr(state, "preview_wait_change", None)
+    if preview_change:
+        mutation = {
+            "account": "document.querySelector('[data-testid=header-profile-menu-button]').href='/id999999';",
+            "text": "document.getElementById('preview-text').textContent='Unapproved changed preview';",
+            "image": "document.querySelector('#preview-images img').src='/changed-preview.png';",
+        }[preview_change]
+        code += ("new MutationObserver(()=>setTimeout(()=>{" + mutation
+                 + "},50)).observe(document.getElementById('preview-images'),{childList:true});")
     if any(getattr(state, name, 0) for name in (
             "editor_mount_delay_ms", "next_ready_delay_ms", "story_aria_delay_ms")):
         code += r"""
@@ -194,7 +207,7 @@ def local_vk(sample):
     state = SimpleNamespace(destination=OWNER, raw=sample.raw, uploads=0, publishes=0, posts=[],
                             gets=[], wrong_owner=False, corrupt_readback=False, bad_photo=False,
                             drop_reply=False, redirect_wrong_wall=False, post_author_override=None,
-                            personal=False, stories=0, publish_readiness=[])
+                            personal=False, stories=0, publish_readiness=[], preview_completions=[])
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -202,13 +215,22 @@ def local_vk(sample):
 
         def do_GET(self):
             state.gets.append(self.path)
+            preview_done = None
             if state.redirect_wrong_wall and self.path == "/id" + OWNER:
                 self.send_response(302)
                 self.send_header("Location", "/id999999")
                 self.end_headers()
                 return
-            if self.path.split("?", 1)[0] == "/photo.png":
-                raw = b"wrong photo" if state.bad_photo else state.raw
+            if self.path.split("?", 1)[0] in {"/photo.png", "/changed-preview.png"}:
+                if self.path == "/photo.png?preview-load=1":
+                    preview_done = threading.Event()
+                    state.preview_completions.append(preview_done)
+                    time.sleep(getattr(state, "preview_photo_delay_ms", 0) / 1000)
+                    raw = b"undecodable preview" if getattr(state, "preview_photo_invalid", False) else state.raw
+                elif self.path == "/changed-preview.png":
+                    raw = state.changed_preview_raw
+                else:
+                    raw = b"wrong photo" if state.bad_photo else state.raw
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
             else:
@@ -217,7 +239,11 @@ def local_vk(sample):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.wfile.write(raw)
+            finally:
+                if preview_done is not None:
+                    preview_done.set()
 
         def do_POST(self):
             raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -278,6 +304,21 @@ def page(browser):
 def run(page, sample, state, authorize=lambda: None):
     return worker.run_publish(page, sample.root, sample.options, sample.payload, authorize,
                               origin=state.origin, fixture=True)
+
+
+def publish_diagnostics(sample, state, result):
+    """Report synthetic fixture phase failures without dumping snapshot text."""
+    details = {"failure_code": result["evidence"].get("failure_code"),
+               "journal_state": result["evidence"].get("journal_state")}
+    try:
+        _, journal = worker._read(sample.root, sample.payload["request_id"])
+        details.update(last_action_intent=journal.get("last_action_intent"),
+                       private_error=journal.get("private_error"))
+    except (AgentError, OSError, ValueError) as exc:
+        details["diagnostic_error"] = type(exc).__name__
+    details.update(uploads=state.uploads, publishes=state.publishes,
+                   publish_readiness=state.publish_readiness, result=result)
+    return details
 
 
 def personal_wall(sample, state):
@@ -883,8 +924,62 @@ def test_full_long_article_and_unicode_title_survive_native_flow_without_truncat
     sample.snapshot["body"] = "Полный научный текст с точными наблюдениями. " * 60 + "\n\nИсточник: https://science.example.test/a"
     expected = sample.snapshot["title"] + "\n\n" + sample.snapshot["body"]
     result = run(page, sample, local_vk)
-    assert result["state"] == "confirmed" and local_vk.posts == [(expected, 51)]
+    assert result["state"] == "confirmed" and local_vk.posts == [(expected, 51)], publish_diagnostics(sample, local_vk, result)
     assert len(expected) > 2500 and result["evidence"]["proof"]["title_format"] == "plain"
+
+
+@pytest.mark.parametrize("long_article", [False, True])
+def test_preview_photo_decode_is_awaited_within_existing_budget_before_one_publish(
+        sample, local_vk, page, long_article):
+    local_vk.preview_photo_delay_ms = 400
+    if long_article:
+        sample.snapshot["title"] = "🔭 Космическое открытие"
+        sample.snapshot["body"] = "Полный научный текст с точными наблюдениями. " * 60
+    expected = sample.snapshot["title"] + "\n\n" + sample.snapshot["body"]
+    result = run(page, sample, local_vk)
+    assert result["state"] == "confirmed", publish_diagnostics(sample, local_vk, result)
+    assert result["external_id"] == OWNER + "_51" and result["verified"] is False
+    assert len(result["evidence"]["proof"]["reloads"]) == 2
+    assert local_vk.posts == [(expected, 51)] and local_vk.uploads == local_vk.publishes == 1
+    assert local_vk.preview_completions and all(done.wait(2) for done in local_vk.preview_completions)
+    assert sample.options["operation_timeout_seconds"] == 1
+
+
+def test_permanently_undecodable_preview_blocks_publish_and_never_reopens_unknown(sample, local_vk, page):
+    local_vk.preview_photo_invalid = True
+    result = run(page, sample, local_vk)
+    assert result["state"] == "unknown", publish_diagnostics(sample, local_vk, result)
+    assert result["evidence"]["failure_code"] == "VK_BROWSER_IMAGE_NOT_READY"
+    assert result["external_id"] is None and result["evidence"]["clicks"] == 0
+    assert local_vk.uploads == 1 and local_vk.publishes == 0 and not local_vk.publish_readiness
+    before = list(local_vk.gets)
+    repeated = run(page, sample, local_vk)
+    assert repeated["state"] == "unknown" and repeated["external_id"] is None
+    assert local_vk.gets == before and local_vk.uploads == 1 and local_vk.publishes == 0
+    assert sample.options["operation_timeout_seconds"] == 1
+
+
+@pytest.mark.parametrize("change,code", [
+    ("account", "VK_BROWSER_ACCOUNT_MISMATCH"),
+    ("text", "VK_BROWSER_PREVIEW_TEXT_MISMATCH"),
+    ("image", "VK_BROWSER_IMAGE_READBACK_MISMATCH"),
+])
+def test_preview_ready_wait_does_not_approve_changed_account_text_or_photo(
+        sample, local_vk, page, change, code):
+    local_vk.preview_photo_delay_ms = 400
+    local_vk.preview_wait_change = change
+    output = io.BytesIO()
+    Image.new("RGB", (640, 480), "red").save(output, format="PNG")
+    local_vk.changed_preview_raw = output.getvalue()
+    result = run(page, sample, local_vk)
+    assert result["state"] == "unknown", publish_diagnostics(sample, local_vk, result)
+    assert result["evidence"]["failure_code"] == code, publish_diagnostics(sample, local_vk, result)
+    assert result["external_id"] is None and result["evidence"]["clicks"] == 0
+    assert local_vk.uploads == 1 and local_vk.publishes == 0 and not local_vk.publish_readiness
+    assert all(done.wait(2) for done in local_vk.preview_completions)
+    before = list(local_vk.gets)
+    assert run(page, sample, local_vk)["state"] == "unknown"
+    assert local_vk.gets == before and local_vk.uploads == 1 and local_vk.publishes == 0
 
 
 def test_wrong_wall_redirect_is_blocked_before_editor_mutation(sample, local_vk, page):
@@ -1614,7 +1709,7 @@ def test_readback_rechecks_complete_post_after_image_get_on_each_reload(
     monkeypatch.setattr(worker, "_image_proof", read_old_image_then_swap)
     result = run(page, sample, local_vk)
     assert result["state"] == "unknown" and result["verified"] is False
-    assert result["external_id"] == OWNER + "_51"
+    assert result["external_id"] == OWNER + "_51", publish_diagnostics(sample, local_vk, result)
     assert result["evidence"]["proof"] is None
     assert len(readback_passes) == reload_pass
     assert local_vk.uploads == local_vk.publishes == 1

@@ -1,12 +1,15 @@
 """Реальный локальный PostgreSQL: один durable claim для двух обработчиков."""
 
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 from test_hub import approve, variants
 from max_postiz_agent.adapters import Delivery
@@ -20,10 +23,20 @@ pytest_plugins = ["test_four_platform_hub"]
 @pytest.fixture
 def postgres_routes(four_hub):
     url = os.getenv("TEST_DATABASE_URL", "")
-    parsed = urlsplit(url)
-    if (not url or parsed.hostname not in {"127.0.0.1", "localhost"}
-            or parsed.port != 55448 or parsed.path != "/editorial_hub_tests"):
-        pytest.skip("Dedicated copy-local PostgreSQL 55448 is not configured")
+    if not url:
+        pytest.skip("TEST_DATABASE_URL is not configured")
+    # An explicit dedicated test database replaces workstation-specific port pins.
+    # Reject unsafe values before creating an engine, without reporting credentials.
+    parsed = None
+    try:
+        parsed = make_url(url)
+    except (ArgumentError, ValueError):
+        pass
+    if (parsed is None or parsed.drivername != "postgresql+psycopg"
+            or not re.fullmatch(r"(?:test_[a-z0-9_]+|[a-z0-9_]+_tests)", parsed.database or "")
+            or parsed.query):
+        pytest.fail("Invalid TEST_DATABASE_URL; use an explicit PostgreSQL test database without query parameters (value withheld)",
+                    pytrace=False)
     admin = create_engine(url)
     schema = "routes_test_" + uid().replace("-", "")
     with admin.begin() as connection:

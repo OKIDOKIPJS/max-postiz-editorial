@@ -124,17 +124,17 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_DB: max_postiz_ci
+          POSTGRES_DB: max_postiz_tests
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ci-local-only
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d max_postiz_ci"
+          --health-cmd "pg_isready -U postgres -d max_postiz_tests"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
       # Это одноразовая БД GitHub runner; production URL и секреты не используются.
-      TEST_DATABASE_URL: postgresql+psycopg://postgres:ci-local-only@127.0.0.1:5432/max_postiz_ci
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:ci-local-only@127.0.0.1:5432/max_postiz_tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -162,6 +162,9 @@ jobs:
           tests/test_article_reserve_store.py
           tests/test_hourly_reserve_controller.py
           tests/test_reserve_preclick_recovery.py
+          tests/test_route_dispatch_postgres.py
+          tests/test_route_recovery.py
+          tests/test_route_postgres_config.py
           --basetemp=.test-state/pytest-postgres
           --junitxml=.test-state/postgres.xml -q
       - name: Save PostgreSQL test report
