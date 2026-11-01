@@ -617,15 +617,20 @@ test('historical fixture badge survives a target changing to live and has no pub
   const React = require(path.join(tooling, 'react'));
   const { renderToStaticMarkup } = require(path.join(tooling, 'react-dom/server'));
   const ui = routeUi();
+  const fixturePermalink = new URL('https://vk.ru/wall123456_51');
   for (const adapter_mode of ['fixture', 'browser', 'live']) {
     const markup = renderToStaticMarkup(React.createElement(ui.EditorialRoutes, { pending: false,
       inventory: { targets: [{ ...routeTarget, adapter_mode, route: 'vk_browser' }], variants: [], dispatches: [{
         id: 'fixture-history', target_id: 'vk_target', title: 'Local fixture', state: 'published',
         due_at: 1867111200, verified: true, evidence_kind: 'fixture', attempts: 1,
-        snapshot_hash: 'e'.repeat(64), permalink: 'https://vk.ru/wall123456_51' }] }, onAction: async () => true }));
+        snapshot_hash: 'e'.repeat(64), permalink: fixturePermalink.href }] }, onAction: async () => true }));
     assert.ok(markup.includes('Локальная проверка; живая доставка не проверена'));
     assert.ok(!markup.includes('API-квитанция')); assert.ok(!markup.includes('Доставка подтверждена'));
-    assert.ok(!markup.includes('Открыть публикацию')); assert.ok(!markup.includes('https://vk.ru/wall123456_51'));
+    assert.ok(!markup.includes('Открыть публикацию'));
+    const renderedUrls = [...markup.matchAll(/https?:\/\/[^\s<>"']+/g)]
+      .map(([value]) => new URL(value.replaceAll('&amp;', '&')));
+    assert.equal(renderedUrls.some(value => value.origin === fixturePermalink.origin
+      && value.pathname === fixturePermalink.pathname), false);
   }
 });
 

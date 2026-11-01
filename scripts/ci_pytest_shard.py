@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -89,6 +90,11 @@ def main(argv=None):
     )
     receipt = ShardReceipt(args.shard_index, args.shard_count, path, pytest_args)
     receipt.write()
+    # Direct script execution starts at scripts/, unlike python -m pytest.
+    # Keep the caller's project root importable for namespace helpers as well.
+    working_directory = str(Path.cwd())
+    if not sys.path or sys.path[0] != working_directory:
+        sys.path.insert(0, working_directory)
     # Failed tests, collection errors, interrupts and no-tests exit codes remain failures.
     result = int(pytest.main(pytest_args, plugins=[receipt]))
     # Usage errors can happen before pytest_sessionfinish is called.
