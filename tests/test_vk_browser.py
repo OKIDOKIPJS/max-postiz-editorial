@@ -283,6 +283,17 @@ def run(page, sample, state, authorize=lambda: None):
                               origin=state.origin, fixture=True)
 
 
+@pytest.fixture
+def semantic_fence_clock(monkeypatch):
+    """Remove fake SQL-authorizer IPC latency, keeping browser/result waits real."""
+    original_mutate = worker._mutate
+
+    def semantic_mutation(*args, **kwargs):
+        return original_mutate(*args, **kwargs, _clock=lambda: 0.0)
+
+    monkeypatch.setattr(worker, "_mutate", semantic_mutation)
+
+
 def personal_wall(sample, state):
     state.personal = True
     sample.snapshot["media"] = []
@@ -608,7 +619,7 @@ def test_personal_story_revoke_after_durable_intent_never_unchecks_or_publishes(
     assert run(page, sample, local_vk, authorize)["state"] == "unknown"
 
 
-def test_personal_story_reenabled_by_last_authorizer_prevents_click(sample, local_vk, page):
+def test_personal_story_reenabled_by_last_authorizer_prevents_click(sample, local_vk, page, semantic_fence_clock):
     personal_wall(sample, local_vk)
 
     def authorize():
@@ -673,7 +684,7 @@ def test_personal_story_refuses_to_disable_never_clicks_or_retries(sample, local
      "VK_BROWSER_ACCOUNT_MISMATCH"),
 ])
 def test_personal_last_authorizer_mutation_never_changes_wrong_editor_or_story(
-        sample, local_vk, page, phase, change, code):
+        sample, local_vk, page, semantic_fence_clock, phase, change, code):
     personal_wall(sample, local_vk)
 
     def authorize():
@@ -1011,7 +1022,7 @@ def test_publication_waits_for_native_spa_editor(sample, local_vk, page):
     (("editor", "next", "story"), "absent"),
 ])
 def test_personal_spa_transitions_wait_before_one_currently_authorized_publish(
-        sample, local_vk, page, transitions, next_mode):
+        sample, local_vk, page, semantic_fence_clock, transitions, next_mode):
     personal_wall(sample, local_vk)
     for name in transitions:
         setattr(local_vk, {"editor": "editor_mount_delay_ms", "next": "next_ready_delay_ms",
@@ -1047,7 +1058,7 @@ def test_personal_spa_transitions_wait_before_one_currently_authorized_publish(
 
 @pytest.mark.parametrize("transition", ["editor", "next", "story"])
 def test_pause_during_personal_spa_wait_prevents_publish_and_repeat(
-        sample, local_vk, page, transition):
+        sample, local_vk, page, semantic_fence_clock, transition):
     personal_wall(sample, local_vk)
     setattr(local_vk, {"editor": "editor_mount_delay_ms", "next": "next_ready_delay_ms",
                       "story": "story_aria_delay_ms"}[transition], 300)
@@ -1155,6 +1166,32 @@ def test_slow_fresh_authorization_expires_before_native_publish(sample, local_vk
     assert result["state"] == "unknown"
     assert result["evidence"]["failure_code"] == "VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED"
     assert local_vk.publishes == 0
+
+
+@pytest.mark.parametrize("phase,elapsed", [("authorize", 1.0), ("authorize", 1.25), ("final_stamp", 0.9995)])
+def test_injected_authorization_clock_expiry_prevents_native_action(monkeypatch, phase, elapsed):
+    current, actions = [10.0], []
+    stamps = []
+
+    def stamp(*_):
+        stamps.append(True)
+        if phase == "final_stamp" and len(stamps) == 3:
+            current[0] += elapsed
+        return "same-state"
+
+    monkeypatch.setattr(worker, "_mutation_stamp", stamp)
+    monkeypatch.setattr(worker, "_context", lambda *_a, **_k: None)
+
+    def authorize():
+        actions.append("authorize")
+        if phase == "authorize":
+            current[0] += elapsed
+
+    with pytest.raises(AgentError, match="VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED"):
+        worker._mutate(None, {}, {}, authorize, lambda: actions.append("check"),
+            lambda timeout: actions.append("native"), origin="https://vk.ru", _clock=lambda: current[0])
+    assert actions == ["check", "authorize"]
+    assert len(stamps) == (3 if phase == "final_stamp" else 2)
 
 
 def test_native_story_label_is_clicked_without_forcing_hidden_input(sample, local_vk, page):

@@ -341,23 +341,24 @@ def _mutation_stamp(page, selectors):
         raise AgentError("VK_BROWSER_MUTATION_STATE_UNAVAILABLE") from None
 
 
-def _mutate(page, plan, selectors, authorize, check, action, *, origin):
+def _mutate(page, plan, selectors, authorize, check, action, *, origin, _clock=None):
     """Expensive guards precede a fresh SQL fence and a bounded native action."""
     stamp = _mutation_stamp(page, selectors)
     _context(page, plan, selectors, origin=origin)
     check()
     if stamp != _mutation_stamp(page, selectors):
         raise AgentError("VK_BROWSER_STATE_CHANGED_DURING_GUARD")
-    deadline = time.monotonic() + 1
+    clock = time.monotonic if _clock is None else _clock
+    deadline = clock() + 1
     authorize()
-    if time.monotonic() >= deadline:
+    if clock() >= deadline:
         raise AgentError("VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED")
     if stamp != _mutation_stamp(page, selectors):
         # Keep precise account/text rejection when a callback changed the DOM.
         _context(page, plan, selectors, origin=origin)
         check()
         raise AgentError("VK_BROWSER_STATE_CHANGED_AFTER_AUTHORIZATION")
-    remaining = int((deadline - time.monotonic()) * 1000)
+    remaining = int((deadline - clock()) * 1000)
     if remaining < 1:
         raise AgentError("VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED")
     return action(min(1000, remaining))
