@@ -5,13 +5,24 @@ import os
 import re
 import time
 from contextlib import contextmanager
-from urllib.parse import urlsplit
 
 from .config import AgentError, inside
 
 
 ORIGIN = "https://web.max.ru"
 COMPOSER = '[contenteditable][role="textbox"][aria-placeholder="Пост"]'
+_CHANNEL_READY_TIMEOUT_MS = 30_000
+_CHANNEL_READY = """({url, title, composer}) => {
+  if (location.href !== url) return 'wrong_channel';
+  const headings = document.querySelectorAll('#main-header-title');
+  if (headings.length !== 1 || headings[0].innerText.trim() !== title) return false;
+  const editors = document.querySelectorAll(composer);
+  if (editors.length !== 1) return false;
+  const editor = editors[0], box = editor.getBoundingClientRect();
+  if (!editor.isContentEditable || editor.getAttribute('aria-disabled') === 'true'
+      || getComputedStyle(editor).visibility !== 'visible' || !box.width || !box.height) return false;
+  return 'ready';
+}"""
 
 
 # Удерживаем системную блокировку профиля на время работы с браузером.
@@ -115,35 +126,50 @@ def session(settings, *, visible=False):
 # Сверяем URL, точное название и доступ к целевому каналу.
 def ensure_channel(page, settings, chat_id, *, navigate=True):
     expected = channel_name(settings, chat_id)
-    # Обрабатываем ветвь при условии: navigate.
+    address = ORIGIN + "/" + chat_id
+    budget = min(_CHANNEL_READY_TIMEOUT_MS,
+                 int(settings.app["max"].get("browser", {}).get("operation_timeout_seconds", 120) * 1000))
+    deadline = time.monotonic() + budget / 1000
+    # Единственный GET до редактора. После отправки navigate=False не добавляет reload.
     if navigate:
-        page.goto(ORIGIN + "/" + chat_id, wait_until="domcontentloaded")
-    # Выполняем операцию с отдельной обработкой возможных ошибок.
-    try:
-        heading = page.locator("#main-header-title")
-        heading.filter(has_text="Окно чата с " + expected).wait_for(state="attached")
-        # Обрабатываем ветвь при условии: heading.inner_text().strip() != 'Окно чата с ' + expected.
-        if heading.inner_text().strip() != "Окно чата с " + expected:
-            raise AgentError("BROWSER_WRONG_CHANNEL")
-    # Обрабатываем AgentError и выбираем допустимый исход.
-    except AgentError:
-        raise
-    # Обрабатываем Exception и выбираем допустимый исход.
-    except Exception as exc:
-        raise AgentError("BROWSER_LOGIN_OR_CHANNEL_REQUIRED") from exc
-    parsed = urlsplit(page.url)
-    # Обрабатываем ветвь при условии: parsed.scheme != 'https' or parsed.hostname != 'web.max.ru' or parsed.path != '/' + chat_id.
-    if parsed.scheme != "https" or parsed.hostname != "web.max.ru" or parsed.path != "/" + chat_id:
+        response = page.goto(address, wait_until="domcontentloaded", timeout=budget)
+        if response is not None and response.status == 429:
+            raise AgentError("BROWSER_CHANNEL_RATE_LIMITED")
+        if response is not None and response.status >= 400:
+            raise AgentError("BROWSER_CHANNEL_UNAVAILABLE")
+    # Чужой адрес не пережидаем и не заменяем повторной навигацией.
+    if page.url != address:
         raise AgentError("BROWSER_WRONG_CHANNEL")
-    # Выполняем операцию с отдельной обработкой возможных ошибок.
+    arguments = {"url": address, "title": "Окно чата с " + expected, "composer": COMPOSER}
     try:
-        page.locator(COMPOSER).wait_for(state="visible")
-    # Обрабатываем Exception и выбираем допустимый исход.
+        # Название и права появляются не одновременно при старте MAX. Ждём их
+        # вместе в одном ограниченном бюджете, не меняя редактор или профиль.
+        result = page.wait_for_function(_CHANNEL_READY, arg=arguments, polling=100,
+            timeout=max(1, int((deadline - time.monotonic()) * 1000)))
+        state = result.json_value()
+        result.dispose()
     except Exception as exc:
-        raise AgentError("BROWSER_PUBLISH_PERMISSION_REQUIRED") from exc
-    # Обрабатываем ветвь при условии: not page.locator(COMPOSER).is_visible().
-    if not page.locator(COMPOSER).is_visible():
-        raise AgentError("BROWSER_PUBLISH_PERMISSION_REQUIRED")
+        raise AgentError(_channel_not_ready(page, address, arguments["title"])) from exc
+    if state != "ready":
+        raise AgentError("BROWSER_WRONG_CHANNEL")
+    # Немедленная повторная сверка закрывает смену адреса/прав в конце ожидания.
+    if page.evaluate(_CHANNEL_READY, arguments) != "ready":
+        raise AgentError(_channel_not_ready(page, address, arguments["title"]))
+
+
+def _channel_not_ready(page, address, title):
+    """Классифицируем отказ без новых ожиданий, переходов или входа в аккаунт."""
+    try:
+        return page.evaluate("""({address, title}) => {
+          if (location.href !== address) return 'BROWSER_WRONG_CHANNEL';
+          const headings = document.querySelectorAll('#main-header-title');
+          if (headings.length !== 1 || !headings[0].innerText.trim())
+            return 'BROWSER_LOGIN_OR_CHANNEL_REQUIRED';
+          return headings[0].innerText.trim() === title
+            ? 'BROWSER_PUBLISH_PERMISSION_REQUIRED' : 'BROWSER_WRONG_CHANNEL';
+        }""", {"address": address, "title": title})
+    except Exception:
+        return "BROWSER_LOGIN_OR_CHANNEL_REQUIRED"
 
 
 # Находим сообщения с точным текстом для сверки результата.

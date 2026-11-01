@@ -1,6 +1,6 @@
 include README.md TOPIC.md alembic.ini .env.example package.json package-lock.json
 include AGENTS.md CHANGELOG.md
-include .dockerignore .gitattributes
+include .gitignore .dockerignore .gitattributes
 include deployment/postiz/.env.example
 include requirements*.lock
 recursive-include schemas *.json
@@ -13,9 +13,15 @@ recursive-include scripts *.py *.ps1 *.sh
 recursive-include docs *.md *.json *.png
 recursive-include docs *.jpg
 include tests/conftest.py
+recursive-include tests/fixtures *.json
+include tests/workstation-power-mocks.ps1
 recursive-include deployment *.py *.yaml *.yml *.md
 recursive-include deployment *.json *.ts *.tsx *.cjs *.png Dockerfile .dockerignore
+recursive-include deployment *.css
 recursive-include deployment Dockerfile.*
 recursive-include deployment *.sh *.service
 recursive-include deployment *.conf
+include deployment/translation/candle_t5_worker.rs
+include deployment/translation/candle-t5-causal-position.patch
+include deployment/translation/requirements.txt
 global-exclude *.pyc

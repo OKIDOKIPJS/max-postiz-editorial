@@ -15,6 +15,38 @@ type State = {
   reserve?: { enabled?: boolean; ready?: number; target?: number; next_delivery_at?: number };
   preparation?: { phase?: string; last_error?: { code: string } | null };
 };
+export type RouteTarget = {
+  id: string; platform: string; route: string; destination: string; enabled: boolean; paused: boolean;
+  binding_hash: string; live_verified: boolean; status_kind: string; credentials_configured?: boolean;
+  adapter_mode?: string; owner_configured?: boolean; profile_exists?: boolean; dom_contract_verified?: boolean;
+};
+export type RouteVariant = {
+  id: string; target_id: string; title: string; revision: number; state: string;
+  content_hash: string; media_count: number; source_count: number;
+  manual_approval_allowed?: boolean; approval_mode?: string; origin?: string;
+};
+export type RouteDispatch = {
+  id: string; target_id: string; title: string; state: string; due_at: number; verified: boolean | null;
+  external_id?: string | null; permalink?: string | null; error?: string | null; attempts: number; snapshot_hash: string;
+  evidence_kind?: 'fixture' | 'api_receipt' | 'independent_readback' | 'unverified';
+  destination?: string | null; platform?: string | null; route?: string | null;
+};
+export type RoutePages = { variant_page: number; dispatch_page: number; dispatch_filter: 'all' | 'unresolved' };
+export type RoutePagination = RoutePages & { page_size: number; variant_count: number; variant_active_count: number;
+  variant_has_next: boolean; dispatch_count: number; dispatch_active_count: number; dispatch_has_next: boolean };
+export type RouteInventory = { targets: RouteTarget[]; variants: RouteVariant[]; dispatches: RouteDispatch[]; pagination?: RoutePagination };
+export type RouteDetails = { variant_id: string; target_id: string; title: string; body: string; revision: number;
+  content_hash: string; destination: string; platform: string; route: string; binding_hash: string;
+  metadata: Record<string, unknown>; media: Record<string, unknown>[]; sources: Record<string, unknown>[];
+  read_only: true; manual_approval_allowed: boolean };
+export type RouteAction = { action: 'inspect' | 'details' | 'preflight' | 'preview' | 'approve' | 'pause' | 'resume' | 'reconcile'; id: string;
+  revision?: number; content_hash?: string; due_at?: number };
+type RouteActionHandler = (action: RouteAction) => Promise<boolean>;
+type RouteDetailsHandler = (variant: RouteVariant) => Promise<void>;
+type RoutePageHandler = (pages: RoutePages) => void;
+type RoutePreviewImage = { data_url: string; sha256: string; mime: string; width: number; height: number; preview: true };
+type RoutePreviewHandler = (variant: RouteVariant) => Promise<unknown | null>;
+const managedRoutes = new Set(['max_browser', 'max_api', 'telegram_api', 'vk_api', 'vk_browser', 'pikabu_browser']);
 const errors: Record<string, string> = {
   EDITORIAL_SERVICE_UNAVAILABLE: 'Редакционный сервис недоступен. Проверьте его состояние на сервере и обновите страницу.',
   EDITORIAL_OWNER_REQUIRED: 'Управление редакцией доступно только владельцу этой организации.',
@@ -45,12 +77,123 @@ const errors: Record<string, string> = {
   SCIENCE_SOURCES_UNAVAILABLE: 'Научные источники сейчас недоступны. История и запас статей сохранены.',
   ARTICLE_RESERVE_CLAIM_LOST: 'Не удалось подтвердить владельца подготовки. Работа остановлена до сверки.',
   ARTICLE_RESERVE_ASSIGNMENT_LOST: 'Назначение статьи требует сверки. Повторная отправка заблокирована.',
+  EDITORIAL_ROUTE_ACTION_INVALID: 'Выберите сохранённый канал или материал, проверьте версию и будущую дату публикации.',
+  EDITORIAL_ROUTE_SCHEDULE_INVALID: 'Укажите будущую дату и время по Москве.',
+  EDITORIAL_ROUTE_CONSENT_REQUIRED: 'Выполните проверку и явно согласуйте выбранную версию, канал и дату.',
+  EDITORIAL_ROUTE_RESPONSE_INVALID: 'Не удалось прочитать список каналов. Обновите статус.',
+  TARGET_PAUSED: 'Канал на паузе. Согласованные материалы сохраняются до возобновления.',
+  APPROVAL_STALE: 'Текст, вложения или настройки изменились. Обновите материал и согласуйте новую версию.',
+  CANCEL_OR_RECONCILE_FIRST: 'Есть незавершённая отправка. Сначала сверьте её результат.',
+  VK_TOKEN_REQUIRED: 'Для VK ещё не настроен доступ на сервере.',
+  TELEGRAM_TOKEN_REQUIRED: 'Для Telegram ещё не настроен доступ на сервере.',
+  ROUTE_ACTION_INVALID: 'Проверьте выбранный канал, материал и дату.',
+  SCHEDULE_FUTURE_REQUIRED: 'Дата публикации должна быть в будущем.',
+  ROUTE_RECONCILE_STATE_INVALID: 'Состояние отправки уже изменилось. Обновите историю.',
+  HUMAN_REVIEW_CONFIRMATION_REQUIRED: 'Этот материал относится к отдельному почасовому сценарию и не согласуется в списке ручных черновиков.',
+  VK_READBACK_UNAVAILABLE: 'VK принял пост, но независимая сверка недоступна. Проверьте результат отдельной сверкой; повторной отправки нет.',
+  VK_READBACK_MISMATCH: 'Текст или вложения найденного поста VK не совпали с согласованной версией. Требуется сверка.',
+  VK_UPLOAD_UNKNOWN: 'Исход загрузки изображения в VK неизвестен. Повторная загрузка и отправка заблокированы.',
+  VK_CAPTCHA_REQUIRED: 'VK запросил проверку доступа. Отправка остановлена.',
+  VK_RATE_LIMIT: 'VK временно ограничил запросы. Повторной отправки нет.',
+  EDITORIAL_ROUTE_PREVIEW_INVALID: 'Не удалось безопасно показать изображение этой версии. Согласование не выполнено.',
+  ROUTE_PREVIEW_SIZE_INVALID: 'Изображение не удалось подготовить для просмотра. Исходный файл не изменён.',
+  EDITORIAL_ROUTE_DETAILS_INVALID: 'Не удалось прочитать полную версию материала. Согласование недоступно.',
+  ROUTE_DETAILS_SIZE_INVALID: 'Полный материал превышает допустимый размер ответа. Согласование не выполнено.',
+  ROUTE_LIST_SIZE_INVALID: 'Список превышает допустимый размер ответа. Материалы и история сохранены.',
+  EDITORIAL_ROUTE_LIST_INVALID: 'Неверная страница списка. Обновите статус.',
+  ROUTE_LIST_INVALID: 'Неверная страница списка. Обновите статус.',
 };
 export function errorText(code: string) { return errors[code] || `Действие остановлено. Код: ${code}`; }
 export function readableTime(value?: string | number) {
   if (value === undefined || value === null || value === '') return '—';
   const date = new Date(typeof value === 'number' && value < 100000000000 ? value * 1000 : value);
-  return Number.isNaN(date.valueOf()) ? '—' : date.toLocaleString('ru-RU');
+  return Number.isNaN(date.valueOf()) ? '—' : date.toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
+}
+export function moscowSchedule(value: string, currentTime = Date.now()): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return null;
+  const timestamp = Date.parse(`${value}:00+03:00`);
+  if (!Number.isFinite(timestamp) || timestamp <= currentTime ||
+      new Date(timestamp + 3 * 3600000).toISOString().slice(0, 16) !== value) return null;
+  return Math.floor(timestamp / 1000);
+}
+export function routePlatform(platform: string) {
+  return ({ max: 'MAX', telegram: 'Telegram', vk: 'ВКонтакте', pikabu: 'Пикабу' } as Record<string, string>)[platform] || platform;
+}
+export function routeDeliveryText(dispatch: RouteDispatch) {
+  if (dispatch.evidence_kind === 'fixture') return 'Локальная проверка; живая доставка не проверена';
+  if (dispatch.state === 'unknown') return 'Исход неизвестен — требуется сверка';
+  if (dispatch.state === 'published') {
+    if (dispatch.evidence_kind === 'independent_readback' && dispatch.verified === true) return 'Доставка подтверждена';
+    if (dispatch.evidence_kind === 'api_receipt' && dispatch.verified === false) return 'API-квитанция; без независимой сверки';
+    if (dispatch.verified === true) return 'В истории отмечено подтверждение; новых доказательств нет';
+    return 'Отправка отмечена; подтверждения нет';
+  }
+  return phaseText(dispatch.state);
+}
+export function routeAccessText(value: unknown) {
+  const neutral = 'Проверка доступа завершена; доставка не проверена.';
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return neutral;
+  const access = value as Record<string, unknown>;
+  if (access.fixture === true) return 'Локальная проверка доступа; живая доставка не проверена.';
+  if (['fixture', 'live_verified', 'publish', 'can_publish'].some(key =>
+    key in access && typeof access[key] !== 'boolean')) return neutral;
+  if ('state' in access && access.state !== 'access_only' && access.state !== 'available') return neutral;
+  if ('verification' in access && access.verification !== 'access_only') return neutral;
+  if ('publish' in access && 'can_publish' in access && access.publish !== access.can_publish) return neutral;
+  const permission = typeof access.publish === 'boolean' ? access.publish : access.can_publish;
+  const connected = access.live_verified === true || (access.fixture === false &&
+    (access.verification === 'access_only' || access.state === 'access_only'));
+  if (!connected || typeof permission !== 'boolean') return neutral;
+  return permission
+    ? 'Доступ и право публикации подтверждены. Доставка ещё не проверена.'
+    : 'Соединение с площадкой подтверждено; право публикации не подтверждено. Доставка не проверена.';
+}
+export function routePreviewImages(value: unknown, variant: RouteVariant): RoutePreviewImage[] {
+  const result = value as any;
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('EDITORIAL_ROUTE_PREVIEW_INVALID');
+  if (result.variant_id !== variant.id || result.revision !== variant.revision ||
+      result.content_hash !== variant.content_hash) throw new Error('APPROVAL_STALE');
+  let size: number;
+  try { size = new TextEncoder().encode(JSON.stringify(result)).byteLength; }
+  catch { throw new Error('EDITORIAL_ROUTE_PREVIEW_INVALID'); }
+  if (size > 1024 * 1024 || result.preflight_only !== true || !Array.isArray(result.images) ||
+      !result.images.length || result.images.length !== variant.media_count) throw new Error('EDITORIAL_ROUTE_PREVIEW_INVALID');
+  return result.images.map((image: any) => {
+    if (!image || typeof image !== 'object' || image.preview !== true || image.mime !== 'image/jpeg' ||
+        typeof image.data_url !== 'string' || !/^data:image\/jpeg;base64,\/9j\/[A-Za-z0-9+/]*={0,2}$/.test(image.data_url) ||
+        typeof image.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(image.sha256) ||
+        !Number.isSafeInteger(image.width) || !Number.isSafeInteger(image.height) || image.width < 1 || image.height < 1 ||
+        image.width > 40000000 || image.height > 40000000 || image.width * image.height > 40000000) {
+      throw new Error('EDITORIAL_ROUTE_PREVIEW_INVALID');
+    }
+    return { data_url: image.data_url, sha256: image.sha256, mime: image.mime,
+      width: image.width, height: image.height, preview: true };
+  });
+}
+export function routeDetailsResult(value: unknown, variant: RouteVariant, target: RouteTarget): RouteDetails {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('EDITORIAL_ROUTE_DETAILS_INVALID');
+  const result = value as RouteDetails;
+  if (result.variant_id !== variant.id || result.revision !== variant.revision || result.content_hash !== variant.content_hash ||
+      result.target_id !== variant.target_id || result.target_id !== target.id || result.destination !== target.destination ||
+      result.platform !== target.platform || result.route !== target.route || result.binding_hash !== target.binding_hash ||
+      result.title !== variant.title) throw new Error('APPROVAL_STALE');
+  let size: number;
+  try { size = new TextEncoder().encode(JSON.stringify(value)).byteLength; }
+  catch { throw new Error('EDITORIAL_ROUTE_DETAILS_INVALID'); }
+  const record = (item: unknown): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item);
+  if (size > 900000 || result.read_only !== true || typeof result.body !== 'string' ||
+      typeof result.manual_approval_allowed !== 'boolean' ||
+      result.manual_approval_allowed !== (variant.manual_approval_allowed !== false) ||
+      !record(result.metadata) || !Array.isArray(result.media) || !result.media.every(record) ||
+      result.media.length !== variant.media_count || !Array.isArray(result.sources) || !result.sources.every(record) ||
+      result.sources.length !== variant.source_count) throw new Error('EDITORIAL_ROUTE_DETAILS_INVALID');
+  return result;
+}
+export function routeListPath(pages: RoutePages): string {
+  if ([pages.variant_page, pages.dispatch_page].some(page => !Number.isSafeInteger(page) || page < 0 || page > 1000000) ||
+      !['all', 'unresolved'].includes(pages.dispatch_filter)) throw new Error('EDITORIAL_ROUTE_LIST_INVALID');
+  if (pages.variant_page === 0 && pages.dispatch_page === 0 && pages.dispatch_filter === 'all') return 'routes';
+  return `routes?variant_page=${pages.variant_page}&dispatch_page=${pages.dispatch_page}&dispatch_filter=${pages.dispatch_filter}`;
 }
 const phases: Record<string, string> = {
   idle: 'Ожидание следующего цикла', paused: 'На паузе', collecting: 'Подбор источников', preparing: 'Перевод и проверка',
@@ -102,20 +245,177 @@ export function NasaRatingField({ mixed = false }: { mixed?: boolean } = {}) {
   </label>;
 }
 
+export function RouteDraft({ variant, target, pending, onAction, onPreview, details, onDetails }: {
+  variant: RouteVariant; target: RouteTarget; pending: boolean; onAction: RouteActionHandler; onPreview?: RoutePreviewHandler;
+  details?: RouteDetails; onDetails?: RouteDetailsHandler;
+}) {
+  const [schedule, setSchedule] = useState('');
+  const [consent, setConsent] = useState(false);
+  const [checkedHash, setCheckedHash] = useState<string | null>(null);
+  const [preview, setPreview] = useState<RoutePreviewImage[] | null>(null);
+  const [previewError, setPreviewError] = useState('');
+  const dueAt = moscowSchedule(schedule);
+  useEffect(() => { setConsent(false); setCheckedHash(null); setPreview(null); setPreviewError(''); },
+    [variant.id, variant.revision, variant.content_hash, target.id, target.destination,
+      target.binding_hash, target.paused, target.enabled, details?.content_hash]);
+  let exact: RouteDetails | null = null;
+  try { if (details) exact = routeDetailsResult(details, variant, target); } catch { /* Старая версия не открывает согласование. */ }
+  const checked = exact !== null && checkedHash === variant.content_hash;
+  const imageReviewed = variant.media_count === 0 || preview !== null;
+  return <article className={styles.routeDraft} aria-label={`Черновик: ${variant.title}`}>
+    <div className={styles.routeHeading}><h3>{variant.title || 'Без заголовка'}</h3>
+      <span className={styles.badge}>{routePlatform(target.platform)} · Версия {variant.revision}</span></div>
+    <p className={styles.muted}>Канал: {target.destination} · Вложений: {variant.media_count} · Источников: {variant.source_count}</p>
+    {!exact ? <div><p className={styles.muted}>Полный текст, вложения и параметры этой версии ещё не загружены. Согласование недоступно.</p>
+      <button type="button" className={styles.button} disabled={pending || !onDetails}
+        onClick={() => onDetails?.(variant)}>Открыть полный материал</button></div> : <>
+    {variant.media_count > 0 && <div>
+      <button type="button" className={styles.button} disabled={pending || !onPreview} onClick={async () => {
+        setConsent(false); setPreview(null); setPreviewError('');
+        try {
+          const result = await onPreview?.(variant);
+          setPreview(routePreviewImages(result, variant));
+        } catch (reason) { setPreviewError(reason instanceof Error ? reason.message : 'EDITORIAL_ROUTE_PREVIEW_INVALID'); }
+      }}>Показать изображение</button>
+      {previewError && <div role="alert" className={styles.notice}>{errorText(previewError)}</div>}
+      {preview?.map((image, index) => <figure key={image.sha256} className={styles.imagePreview}>
+        <img src={image.data_url} alt={`Предпросмотр изображения ${index + 1}: ${variant.title}`} decoding="async" />
+        <figcaption className={styles.muted}>Предпросмотр · {image.width} × {image.height}. На площадку отправляется исходный файл этой версии, его SHA проверен сервером.</figcaption>
+      </figure>)}
+      {!imageReviewed && <p className={styles.muted}>Перед согласованием покажите изображение этой версии.</p>}
+    </div>}
+    <div className={styles.fullBody}>{exact.body}</div>
+    <h4>Параметры публикации</h4><pre className={styles.fullBody}>{JSON.stringify(exact.metadata, null, 2)}</pre>
+    <h4>Вложения этой версии</h4><pre className={styles.fullBody}>{JSON.stringify(exact.media, null, 2)}</pre>
+    <h4>Источники этой версии</h4><pre className={styles.fullBody}>{JSON.stringify(exact.sources, null, 2)}</pre>
+    <div className={styles.actions}><button type="button" className={styles.button} disabled={pending}
+      onClick={async () => { setConsent(false); setCheckedHash(null);
+        if (await onAction({ action: 'preflight', id: variant.id })) setCheckedHash(variant.content_hash); }}>
+      Проверить перед согласованием</button>
+      {checked && <span className={styles.muted}>Проверка этой версии завершена</span>}</div>
+    <label className={styles.field}><span>Дата и время публикации (Москва, UTC+3)</span>
+      <input type="datetime-local" step="60" value={schedule} disabled={pending}
+        onChange={event => { setSchedule(event.target.value); setConsent(false); }} />
+      {schedule && dueAt === null && <span role="status" className={styles.muted}>Укажите корректную будущую дату по Москве.</span>}
+    </label>
+    <label className={styles.consent}><input type="checkbox" checked={consent}
+      disabled={pending || !checked || !imageReviewed || dueAt === null || !target.enabled || target.paused}
+      onChange={event => setConsent(event.target.checked)} />
+      <span>Я проверил материал и согласую версию {variant.revision} для канала {target.destination}
+        {dueAt !== null ? ` на ${readableTime(dueAt)} (МСК)` : ' на выбранную дату'}.</span></label>
+    <div className={styles.actions}><button type="button" className={`${styles.button} ${styles.primary}`}
+      disabled={pending || !target.enabled || target.paused || !checked || !imageReviewed || !consent || dueAt === null}
+      onClick={async () => {
+        const exactDate = moscowSchedule(schedule);
+        if (pending || !target.enabled || target.paused || !consent || !checked || !imageReviewed || exactDate === null) return;
+        setConsent(false);
+        await onAction({ action: 'approve', id: variant.id, revision: variant.revision,
+          content_hash: variant.content_hash, due_at: exactDate });
+      }}>Согласовать версию и дату</button></div>
+    {target.paused && <p className={styles.muted}>Канал на паузе. Перед согласованием возобновите его отдельной кнопкой.</p>}
+    </>}
+  </article>;
+}
+
+export function EditorialRoutes({ inventory, pending, error, onAction, onPreview, detailsById = {}, onDetails, onPage }: {
+  inventory: RouteInventory | null; pending: boolean; error?: string; onAction: RouteActionHandler; onPreview?: RoutePreviewHandler;
+  detailsById?: Record<string, RouteDetails>; onDetails?: RouteDetailsHandler; onPage?: RoutePageHandler;
+}) {
+  const targets = (inventory?.targets || []).filter(target => managedRoutes.has(target.route));
+  const variants = (inventory?.variants || []).filter(variant => variant.manual_approval_allowed !== false &&
+    ['review_pending', 'ready', 'draft'].includes(variant.state));
+  const dispatches = inventory?.dispatches || [];
+  const pagination = inventory?.pagination;
+  return <section className={styles.card} aria-labelledby="routes-heading"><h2 id="routes-heading">Каналы и публикации</h2>
+    <p className={styles.muted}>MAX, Telegram, ВКонтакте и Пикабу. Настройка подключения и проверка доступа ещё не подтверждают доставку.</p>
+    {error && <div role="alert" className={styles.notice}>{errorText(error)}</div>}
+    {!inventory ? <p className={styles.muted}>Загрузка каналов…</p> : <>
+      <div className={styles.routesGrid}>{targets.map(target => <article key={target.id} className={styles.routeTarget}>
+        <div className={styles.routeHeading}><h3>{routePlatform(target.platform)}</h3>
+          <span className={styles.badge}>{!target.enabled ? 'Выключен' : target.paused ? 'На паузе' : 'Отправка разрешена'}</span></div>
+        <p className={styles.destination}>{target.destination}</p>
+        <p className={styles.muted}>{target.adapter_mode === 'fake' ? 'Режим локальной проверки' : 'Настройки подключения'}
+          {target.credentials_configured !== undefined && ` · Доступ ${target.credentials_configured ? 'настроен' : 'не настроен'}`}
+          {target.owner_configured !== undefined && ` · Владелец ${target.owner_configured ? 'указан' : 'не указан'}`}
+          {target.profile_exists !== undefined && ` · Профиль браузера ${target.profile_exists ? 'сохранён' : 'не найден'}`}
+          {target.dom_contract_verified !== undefined && ` · Редактор ${target.dom_contract_verified ? 'проверен' : 'требует проверки'}`}</p>
+        <div className={styles.actions}><button type="button" className={styles.button} disabled={pending}
+          onClick={() => onAction({ action: 'inspect', id: target.id })}>Проверить доступ</button>
+          <button type="button" className={styles.button} disabled={pending || !target.enabled}
+            onClick={() => onAction({ action: target.paused ? 'resume' : 'pause', id: target.id })}>
+            {target.paused ? 'Возобновить канал' : 'Приостановить канал'}</button></div>
+      </article>)}</div>
+      {!targets.length && <p className={styles.muted}>Каналы ещё не настроены.</p>}
+      <h3 className={styles.subheading}>Черновики для согласования</h3>
+      {pagination && <div className={styles.actions}><span className={styles.muted}>
+        Страница материалов {pagination.variant_page + 1}; всего {pagination.variant_count}, ожидают проверки {pagination.variant_active_count}.</span>
+        <button type="button" className={styles.button} disabled={pending || !onPage || pagination.variant_page === 0}
+          onClick={() => onPage?.({ ...pagination, variant_page: pagination.variant_page - 1 })}>Предыдущие материалы</button>
+        <button type="button" className={styles.button} disabled={pending || !onPage || !pagination.variant_has_next}
+          onClick={() => onPage?.({ ...pagination, variant_page: pagination.variant_page + 1 })}>Следующие материалы</button></div>}
+      {variants.map(variant => { const target = targets.find(item => item.id === variant.target_id);
+        return target ? <RouteDraft key={`${variant.id}:${variant.revision}:${variant.content_hash}:${target.binding_hash}`}
+          variant={variant} target={target} pending={pending} onAction={onAction} onPreview={onPreview}
+          details={detailsById[variant.id]} onDetails={onDetails} /> : null; })}
+      {!variants.length && <p className={styles.muted}>На этой странице нет черновиков для ручного согласования.</p>}
+      <h3 className={styles.subheading}>История отправок</h3>
+      {pagination && <div className={styles.actions}><span className={styles.muted}>
+        Страница отправок {pagination.dispatch_page + 1}; в списке {pagination.dispatch_count}, требуют сверки {pagination.dispatch_active_count}.</span>
+        <button type="button" className={styles.button} disabled={pending || !onPage}
+          onClick={() => onPage?.({ ...pagination, dispatch_page: 0,
+            dispatch_filter: pagination.dispatch_filter === 'unresolved' ? 'all' : 'unresolved' })}>
+          {pagination.dispatch_filter === 'unresolved' ? 'Все отправки' : 'Только незавершённые'}</button>
+        <button type="button" className={styles.button} disabled={pending || !onPage || pagination.dispatch_page === 0}
+          onClick={() => onPage?.({ ...pagination, dispatch_page: pagination.dispatch_page - 1 })}>Предыдущие отправки</button>
+        <button type="button" className={styles.button} disabled={pending || !onPage || !pagination.dispatch_has_next}
+          onClick={() => onPage?.({ ...pagination, dispatch_page: pagination.dispatch_page + 1 })}>Следующие отправки</button></div>}
+      <div className={styles.tableWrap}><table className={styles.table}>
+        <thead><tr><th>Материал и канал</th><th>Состояние</th><th>Дата (МСК)</th><th>Проверка</th></tr></thead>
+        <tbody>{dispatches.map(dispatch => {
+          const destination = typeof dispatch.destination === 'string' && dispatch.destination ? dispatch.destination : 'Адресат не сохранён';
+          const platform = typeof dispatch.platform === 'string' && dispatch.platform ? routePlatform(dispatch.platform) : null;
+          const link = dispatch.evidence_kind === 'fixture' ? null : safeSourceUrl(dispatch.permalink || undefined);
+          return <tr key={dispatch.id}><td>{dispatch.title || 'Без заголовка'}
+            <span className={styles.detail}>{platform ? `${platform} · ${destination}` : destination}</span></td>
+            <td>{routeDeliveryText(dispatch)}{dispatch.error && <span className={styles.detail}>{errorText(dispatch.error)}</span>}</td>
+            <td>{readableTime(dispatch.due_at)}</td><td>
+              {link && <a href={link} target="_blank" rel="noopener noreferrer">Открыть публикацию</a>}
+              {dispatch.state === 'unknown' && <button type="button" className={styles.button}
+                disabled={pending} onClick={() => onAction({ action: 'reconcile', id: dispatch.id })}>Сверить результат</button>}
+              {dispatch.state === 'unknown' && !dispatch.external_id && <span className={styles.detail}>Сверка использует сохранённые доказательства. Повторной отправки нет.</span>}
+            </td></tr>; })}</tbody>
+      </table>{!dispatches.length && <p className={styles.muted}>На этой странице отправок нет.</p>}</div>
+    </>}
+  </section>;
+}
+
 export function EditorialPanel() {
   const [state, setState] = useState<State | null>(null);
   const [settings, setSettings] = useState<EditorialSettings | null>(null);
   const [revision, setRevision] = useState<number | null>(null);
   const [form, setForm] = useState<EditorialForm | null>(null);
   const [dirty, setDirty] = useState(false), [pending, setPending] = useState(false), [error, setError] = useState('');
+  const [routes, setRoutes] = useState<RouteInventory | null>(null);
+  const [routeDetails, setRouteDetails] = useState<Record<string, RouteDetails>>({});
+  const routePages = useRef<RoutePages>({ variant_page: 0, dispatch_page: 0, dispatch_filter: 'all' });
+  const [routeError, setRouteError] = useState('');
+  const [routeNotice, setRouteNotice] = useState('');
   const mounted = useRef(true);
   const refresh = useCallback(async (loadSettings: boolean, signal?: AbortSignal) => {
-    const current = await api('state', 'GET', undefined, signal);
+    const [current, channels, saved] = await Promise.allSettled([
+      api('state', 'GET', undefined, signal), api(routeListPath(routePages.current), 'GET', undefined, signal),
+      loadSettings ? api('settings', 'GET', undefined, signal) : Promise.resolve(null),
+    ]);
     if (!mounted.current) return;
-    setState(current);
+    if (current.status === 'rejected') throw current.reason;
+    setState(current.value);
+    if (channels.status === 'fulfilled' && channels.value && Array.isArray(channels.value.targets) &&
+        Array.isArray(channels.value.variants) && Array.isArray(channels.value.dispatches)) {
+      setRoutes(channels.value); setRouteError('');
+    } else { setRouteError(channels.status === 'rejected' ? channels.reason.message : 'EDITORIAL_ROUTE_RESPONSE_INVALID'); }
     if (loadSettings) {
-      const result = await api('settings', 'GET', undefined, signal);
-      if (!mounted.current) return;
+      if (saved.status === 'rejected') throw saved.reason;
+      const result = saved.value;
       setSettings(result.settings); setRevision(result.revision); setForm(formFromSettings(result.settings)); setDirty(false);
     }
   }, []);
@@ -129,8 +429,55 @@ export function EditorialPanel() {
   const change = (key: keyof EditorialForm, value: string) => { setForm(previous => previous && ({ ...previous, [key]: value })); setDirty(true); };
   const perform = async (operation: () => Promise<unknown>, resetSettings = false) => {
     setPending(true); setError('');
-    try { await operation(); await refresh(resetSettings); } catch (reason) { setError(reason instanceof Error ? reason.message : 'EDITORIAL_REQUEST_FAILED'); }
+    try { await operation(); await refresh(resetSettings); return true; }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'EDITORIAL_REQUEST_FAILED'); return false; }
     finally { setPending(false); }
+  };
+  const routeAction: RouteActionHandler = async action => {
+    setRouteNotice('');
+    let result: any;
+    const success = await perform(async () => {
+      result = await api('route-action', 'POST', action);
+      if (action.action === 'preflight') {
+        const exact = routes?.variants.find(variant => variant.id === action.id);
+        if (!exact || result?.revision !== exact.revision || result?.content_hash !== exact.content_hash ||
+            result?.target_id !== exact.target_id) throw new Error('APPROVAL_STALE');
+      }
+    });
+    if (success) {
+      let message = ({ inspect: 'Проверка доступа завершена; это не подтверждение доставки.',
+      details: 'Полная версия открыта для просмотра; согласование не выполнено.',
+      preflight: 'Проверка выбранной версии завершена.', preview: 'Изображение подготовлено для просмотра.', approve: 'Версия, канал и дата согласованы.',
+      pause: 'Канал приостановлен; история сохранена.', resume: 'Канал возобновлён.',
+      reconcile: 'Сверка завершена. Проверьте обновлённое состояние отправки.' })[action.action];
+      if (action.action === 'inspect') {
+        message = routeAccessText(result?.access);
+      }
+      if (action.action === 'reconcile' && result?.state === 'unknown') message = 'Исход остаётся неизвестным. Повторной отправки нет.';
+      setRouteNotice(message);
+    }
+    return success;
+  };
+  const routePreview: RoutePreviewHandler = async variant => {
+    let result: unknown = null;
+    const success = await perform(async () => {
+      result = await api('route-action', 'POST', { action: 'preview', id: variant.id });
+    });
+    return success ? result : null;
+  };
+  const loadRouteDetails: RouteDetailsHandler = async variant => {
+    await perform(async () => {
+      const target = routes?.targets.find(item => item.id === variant.target_id);
+      if (!target) throw new Error('APPROVAL_STALE');
+      const value = await api('route-action', 'POST', { action: 'details', id: variant.id });
+      const exact = routeDetailsResult(value, variant, target);
+      setRouteDetails(previous => ({ ...previous, [variant.id]: exact }));
+    });
+  };
+  const changeRoutePage: RoutePageHandler = pages => {
+    routePages.current = { variant_page: pages.variant_page, dispatch_page: pages.dispatch_page, dispatch_filter: pages.dispatch_filter };
+    setRouteDetails({});
+    return perform(() => Promise.resolve());
   };
   const control = (action: 'start' | 'pause') => perform(() => api('control', 'POST', { action, revision: state?.revision }), !dirty);
   const field = (label: string, key: keyof EditorialForm, kind = 'text', help?: string) => <label className={styles.field}>
@@ -196,6 +543,9 @@ export function EditorialPanel() {
         </div>
       </form> : <p className={styles.muted}>Загрузка настроек…</p>}
     </section>
+    {routeNotice && <div role="status" className={styles.notice}>{routeNotice}</div>}
+    <EditorialRoutes inventory={routes} pending={pending || Boolean(routeError)} error={routeError} onAction={routeAction} onPreview={routePreview}
+      detailsById={routeDetails} onDetails={loadRouteDetails} onPage={changeRoutePage} />
     <section className={styles.card}><h2>Последние материалы</h2><EditorialRecords records={state?.recent || []} /></section>
   </main>;
 }

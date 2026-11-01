@@ -1,0 +1,18 @@
+{
+  "id": "vk_test",
+  "profile_id": "test",
+  "platform": "vk",
+  "route": "vk_browser",
+  "destination": "",
+  "enabled": false,
+  "options": {
+    "max_chars": 16384,
+    "profile_dir": "data/vk-browser",
+    "channel": "chrome",
+    "headless": true,
+    "operation_timeout_seconds": 180,
+    "dom_contract_verified": false,
+    "dom_contract_profile": "personal-text-v1",
+    "media_contract_verified": false
+  }
+}

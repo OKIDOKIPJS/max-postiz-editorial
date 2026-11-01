@@ -36,12 +36,51 @@ def automatic_review_rubric(record):
 
 def automatic_review_prompt_name(record):
     from .article_quality import review_prompt_name
-    return review_prompt_name(automatic_review_rubric(record))
+    return review_prompt_name(automatic_review_rubric(record),
+                              review_protocol_contract=record.get("review_protocol_contract"))
+
+
+def review_protocol_binding(core, session, record, variant=None):
+    """Новые bounds закреплены в записи/Audit до модели; старые не мигрируются."""
+    from .article_quality import REVIEW_BOUNDS_V2_CONTRACT, review_protocol_marker
+    protocol = record.get("review_protocol_contract")
+    review_protocol_marker(protocol, automatic_review_rubric(record))
+    attempts = record.get("preparation_attempts", [])
+    audits = list(session.scalars(select(Audit).where(
+        Audit.entity == record["id"], Audit.action == "hourly_article_prepare_attempt")))
+    if (not isinstance(attempts, list) or any(not isinstance(a, dict) for a in attempts)
+            or any(not isinstance(a.details, dict) for a in audits)):
+        raise AgentError("ARTICLE_REVIEW_PROTOCOL_BINDING_INVALID", 409)
+    markers = [protocol, *(a.get("review_protocol_contract") for a in attempts),
+               *(a.details.get("review_protocol_contract") for a in audits)]
+    if variant is not None:
+        evidence = variant.metadata_json.get("machine_review_evidence", {})
+        if not isinstance(evidence, dict):
+            raise AgentError("ARTICLE_REVIEW_PROTOCOL_BINDING_INVALID", 409)
+        markers.extend((variant.metadata_json.get("review_protocol_contract"),
+                        evidence.get("review_protocol_contract")))
+    if not any(value is not None for value in markers):
+        return None
+    if (protocol != REVIEW_BOUNDS_V2_CONTRACT or not attempts or len(audits) != len(attempts)
+            or any(value != protocol for value in markers)):
+        raise AgentError("ARTICLE_REVIEW_PROTOCOL_BINDING_INVALID", 409)
+    for number, attempt in enumerate(attempts, 1):
+        matching = [a for a in audits if type(a.details.get("attempt")) is int
+                    and a.details["attempt"] == number]
+        actor = ("automatic_article_repair" if attempt.get("automatic_repair_claim") else
+                 "hourly_article_operator" if attempt.get("operator_retry") else "article_quality")
+        if (type(attempt.get("number")) is not int or attempt["number"] != number or len(matching) != 1
+                or matching[0].actor != actor
+                or any(matching[0].details.get(key) != record.get(key) for key in ("input_hash", "policy_hash"))
+                or matching[0].details.get("source_hash") != record.get("original_hash")):
+            raise AgentError("ARTICLE_REVIEW_PROTOCOL_BINDING_INVALID", 409)
+    return protocol
 
 
 def review_rubric_binding(core, session, record, variant=None):
     """Практические критерии требуют marker в записи, attempts и durable Audit."""
     from .article_quality import PRACTICAL_REVIEW_RUBRICS, MEANING_FIRST_REVIEW_RUBRIC
+    review_protocol_binding(core, session, record, variant)
     rubric = automatic_review_rubric(record)
     attempts = record.get("preparation_attempts", [])
     audits = list(session.scalars(select(Audit).where(
@@ -120,9 +159,13 @@ class HourlyArticleCycle:
     """A private durable ledger stops interrupted operations instead of replaying them."""
 
     def __init__(self, core, quality_factory=None, repair_factory=None, *, reserve_mode=False,
-                 scientific_spelling_contract=None):
+                 scientific_spelling_contract=None, review_protocol_contract=None):
         self.core, self.quality_factory, self.repair_factory = core, quality_factory, repair_factory
         self.reserve_mode = reserve_mode
+        from .article_quality import REVIEW_BOUNDS_V2_CONTRACT
+        if review_protocol_contract not in {None, REVIEW_BOUNDS_V2_CONTRACT}:
+            raise AgentError("ARTICLE_REVIEW_PROTOCOL_CONTRACT_INVALID", 409)
+        self.review_protocol_contract = review_protocol_contract
         if scientific_spelling_contract is not None:
             from .scientific_terms import SCIENTIFIC_SPELLING_CONTRACT
             if scientific_spelling_contract != SCIENTIFIC_SPELLING_CONTRACT:
@@ -420,6 +463,8 @@ class HourlyArticleCycle:
                                      review_rubric=(automatic_review_rubric(records[0]) if records else
                                          self._policy(enabled=False)["review_rubric"]) if mode == "automatic" else "legacy",
                                      reference_contract=reference_contract,
+                                     review_protocol_contract=(records[0].get("review_protocol_contract")
+                                                               if records else None),
                                      allow_registered_terms=scientific_contract is not None,
                                      **({"presentation_contract": records[0]["presentation_contract"],
                                          "image_credit": records[0]["image_credit"]}
@@ -721,7 +766,8 @@ class HourlyArticleCycle:
                                 source["title"] + "\n\n" + source["body"],
                                 translated["title"] + "\n\n" + translated["body"], automatic_review_rubric(record),
                                 hashlib.sha256(review_prompt.encode("utf-8")).hexdigest(),
-                                reference_contract=reference_contract):
+                                reference_contract=reference_contract,
+                                review_protocol_contract=record.get("review_protocol_contract")):
                             raise ValueError
                 if terminal["attempt"] == number and terminal.get("feedback") != block[-1].get("feedback"):
                     raise ValueError
@@ -878,6 +924,13 @@ class HourlyArticleCycle:
                 if policy.get("review_rubric") in PRACTICAL_REVIEW_RUBRICS:
                     # Новая рубрика выбирается только явной политикой до первой модели.
                     record["review_rubric"] = policy["review_rubric"]
+                from .article_quality import HOURLY_PRACTICAL_V2_REVIEW_RUBRIC, REVIEW_BOUNDS_V2_CONTRACT
+                if (policy.get("approval_mode") == "automatic"
+                        and policy.get("review_rubric") == HOURLY_PRACTICAL_V2_REVIEW_RUBRIC
+                        and (getattr(self, "review_protocol_contract", None) == REVIEW_BOUNDS_V2_CONTRACT
+                             or not self.quality_factory and getattr(self._quality, "__func__", None)
+                             is HourlyArticleCycle._quality)):
+                    record["review_protocol_contract"] = REVIEW_BOUNDS_V2_CONTRACT
                 if self.reserve_mode:
                     from .article_reserve import ArticleReserveStore
                     ArticleReserveStore(self.core).bind_preparation(reserve_claim, record["id"])
@@ -914,6 +967,8 @@ class HourlyArticleCycle:
                        "started_at": now(), "state": "preparing", "operator_retry": bool(retry_record) and not repair_claim}
             if "review_rubric" in record:
                 attempt["review_rubric"] = automatic_review_rubric(record)
+            if "review_protocol_contract" in record:
+                attempt["review_protocol_contract"] = record["review_protocol_contract"]
             if "reference_contract" in record:
                 if (not isinstance(record["reference_contract"], str)
                         or record["reference_contract"] not in REFERENCE_CONTRACTS):
@@ -962,6 +1017,8 @@ class HourlyArticleCycle:
                         candidate_hash=attempt.get("candidate_hash"), operator_correction=attempt.get("operator_correction", False),
                         automatic_repair_claim=automatic_repair_claim,
                         **({"review_rubric": attempt["review_rubric"]} if "review_rubric" in attempt else {}),
+                        **({"review_protocol_contract": attempt["review_protocol_contract"]}
+                           if "review_protocol_contract" in attempt else {}),
                         **({"reference_contract": attempt["reference_contract"]}
                            if "reference_contract" in attempt else {}),
                         **({"scientific_spelling_contract": attempt["scientific_spelling_contract"]}
@@ -995,9 +1052,22 @@ class HourlyArticleCycle:
                     attempt["image_preparation_state"] = "failed"
                 attempt.update(state="needs_attention", error=record["error"], finished_at=now())
                 self._save(ledger)
+                completion = None
+                if (record["error"] == "ARTICLE_QUALITY_REJECTED"
+                        and record.get("review_protocol_contract") == "article-review-bounds-v2"):
+                    from .completed_review import completed_review_proof
+                    try:
+                        completion = completed_review_proof(self, record, article, require_anchor=False)
+                    except AgentError:
+                        # Неполный trace/таймаут не получают положительного terminal proof.
+                        pass
+                    else:
+                        attempt["completed_review_protocol"] = completion
+                        self._save(ledger)
                 with self.core.db.session.begin() as session:
                     self.core.db.audit(session, "article_quality", "hourly_article_prepare_error", record["id"],
-                        attempt=attempt["number"], error=record["error"])
+                        attempt=attempt["number"], error=record["error"],
+                        **({"completed_review_protocol_hash": fingerprint(completion)} if completion else {}))
                 raise
             finally:
                 if quality:
@@ -1019,6 +1089,8 @@ class HourlyArticleCycle:
         if (policy.get("approval_mode") == "automatic"
                 and prepared.get("review_rubric") != automatic_review_rubric(record)):
             raise AgentError("ARTICLE_REVIEW_RUBRIC_BINDING_INVALID", 409)
+        if prepared.get("review_protocol_contract") != record.get("review_protocol_contract"):
+            raise AgentError("ARTICLE_REVIEW_PROTOCOL_BINDING_INVALID", 409)
         if (record.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
                 != prepared.get("reference_contract", LEGACY_REFERENCE_CONTRACT)):
             raise AgentError("ARTICLE_REFERENCE_CONTRACT_INVALID", 409)

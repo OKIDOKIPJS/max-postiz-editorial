@@ -225,8 +225,20 @@ class ReserveServerCycle(ServerCycle):
         return self._phase("reserve_empty", next_run_at=self.clock() + 30,
             last_error={"code": "ARTICLE_RESERVE_EMPTY"})
 
+    def _quarantine_completed_review(self, claim, record):
+        # Положительный durable proof отделён от обычного отказа и от unknown.
+        # Проверка повторяется внутри короткой транзакции, без новых моделей.
+        if (record.get("review_protocol_contract") == "article-review-bounds-v2"
+                and record.get("preparation_attempts")
+                and record["preparation_attempts"][-1].get("completed_review_protocol")):
+            self.reserve.quarantine_completed_review(claim, record["id"], cycle=self.cycle)
+            return True
+        return False
+
     def _finish_candidate(self, claim, record):
         for _ in range(2):
+            if self._quarantine_completed_review(claim, record):
+                return "protocol_rejected"
             if record["state"] == "quality_ready":
                 if self.reserve.disqualify_semantic_ready(record["id"], cycle=self.cycle, claim=claim):
                     return "semantic_rejected"
@@ -246,6 +258,8 @@ class ReserveServerCycle(ServerCycle):
                             or not self._known_rejection(fresh)):
                         raise
             record = self.cycle._record(self.cycle._load(), record["id"])
+        if self._quarantine_completed_review(claim, record):
+            return "protocol_rejected"
         if record["state"] == "quality_ready":
             if self.reserve.disqualify_semantic_ready(record["id"], cycle=self.cycle, claim=claim):
                 return "semantic_rejected"
@@ -277,8 +291,19 @@ class ReserveServerCycle(ServerCycle):
             if ready.get("state") == "quality_ready" and ready.get("reserve_contract") == RESERVE_CONTRACT:
                 if self.reserve.disqualify_semantic_ready(ready["id"], cycle=self.cycle):
                     self._refilling = True
-        if self.reserve.active_preparation():
-            return self._phase("blocked", last_error={"code": "ARTICLE_RESERVE_PREPARATION_ACTIVE"})
+        active_claim = self.reserve.active_preparation()
+        if active_claim:
+            record = next((r for r in self.cycle._load()["records"]
+                           if r.get("id") == active_claim.get("record_id")), None)
+            # После рестарта можно завершить только тот же законченный verdict,
+            # закреплённый до ошибки. Возраст claim ничего не разрешает.
+            original_claim = record.get("reserve_claim") if record else None
+            if (not isinstance(original_claim, dict)
+                    or active_claim.get("record_id") != record["id"]
+                    or any(original_claim.get(key) != active_claim.get(key)
+                           for key in ("id", "token", "control_revision"))
+                    or not self._quarantine_completed_review(original_claim, record)):
+                return self._phase("blocked", last_error={"code": "ARTICLE_RESERVE_PREPARATION_ACTIVE"})
         active, leased = self._inventory()
         if leased or any(d["state"] in {"sending", "unknown"} for d in active):
             return self._phase("blocked", last_error={"code": "ARTICLE_RECONCILIATION_REQUIRED"})

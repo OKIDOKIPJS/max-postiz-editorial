@@ -14,10 +14,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["start", "stop", "status"])
     parser.add_argument("--port", type=int, default=55438)
+    parser.add_argument("--runtime-root", type=Path,
+                        help="ASCII junction к data этой копии для Windows PostgreSQL")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    binary = root / "data/tools/pgsql/bin"
-    cluster = root / "data/postgres"
+    runtime = args.runtime_root or root / "data"
+    if runtime.resolve() != (root / "data").resolve():
+        raise RuntimeError("Runtime must resolve to this checkout's data directory")
+    binary = runtime / "tools/pgsql/bin"
+    cluster = runtime / "postgres"
     access = root / "data/postgres-access.json"
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -40,7 +45,7 @@ def main():
         access.write_text(json.dumps({"password": secrets.token_urlsafe(32), "port": args.port}), encoding="utf-8")
     value = json.loads(access.read_text(encoding="utf-8"))
     if not cluster.exists():
-        password_file = root / "data/postgres-password.tmp"
+        password_file = runtime / "postgres-password.tmp"
         password_file.write_text(value["password"], encoding="utf-8")
         try:
             run("initdb", "-D", cluster, "-U", "hub_admin", "-E", "UTF8", "--locale=C", "-A", "scram-sha-256", "--pwfile", password_file)
@@ -51,7 +56,7 @@ def main():
     status = subprocess.run([str(binary / "pg_ctl.exe"), "-D", str(cluster), "status"],
                             capture_output=True, creationflags=flags)
     if status.returncode:
-        run("pg_ctl", "-D", cluster, "-l", root / "data/postgres.log", "-w", "start")
+        run("pg_ctl", "-D", cluster, "-l", runtime / "postgres.log", "-w", "start")
     with psycopg.connect(host="127.0.0.1", port=value["port"], user="hub_admin", password=value["password"], dbname="postgres", autocommit=True, connect_timeout=10) as conn:
         for db in ("editorial_hub", "editorial_hub_tests"):
             if not conn.execute("SELECT 1 FROM pg_database WHERE datname=%s", (db,)).fetchone():

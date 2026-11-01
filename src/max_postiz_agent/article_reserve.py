@@ -11,7 +11,7 @@ from collections import Counter
 from decimal import Decimal
 from uuid import NAMESPACE_URL, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from .article_attribution import illustrated_presentation
@@ -115,6 +115,16 @@ def _stamp(value):
     return type(value) in {int, float} and math.isfinite(value) and value >= 0
 
 
+def _postiz_due_matches(observed, signed):
+    """Postiz хранит миллисекунды; подписанная дата остаётся без округления."""
+    # Верхняя граница — 10000-01-01 UTC, вне поддерживаемого ISO datetime.
+    if not all(type(value) in {int, float} and 0 <= value < 253402300800
+               and math.isfinite(value) for value in (observed, signed)):
+        return False
+    # На больших Unix timestamps float может представить ровно 1 мс как <1 мс.
+    return abs(Decimal(str(observed)) - Decimal(str(signed))) < Decimal("0.001")
+
+
 def _hash(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
@@ -212,6 +222,87 @@ class ArticleReserveStore:
                 EditorialPreparationClaim.active_key == "models"))
             return _claim_view(row) if row else None
 
+    def quarantine_completed_review(self, claim, record_id, *, cycle):
+        """Закрыть свой полный protocol refusal, не повторяя модель или статью.
+
+        blocked_unknown снимается только положительным новым proof + Audit.
+        Возраст, отсутствие HTTP-запросов сейчас и сам текст ошибки не доказательство.
+        """
+        from .completed_review import completed_review_proof, UNSAFE
+        from .db import Material, Story
+
+        def require(value):
+            if not value:
+                raise AgentError(UNSAFE, 409)
+
+        require(cycle.core is self.core and cycle.reserve_mode and isinstance(claim, dict)
+            and isinstance(record_id, str) and re.fullmatch(r"[a-f0-9-]{36}", record_id))
+        with self.core.db.session.begin() as session:
+            control = self._control(session)
+            row = session.scalar(select(EditorialPreparationClaim).where(
+                EditorialPreparationClaim.id == claim.get("id")).with_for_update())
+            ledger = session.scalar(select(EditorialLedger).where(
+                EditorialLedger.id == LEDGER_ID).with_for_update())
+            payload = copy.deepcopy(ledger.payload) if ledger else {}
+            records = [r for r in payload.get("records", []) if isinstance(r, dict) and r.get("id") == record_id]
+            record = records[0] if len(records) == 1 else {}
+            require(row is not None and row.token == claim.get("token")
+                and type(claim.get("control_revision")) is int
+                and row.control_revision == claim["control_revision"] == control.revision
+                and row.record_id == record_id and row.active_key == "models"
+                and row.state in {"preparing", "blocked_unknown"}
+                and row.error in {None, "ARTICLE_QUALITY_REJECTED", "ARTICLE_RECONCILIATION_REQUIRED"}
+                and record.get("reserve_claim") == claim and record.get("reserve_contract") == RESERVE_CONTRACT
+                and not record.get("protocol_guard") and not record.get("cancelled_at"))
+            binding = {key: record.get(key) for key in ("id", "reserve_contract", "reserve_claim", "input_hash",
+                "policy_hash", "target_id", "source_id", "original_hash", "source_published_at")}
+            audit = session.get(Audit, str(uuid5(NAMESPACE_URL, "max-postiz:reserve-binding:" + record_id)))
+            require(audit is not None and audit.actor == "article_reserve" and audit.entity == record_id
+                and audit.action == "article_reserve_preparation_binding"
+                and audit.details == {"binding": binding, "binding_hash": fingerprint(binding)}
+                and record.get("reserve_binding_hash") == fingerprint(binding))
+            policy = cycle._policy_for_record(record)
+            require(policy.get("approval_mode") == "automatic" and fingerprint(policy) == record.get("policy_hash"))
+            require(not any(record.get(key) is not None for key in ("variant_id", "postiz_id", "dispatch_id",
+                "material_id", "story_id", "due_at", "prepared_hash", "reserve_prepared_hash", "publication_slot_id"))
+                and not session.scalar(select(Story).where(Story.text_hash == fingerprint({"hourly_article": record_id})))
+                and not session.scalar(select(Material).where(Material.url == record.get("url")))
+                and not any(isinstance(v.metadata_json, dict) and v.metadata_json.get("record_id") == record_id
+                    for v in session.scalars(select(Variant)))
+                and not any(isinstance(d.snapshot, dict) and isinstance(d.snapshot.get("metadata"), dict)
+                    and d.snapshot["metadata"].get("record_id") == record_id for d in session.scalars(select(Dispatch)))
+                and not session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == record_id)))
+            # Чужая действующая внешняя мутация не закрывается этой операцией.
+            require(not session.scalar(select(Dispatch).where(Dispatch.state.in_(["sending", "unknown"])))
+                and not session.scalar(select(Dispatch).where(Dispatch.owner.is_not(None)))
+                and not session.scalar(select(Dispatch).where(or_(Dispatch.lease_until != 0, Dispatch.lease_until.is_(None))))
+                and not session.scalar(select(BridgePost).where(BridgePost.mutation_owner.is_not(None)))
+                and not session.scalar(select(BridgePost).where(or_(BridgePost.mutation_until != 0, BridgePost.mutation_until.is_(None)))))
+            proof = completed_review_proof(cycle, record, session=session)
+            if proof["kind"] == "candidate":
+                repair = record["automatic_repair_attempts"][-1]
+                repair_audit = session.get(Audit, str(uuid5(NAMESPACE_URL, repair["id"] + ":review-protocol-quarantine")))
+                require(repair.get("state") == "not_repairable" and repair.get("outcome_origin") == "review_protocol_guard"
+                    and repair.get("completed_review_protocol") == proof
+                    and repair.get("completed_review_protocol_hash") == fingerprint(proof)
+                    and repair_audit is not None and repair_audit.actor == "automatic_article_repair"
+                    and repair_audit.action == "automatic_article_review_protocol_quarantined"
+                    and repair_audit.entity == record_id and repair_audit.details == {
+                        "claim_id": repair["id"], "candidate_hash": repair["candidate_hash"], "proof_hash": fingerprint(proof)})
+            # Re-read raw evidence before any mutation; the saved refusal stays byte-exact.
+            require(completed_review_proof(cycle, record, session=session) == proof)
+            stamp = now()
+            disposition = {"contract": proof["contract"], "at": stamp, "proof_hash": fingerprint(proof),
+                "trace_hash": proof["quality_trace_hash"], "raw_review_sha256": proof["raw_review_sha256"],
+                "source_remains_used": True, "approval_permitted": False, "no_retry": True}
+            record.update(state="cancelled", cancelled_at=stamp, protocol_guard=disposition)
+            ledger.payload, ledger.revision, ledger.updated_at = payload, ledger.revision + 1, stamp
+            row.state, row.active_key, row.updated_at = "rejected", None, stamp
+            self.core.db.audit(session, "article_reserve", "reserve_completed_review_quarantined", record_id,
+                **disposition, claim_id=row.id, control_revision=control.revision,
+                error_preserved=record.get("error"), model_calls=0, external_operations=0)
+            return {"record_id": record_id, "claim_id": row.id, "state": "cancelled", "proof_hash": fingerprint(proof)}
+
     def finish_unbound_selection_on_pause(self, claim, *, expected_revision):
         """Пауза закрывает только выбор источника, ещё не привязавший запись.
 
@@ -305,7 +396,7 @@ class ArticleReserveStore:
 
     def reject_translation_preflight(self, claim, record_id, rejection, *, cycle):
         """Только доказанный локальный отказ разбиения до первого HTTP модели."""
-        from .article_quality import numbers
+        from .article_quality import numbers, review_protocol_marker
         from .config import inside, parse_json
         from .db import Story
         from .reddit import text_hash
@@ -384,8 +475,11 @@ class ArticleReserveStore:
                 and [e.get("phase") for e in events] == ["translation_started", "translation_failed"])
             markers = ({key: record[key] for key in ("presentation_contract", "image_credit")}
                        if illustrated_presentation(record.get("presentation_contract")) else {})
+            protocol = review_protocol_marker(record.get("review_protocol_contract"), record.get("review_rubric", "meaning-first-v1"))
+            markers.update(protocol)
             context = {"instruction": (root / "prompts/ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8"),
-                "source_untrusted": source, "numeric_tokens_must_match_exactly": sorted(numbers(source["title"] + "\n\n" + source["body"]))}
+                "source_untrusted": source, "numeric_tokens_must_match_exactly": sorted(numbers(source["title"] + "\n\n" + source["body"])),
+                **protocol}
             if record.get("scientific_spelling_contract"):
                 context["scientific_spelling_contract"] = record["scientific_spelling_contract"]
             if record.get("reference_contract") == "article-links-v2":
@@ -409,7 +503,10 @@ class ArticleReserveStore:
                 and not session.scalar(select(Story).where(Story.text_hash == fingerprint({"hourly_article": record_id})))
                 and not any(v.metadata_json.get("record_id") == record_id for v in session.scalars(select(Variant)))
                 and not session.scalar(select(PublicationSlot).where(PublicationSlot.record_id == record_id)))
-            if markers:
+            if protocol:
+                from .article_cycle import review_protocol_binding
+                review_protocol_binding(self.core, session, record)
+            if illustrated_presentation(record.get("presentation_contract")):
                 from .article_images import validate_article_image
                 validate_article_image(self.core, record)
                 require(attempt.get("image_preparation_state") == "ready"
@@ -857,6 +954,8 @@ class ArticleReserveStore:
         config_hash = self.core.settings.hash
         require(isinstance(proof, dict) and _hash(proof.get("sha256"))
             and isinstance(proof.get("proof"), dict) and _stamp(proof["proof"].get("failed_at")))
+        # MAX 429 требует остановки: другой источник не разрешает новый GET канала.
+        require(proof["proof"].get("error", {}).get("code") != "BROWSER_CHANNEL_RATE_LIMITED")
         with self.core.db.session.begin() as session:
             control = self._control(session)
             if type(expected_revision) is not int or control.revision != expected_revision:
@@ -921,7 +1020,8 @@ class ArticleReserveStore:
                 and metadata.get("record_id") == record["id"] and metadata.get("policy_hash") == record.get("policy_hash")
                 and metadata.get("reserve_contract") == RESERVE_CONTRACT
                 and metadata.get("reserve_binding_hash") == record.get("reserve_binding_hash")
-                and metadata.get("postiz_post_id") == link.post_id and metadata.get("postiz_due_at") == row.due_at
+                and metadata.get("postiz_post_id") == link.post_id
+                and _postiz_due_matches(metadata.get("postiz_due_at"), row.due_at)
                 and metadata.get("postiz_state") == "QUEUE" and variant.target_id == target.id
                 and target.platform == "max" and target.route == "max_browser" and target.enabled
                 and row.text_hash == record.get("reserve_prepared_hash")

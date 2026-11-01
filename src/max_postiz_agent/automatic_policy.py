@@ -10,7 +10,6 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from .adapters import extract_object
 from .article_attribution import illustrated_presentation
 from .article_links import LEGACY_REFERENCE_CONTRACT, REFERENCE_CONTRACT, reference_urls
 from .config import AgentError, fingerprint, inside, parse_json
@@ -19,6 +18,42 @@ from .hub_models import BridgePost, Dispatch, RemoteDraft, Target, TargetApprova
 from .human_review import candidate_body, machine_current, source_data, text_hash
 
 POLICY_ACTOR = "hourly_article_policy"
+
+
+def review_protocol_trace_binding(trace_path, evidence):
+    """Новый parser выбирается полным trace/evidence, а не текущим кодом сервера."""
+    from .article_quality import REVIEW_BOUNDS_V2_CONTRACT
+    try:
+        raw = trace_path.read_bytes()
+        if (not 0 < len(raw) <= 2 * 1024 * 1024
+                or hashlib.sha256(raw).hexdigest() != evidence["trace_hash"]):
+            raise ValueError
+        events = [parse_json(line) for line in raw.decode("utf-8").splitlines()]
+        if (not events or len(events) > 10000
+                or any(not isinstance(event, dict)
+                       or event.get("review_protocol_contract") != REVIEW_BOUNDS_V2_CONTRACT for event in events)):
+            raise ValueError
+        record_id = events[0].get("record_id")
+        if not isinstance(record_id, str) or not record_id or any(event.get("record_id") != record_id for event in events):
+            raise ValueError
+        if events[-1].get("phase") != "accepted":
+            raise ValueError
+        result = events[-1]["result"]
+        if (result.get("review_protocol_contract") != REVIEW_BOUNDS_V2_CONTRACT
+                or result["machine_review_evidence"] != {key: value for key, value in evidence.items() if key != "trace_hash"}):
+            raise ValueError
+        review_events = [event for event in events if event.get("phase") == "review_started"]
+        context = review_events[-1]["context"]
+        if (context.get("review_protocol_contract") != REVIEW_BOUNDS_V2_CONTRACT
+                or context.get("source_untrusted") != result["original"]
+                or context.get("translation_untrusted") != result["translation"]
+                or context.get("review_prompt_hash") != evidence["review_prompt_hash"]
+                or hashlib.sha256(context["instruction"].encode("utf-8")).hexdigest() != evidence["review_prompt_hash"]
+                or next(e["raw"] for e in reversed(events) if e.get("phase") == "review_returned") != evidence["review_raw"]
+                or next(e["review"] for e in reversed(events) if e.get("phase") == "review_parsed") != evidence["review"]):
+            raise ValueError
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError, AttributeError, IndexError, StopIteration) as exc:
+        raise AgentError("ARTICLE_REVIEW_PROTOCOL_BINDING_INVALID", 409) from exc
 
 
 def scientific_trace_binding(trace_path, contract, *, expected_hash=None, expected_evidence=None,
@@ -98,12 +133,13 @@ def scientific_trace_binding(trace_path, contract, *, expected_hash=None, expect
 def _validate(evidence, title, body, source):
     from .article_quality import (AUTOMATIC_REVIEW_RUBRICS, FRESH_SPACETIME_SPELLING_CONTRACT,
                                   MAX_REVIEW_ISSUES, TOPICS,
-                                  normalize_rubric_review, protocol_recovery_provenance,
+                                  HOURLY_PRACTICAL_V2_REVIEW_RUBRIC, REVIEW_BOUNDS_V2_CONTRACT,
+                                  decode_rubric_review, normalize_rubric_review, protocol_recovery_provenance,
                                   review_parser_contract, rubric_spelling, rubric_translation_gate)
     required = {"review_raw", "review", "spelling_matches", "spelling_adjudicated", "spelling_unresolved",
                 "hard_gates_passed", "text_hash", "source_hash", "review_rubric", "review_prompt_hash", "trace_hash"}
     optional = {"parser_contract", "protocol_recovery", "fresh_spelling_contract", "reference_check",
-                "scientific_spelling_contract", "presentation_contract", "image_credit"}
+                "scientific_spelling_contract", "presentation_contract", "image_credit", "review_protocol_contract"}
     if (not isinstance(evidence, dict) or not required <= set(evidence) <= required | optional
             or not isinstance(evidence["review_rubric"], str)
             or evidence["review_rubric"] not in AUTOMATIC_REVIEW_RUBRICS
@@ -125,13 +161,19 @@ def _validate(evidence, title, body, source):
             or "protocol_recovery" in evidence):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     rubric = evidence["review_rubric"]
-    review = normalize_rubric_review(evidence["review"], rubric)
-    if (normalize_rubric_review(extract_object(evidence["review_raw"]), rubric) != review
+    protocol = evidence.get("review_protocol_contract")
+    if "review_protocol_contract" in evidence and (
+            protocol != REVIEW_BOUNDS_V2_CONTRACT or rubric != HOURLY_PRACTICAL_V2_REVIEW_RUBRIC
+            or "parser_contract" not in evidence or "protocol_recovery" in evidence):
+        raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
+    review = normalize_rubric_review(evidence["review"], rubric, review_protocol_contract=protocol)
+    if (decode_rubric_review(evidence["review_raw"], rubric, review_protocol_contract=protocol) != review
             or review["approved"] is not True or review["issues"] or review["topic"] not in TOPICS):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     if "parser_contract" in evidence:
         if (not isinstance(evidence["parser_contract"], dict)
-                or fingerprint(evidence["parser_contract"]) != fingerprint(review_parser_contract(evidence["review_raw"]))):
+                or fingerprint(evidence["parser_contract"]) != fingerprint(review_parser_contract(
+                    evidence["review_raw"], review_protocol_contract=protocol))):
             raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     elif len(review["warnings"]) > MAX_REVIEW_ISSUES:
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
@@ -183,6 +225,10 @@ def machine_metadata(prepared, source, trace_path):
         raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_BINDING_INVALID", 409)
     if any(prepared.get(key) != evidence.get(key) for key in ("presentation_contract", "image_credit")):
         raise AgentError("ARTICLE_PRESENTATION_BINDING_INVALID", 409)
+    if prepared.get("review_protocol_contract") != evidence.get("review_protocol_contract"):
+        raise AgentError("ARTICLE_REVIEW_PROTOCOL_BINDING_INVALID", 409)
+    if "review_protocol_contract" in evidence:
+        review_protocol_trace_binding(trace_path, evidence)
     if "scientific_spelling_contract" in evidence:
         scientific_trace_binding(trace_path, evidence["scientific_spelling_contract"], expected_hash=hashed,
                                  expected_evidence=evidence)
@@ -190,7 +236,8 @@ def machine_metadata(prepared, source, trace_path):
     if (prepared.get("review_rubric") != evidence["review_rubric"]
             or prepared.get("review_prompt_hash") != evidence["review_prompt_hash"]
             or evidence["review_prompt_hash"] != hashlib.sha256((trace_path.parents[2] / "prompts" /
-                review_prompt_name(evidence["review_rubric"])).read_text(encoding="utf-8").encode("utf-8")).hexdigest()):
+                review_prompt_name(evidence["review_rubric"], review_protocol_contract=evidence.get("review_protocol_contract")))
+                .read_text(encoding="utf-8").encode("utf-8")).hexdigest()):
         raise AgentError("ARTICLE_AUTOMATIC_EVIDENCE_INVALID", 409)
     reference_contract = evidence.get("reference_check", {}).get("contract", LEGACY_REFERENCE_CONTRACT)
     if prepared.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != reference_contract:
@@ -199,6 +246,8 @@ def machine_metadata(prepared, source, trace_path):
             "machine_review_warnings": review["warnings"], "machine_review_evidence": evidence,
             "machine_review_evidence_hash": fingerprint(evidence), "review_rubric": evidence["review_rubric"],
             "review_prompt_hash": evidence["review_prompt_hash"],
+            **({"review_protocol_contract": evidence["review_protocol_contract"]}
+               if "review_protocol_contract" in evidence else {}),
             **({"scientific_spelling_contract": evidence["scientific_spelling_contract"]}
                if "scientific_spelling_contract" in evidence else {}),
             **({"reference_contract": reference_contract}
@@ -219,6 +268,7 @@ def automatic_evidence(session, variant):
         if (hashed != variant.metadata_json.get("machine_review_evidence_hash")
                 or variant.metadata_json.get("review_rubric") != evidence["review_rubric"]
                 or variant.metadata_json.get("review_prompt_hash") != evidence["review_prompt_hash"]
+                or variant.metadata_json.get("review_protocol_contract") != evidence.get("review_protocol_contract")
                 or variant.metadata_json.get("scientific_spelling_contract") != evidence.get("scientific_spelling_contract")
                 or variant.metadata_json.get("reference_contract", LEGACY_REFERENCE_CONTRACT)
                 != evidence.get("reference_check", {}).get("contract", LEGACY_REFERENCE_CONTRACT)
@@ -317,7 +367,8 @@ def _eligible_record(cycle, session, variant, policy, record, *, reserve_unassig
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
     if (record.get("source_id") != policy["source_id"]
             or record.get("target_id") != policy["target_id"]
-            or record.get("policy_hash") != fingerprint(policy)):
+            or record.get("policy_hash") != fingerprint(policy)
+            or record.get("review_protocol_contract") != variant.metadata_json.get("review_protocol_contract")):
         raise AgentError("ARTICLE_AUTOMATIC_NOT_ELIGIBLE", 409)
     from .article_repair_cycle import AutomaticArticleRepair
     AutomaticArticleRepair(cycle).assert_complete(record, session)
@@ -342,7 +393,8 @@ def _eligible_record(cycle, session, variant, policy, record, *, reserve_unassig
     rubric_translation_gate(source["title"] + "\n\n" + source["body"],
         variant.title + "\n\n" + candidate_body(variant, source), rubric,
         reference_contract=REFERENCE_CONTRACT)
-    prompt_hash = hashlib.sha256((core.settings.root / "prompts" / review_prompt_name(rubric))
+    prompt_hash = hashlib.sha256((core.settings.root / "prompts" / review_prompt_name(rubric,
+                                review_protocol_contract=record.get("review_protocol_contract")))
                                 .read_text(encoding="utf-8").encode("utf-8")).hexdigest()
     if variant.metadata_json.get("review_prompt_hash") != prompt_hash:
         raise AgentError("ARTICLE_AUTOMATIC_RECHECK_REQUIRED", 409)

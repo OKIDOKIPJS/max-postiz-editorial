@@ -61,6 +61,9 @@ def main(argv=None):
                     while not stop.is_set():
                         try:
                             core.dispatch_tick()
+                            # Отдельные согласования новых адресатов не наследуют
+                            # MAX hourly policy; отправляет тот же владелец worker.
+                            core.publish_due(platform_routes_only=True)
                             controller.run_once()
                         except Exception as exc:
                             code = exc.code if isinstance(exc, AgentError) else "EDITORIAL_WORKER_ERROR"

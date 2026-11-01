@@ -37,6 +37,7 @@ from max_postiz_agent.browser_runtime import profile_lock
 from max_postiz_agent.config import AgentError, fingerprint, parse_json
 from max_postiz_agent.editorial import numbers
 from max_postiz_agent.reddit import text_hash
+from max_postiz_agent.report_files import replace_report_file
 
 CONTRACT = "article-benchmark-mechanical-quality-v1"
 ROUTES = ("hy_current", "hy_glossary", "madlad400_3b", "translategemma")
@@ -196,7 +197,7 @@ def save_report(path, report):
         stream.write(raw)
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    replace_report_file(temporary, path)
     if os.name != "nt":
         descriptor = os.open(path.parent, os.O_RDONLY)
         try:

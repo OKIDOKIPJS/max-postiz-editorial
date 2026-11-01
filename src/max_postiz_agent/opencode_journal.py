@@ -119,6 +119,24 @@ class OpenCodeRequestJournal:
             "text_bytes": len(text.encode("utf-8")),
         })
 
+    def completed_generation(self):
+        """Привязка полного полученного ответа; не разрешение повторить запрос."""
+        names = ("intent.json", "session.json", "create.json", "create.raw",
+                 "response.json", "response.raw", "validated.json")
+        try:
+            files = {}
+            for name in names:
+                path = self._path(self.relative + "/" + name)
+                if not path.is_file() or path.is_symlink():
+                    raise OSError("Completion evidence unavailable")
+                files[name] = _sha(path.read_bytes())
+            validated = json.loads(self._path(self.relative + "/validated.json").read_bytes())
+            return {"contract": "opencode-completed-generation-v1", "directory": self.relative,
+                    "prompt_sha256": self.prompt_hash, "text_sha256": validated["text_sha256"],
+                    "files": files}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise AgentError("OPENCODE_JOURNAL_FAILED", 503) from exc
+
     def failed(self, code, stage):
         # Исключения httpx могут включать URL/credentials, поэтому их текст не сохраняем.
         self._json("failure.json", {

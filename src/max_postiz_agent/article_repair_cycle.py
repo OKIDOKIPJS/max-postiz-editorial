@@ -30,7 +30,7 @@ QUARANTINE_ERRORS = {"ARTICLE_REPAIR_RESPONSE_INVALID", "ARTICLE_REPAIR_PATCH_IN
 _BINDING = ("id", "number", "contract", "model", "input_hash", "policy_hash", "slot",
             "parent_trace_hash", "parent_trace_bytes", "snapshot_hash", "snapshot_path", "prompts", "target_binding_hash",
             "source_config_hash", "reference_contract", "review_rubric", "presentation_contract", "image_credit",
-            "feedback_contract", "raw_feedback_hash", "model_input")
+            "feedback_contract", "raw_feedback_hash", "model_input", "review_protocol_contract")
 
 
 def _now():
@@ -126,6 +126,12 @@ class AutomaticArticleRepair:
                 self._quarantine_proof(record, history[-1], saved=True)
             except (AgentError, OSError, ValueError, TypeError, KeyError, UnicodeError):
                 return {**result, "reason": "TRACE_INVALID"}
+        if history and history[-1].get("outcome_origin") == "review_protocol_guard":
+            try:
+                self._review_protocol_guard_proof(record, history[-1], saved=True)
+            except (AgentError, OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                return {**result, "reason": "TRACE_INVALID"}
+            return {**result, "reason": "NOT_REPAIRABLE"}
         if record.get("state") != "needs_attention" or record.get("error") != "ARTICLE_QUALITY_REJECTED":
             return result
         try:
@@ -159,14 +165,15 @@ class AutomaticArticleRepair:
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         return expected
 
-    def _prompts(self, contract=None, rubric="meaning-first-v1"):
+    def _prompts(self, contract=None, rubric="meaning-first-v1", *, review_protocol_contract=None):
         # Claim привязан к своей версии промпта: новая редакция не переоценивает
         # сохранённые v3/v4 и не меняет их имена полей или hashes в истории.
         repair_prompt = repair_prompt_name(REPAIR_CONTRACT if contract is None else contract)
         from .article_quality import review_prompt_name
         root = self.core.settings.root / "prompts"
         from .article_quality import HOURLY_PRACTICAL_V2_REVIEW_RUBRIC
-        names = ["ARTICLE_TRANSLATE.txt", review_prompt_name(rubric), repair_prompt]
+        names = ["ARTICLE_TRANSLATE.txt", review_prompt_name(rubric,
+                 review_protocol_contract=review_protocol_contract), repair_prompt]
         if rubric == HOURLY_PRACTICAL_V2_REVIEW_RUBRIC:
             names.append(COMPACT_REPAIR_PROMPT)
         return {name: _sha((root / name).read_bytes()) for name in names}
@@ -222,7 +229,8 @@ class AutomaticArticleRepair:
         """Читаем полный завершённый отказ, не принимая замечания за инструкции."""
         from .adapters import extract_object
         from .article_attribution import article_footer
-        from .article_quality import (_numeric_feedback, article_review_context, normalize_article_links, normalize_rubric_review,
+        from .article_quality import (_numeric_feedback, article_review_context, decode_rubric_review,
+                                      normalize_article_links, review_protocol_marker,
                                       rubric_spelling, rubric_translation_gate, TOPICS)
         from .editorial import numbers
 
@@ -242,6 +250,8 @@ class AutomaticArticleRepair:
         try:
             from .article_cycle import automatic_review_rubric, review_rubric_binding, scientific_contract_binding
             rubric = automatic_review_rubric(record)
+            protocol = record.get("review_protocol_contract")
+            protocol_marker = review_protocol_marker(protocol, rubric)
             presentation = presentation_binding(record.get("presentation_contract"), record.get("image_credit"))
             with self.core.db.session() as session:
                 scientific_contract = scientific_contract_binding(self.core, session, record)
@@ -257,6 +267,7 @@ class AutomaticArticleRepair:
                 event = parse_json(line)
                 require(isinstance(event, dict) and event.get("record_id") == record["id"]
                         and isinstance(event.get("phase"), str)
+                        and event.get("review_protocol_contract") == protocol
                         and type(event.get("attempt")) is int and 1 <= event["attempt"] <= 3)
                 require(presentation_binding(event.get("presentation_contract"), event.get("image_credit")) == presentation)
                 stamp = timestamp(event.get("at"))
@@ -318,7 +329,8 @@ class AutomaticArticleRepair:
                     and (initial or len(starts) == 1))
             translation_prompt = (self.core.settings.root / "prompts/ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
             from .article_quality import review_prompt_name
-            review_prompt = (self.core.settings.root / "prompts" / review_prompt_name(rubric)).read_text(encoding="utf-8")
+            review_prompt = (self.core.settings.root / "prompts" / review_prompt_name(rubric,
+                             review_protocol_contract=protocol)).read_text(encoding="utf-8")
             review_hash = _sha(review_prompt.encode("utf-8"))
             original = source["title"] + "\n\n" + source["body"]
             prior_feedback = {}
@@ -334,6 +346,7 @@ class AutomaticArticleRepair:
                     require(isinstance(context, dict) and context.get("source_untrusted") == source
                             and context.get("instruction") == translation_prompt
                             and context.get("reference_contract", LEGACY_REFERENCE_CONTRACT) == reference_contract
+                            and context.get("review_protocol_contract") == protocol
                             and context.get("scientific_spelling_contract") == scientific_contract
                             and context.get("numeric_tokens_must_match_exactly") == sorted(numbers(original))
                             and isinstance(block[1].get("raw"), str))
@@ -385,10 +398,10 @@ class AutomaticArticleRepair:
                         context = tail[1].get("context")
                         require(isinstance(context, dict) and context == article_review_context(
                             review_prompt, original, translated, rubric, review_hash,
-                            reference_contract=reference_contract))
+                            reference_contract=reference_contract, review_protocol_contract=protocol))
                         require(isinstance(tail[2].get("raw"), str))
+                        reviewed = decode_rubric_review(tail[2]["raw"], rubric, review_protocol_contract=protocol)
                         raw_review = extract_object(tail[2]["raw"])
-                        reviewed = normalize_rubric_review(raw_review, rubric)
                         normalized = [e for e in tail if e["phase"] == "review_normalized"]
                         require(bool(normalized) == (reviewed != raw_review))
                         if normalized:
@@ -421,6 +434,7 @@ class AutomaticArticleRepair:
             payload = {"article": article, "candidate": candidate, "feedback": feedback,
                        "parent_trace_hash": _sha(raw), "rejected_replay_hashes": sorted(rejected)}
             payload.update(presentation)
+            payload.update(protocol_marker)
             if reference_contract != LEGACY_REFERENCE_CONTRACT:
                 payload["reference_contract"] = reference_contract
             if scientific_contract is not None:
@@ -439,7 +453,9 @@ class AutomaticArticleRepair:
         path = inside(self.core.settings.root, claim["repair_trace"])
 
         def write(event):
-            raw = json.dumps({**event, "record_id": record["id"], "repair_claim": claim["id"], "at": _now()}, ensure_ascii=False) + "\n"
+            raw = json.dumps({**event, "record_id": record["id"], "repair_claim": claim["id"], "at": _now(),
+                **({"review_protocol_contract": claim["review_protocol_contract"]}
+                   if "review_protocol_contract" in claim else {})}, ensure_ascii=False) + "\n"
             descriptor = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 stream.write(raw)
@@ -457,7 +473,8 @@ class AutomaticArticleRepair:
         self._files(record, claim, snapshot["article"])
         policy = self.cycle._policy_for_record(record)
         source, target = self.cycle._source_target(policy)
-        if (self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1")) != claim["prompts"] or fingerprint(policy) != claim["policy_hash"]
+        if (self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1"),
+                review_protocol_contract=claim.get("review_protocol_contract")) != claim["prompts"] or fingerprint(policy) != claim["policy_hash"]
                 or fingerprint(source) != claim["source_config_hash"] or target.binding_hash != claim["target_binding_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         with self.core.db.session() as session:
@@ -480,6 +497,7 @@ class AutomaticArticleRepair:
                                           contract=claim["contract"], feedback_contract=claim.get("feedback_contract"))
         if ([e.get("phase") for e in events] != ["repair_started", "repair_returned", "repair_failed"]
                 or any(e.get("record_id") != record["id"] or e.get("repair_claim") != claim["id"]
+                       or e.get("review_protocol_contract") != claim.get("review_protocol_contract")
                        or e.get("attempt") != 1 or e.get("binding") != expected for e in events)
                 or any(type(e.get("at")) not in {int, float} or not math.isfinite(e["at"])
                        or e["at"] < claim["started_at"] for e in events)
@@ -529,6 +547,48 @@ class AutomaticArticleRepair:
                                              "snapshot_hash": claim["snapshot_hash"]}):
                     raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
         return _sha(raw)
+
+    def _review_protocol_guard_proof(self, record, claim, *, saved=False):
+        """Завершённый неверный Min-response после Qwen не становится новым запросом."""
+        from .article_quality import REVIEW_BOUNDS_V2_CONTRACT
+        from .completed_review import completed_review_proof
+        code = "ARTICLE_AUTOMATIC_REPAIR_TRACE_INVALID"
+        history, blocked = self._history(record)
+        expected_state = "not_repairable" if saved else "checking"
+        if (record.get("review_protocol_contract") != REVIEW_BOUNDS_V2_CONTRACT
+                or claim.get("review_protocol_contract") != REVIEW_BOUNDS_V2_CONTRACT
+                or not history or history[-1] != claim or len(history) > MAX_AUTOMATIC_REPAIRS
+                or any(previous.get("state") != "rejected" for previous in history[:-1])
+                or blocked != (None if saved else "IN_PROGRESS")
+                or claim.get("state") != expected_state or claim.get("model") != REPAIR_MODEL
+                or record.get("state") != "needs_attention" or record.get("error") != "ARTICLE_QUALITY_REJECTED"
+                or saved and claim.get("outcome_origin") != "review_protocol_guard"
+                or not saved and claim.get("outcome_origin") is not None):
+            raise AgentError(code, 409)
+        self.cycle._assert_pre_draft(record)
+        snapshot = parse_json(inside(self.core.settings.root, claim["snapshot_path"]).read_text(encoding="utf-8"))
+        proposal = parse_json(inside(self.core.settings.root, claim["proposal_path"]).read_text(encoding="utf-8"))
+        candidate = proposal.get("candidate")
+        if (proposal.get("repairable") is False or proposal.get("evidence", {}).get("outcome") != "candidate"
+                or not isinstance(candidate, dict)
+                or fingerprint(candidate) != claim.get("candidate_hash")
+                or self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1"),
+                    review_protocol_contract=claim.get("review_protocol_contract")) != claim["prompts"]
+                or fingerprint(self.cycle._policy_for_record(record)) != claim["policy_hash"]):
+            raise AgentError(code, 409)
+        self._files(record, claim, snapshot["article"], candidate)
+        proof = completed_review_proof(self.cycle, record, snapshot["article"], require_anchor=True)
+        if saved:
+            details = {"claim_id": claim["id"], "candidate_hash": claim["candidate_hash"], "proof_hash": fingerprint(proof)}
+            with self.core.db.session() as session:
+                audit = session.get(Audit, str(uuid5(NAMESPACE_URL, claim["id"] + ":review-protocol-quarantine")))
+                if (claim.get("completed_review_protocol") != proof
+                        or claim.get("completed_review_protocol_hash") != fingerprint(proof)
+                        or not audit or audit.actor != "automatic_article_repair"
+                        or audit.action != "automatic_article_review_protocol_quarantined"
+                        or audit.entity != record["id"] or audit.details != details):
+                    raise AgentError(code, 409)
+        return proof
 
     def quarantine_failed_reference(self, ident, reason):
         """Адресный одноразовый карантин старого полного отказа по потере ссылки.
@@ -646,7 +706,8 @@ class AutomaticArticleRepair:
             if not audit or any(claim.get(key) != audit.details.get(key) for key in _BINDING):
                 raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
         if (fingerprint(article) != claim["input_hash"] or fingerprint(candidate) != claim.get("candidate_hash")
-                or self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1")) != claim["prompts"]
+                or self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1"),
+                    review_protocol_contract=claim.get("review_protocol_contract")) != claim["prompts"]
                 or _sha(inside(self.core.settings.root, record["quality_trace"]).read_bytes()) != claim["parent_trace_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         self._files(record, claim, article, candidate)
@@ -663,6 +724,8 @@ class AutomaticArticleRepair:
                 or presentation_binding(claim.get("presentation_contract"), claim.get("image_credit")) != presentation
                 or snapshot.get("review_rubric") != record.get("review_rubric")
                 or claim.get("review_rubric") != record.get("review_rubric")
+                or snapshot.get("review_protocol_contract") != record.get("review_protocol_contract")
+                or claim.get("review_protocol_contract") != record.get("review_protocol_contract")
                 or snapshot.get("scientific_spelling_contract") != record.get("scientific_spelling_contract")
                 or snapshot.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references
                 or record.get("reference_contract", LEGACY_REFERENCE_CONTRACT) != references):
@@ -719,7 +782,8 @@ class AutomaticArticleRepair:
 
     def after_quality(self, record, claim, article):
         source, target = self._quiet(record, self.cycle._policy_for_record(record))
-        if (self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1")) != claim["prompts"] or fingerprint(article) != claim["input_hash"]
+        if (self._prompts(claim["contract"], claim.get("review_rubric", "meaning-first-v1"),
+                review_protocol_contract=claim.get("review_protocol_contract")) != claim["prompts"] or fingerprint(article) != claim["input_hash"]
                 or target.binding_hash != claim["target_binding_hash"] or fingerprint(source) != claim["source_config_hash"]):
             raise AgentError("ARTICLE_AUTOMATIC_REPAIR_INPUT_CHANGED", 409)
         self._files(record, claim, article)
@@ -792,7 +856,8 @@ class AutomaticArticleRepair:
                 "parent_trace_hash": payload["parent_trace_hash"], "snapshot_path": path,
                 "parent_trace_bytes": len(inside(self.core.settings.root, record["quality_trace"]).read_bytes()),
                 "snapshot_hash": _write_json(inside(self.core.settings.root, path), payload),
-                "prompts": self._prompts(REPAIR_CONTRACT, record.get("review_rubric", "meaning-first-v1")), "target_binding_hash": target.binding_hash,
+                "prompts": self._prompts(REPAIR_CONTRACT, record.get("review_rubric", "meaning-first-v1"),
+                    review_protocol_contract=record.get("review_protocol_contract")), "target_binding_hash": target.binding_hash,
                 "source_config_hash": fingerprint(source),
                 "repair_trace": f"data/hourly-articles/repair-{claim_id}.local.jsonl",
                 "owner_authorization": "2026-10-22 bounded automatic translation corrections"}
@@ -801,6 +866,8 @@ class AutomaticArticleRepair:
                 claim["reference_contract"] = payload["reference_contract"]
             if "review_rubric" in record:
                 claim["review_rubric"] = record["review_rubric"]
+            if "review_protocol_contract" in record:
+                claim["review_protocol_contract"] = record["review_protocol_contract"]
             if payload.get("feedback_contract") is not None:
                 claim.update({key: copy.deepcopy(payload[key]) for key in ("feedback_contract", "raw_feedback_hash", "model_input")})
             try:
@@ -851,6 +918,7 @@ class AutomaticArticleRepair:
                 if (not 0 < len(repair_raw) <= 512 * 1024
                         or [e.get("phase") for e in repair_events] != ["repair_started", "repair_returned", terminal]
                         or any(e.get("record_id") != ident or e.get("repair_claim") != claim_id
+                               or e.get("review_protocol_contract") != claim.get("review_protocol_contract")
                                or e.get("attempt") != 1 for e in repair_events)
                         or repair_events[-1].get("result") != proposal
                         or repair_events[1].get("raw") != proposal.get("raw")
@@ -929,7 +997,38 @@ class AutomaticArticleRepair:
                 code = exc.code if isinstance(exc, AgentError) else "ARTICLE_AUTOMATIC_REPAIR_INTERRUPTED"
                 from .server_cycle import ServerCycle
                 known = code == "ARTICLE_QUALITY_REJECTED" and ServerCycle(self.core, cycle=cycle)._known_rejection(record)
-                claim.update(state="rejected" if known else "failed", error=code, finished_at=_now())
+                if known and record.get("review_protocol_contract") is not None:
+                    # Общий classifier может распознать завершённый protocol отказ.
+                    # Обычный rejected здесь требует именно полного semantic replay.
+                    try:
+                        self._payload(record)
+                    except (AgentError, OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                        known = False
+                protocol = None
+                if code == "ARTICLE_QUALITY_REJECTED" and record.get("review_protocol_contract") is not None:
+                    try:
+                        protocol = self._review_protocol_guard_proof(record, claim)
+                        details = {"claim_id": claim["id"], "candidate_hash": claim["candidate_hash"],
+                                   "proof_hash": fingerprint(protocol)}
+                        with self.core.db.session.begin() as session:
+                            audit_id = str(uuid5(NAMESPACE_URL, claim["id"] + ":review-protocol-quarantine"))
+                            audit = session.get(Audit, audit_id)
+                            if audit is not None:
+                                if (audit.actor != "automatic_article_repair"
+                                        or audit.action != "automatic_article_review_protocol_quarantined"
+                                        or audit.entity != ident or audit.details != details):
+                                    raise AgentError("ARTICLE_AUTOMATIC_REPAIR_CLAIM_LOST", 409)
+                            else:
+                                session.add(Audit(id=audit_id, actor="automatic_article_repair",
+                                    action="automatic_article_review_protocol_quarantined", entity=ident, details=details))
+                    except (AgentError, OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                        protocol = None
+                claim.update(state="not_repairable" if protocol is not None else "rejected" if known else "failed",
+                             error=code, finished_at=_now())
+                if protocol is not None:
+                    claim.update(outcome_origin="review_protocol_guard", completed_review_protocol=copy.deepcopy(protocol),
+                        completed_review_protocol_hash=fingerprint(protocol),
+                        reason="Completed invalid independent review; original candidate and rejection retained")
                 cycle._save(ledger)
             raise
         with profile_lock(cycle._preparation_lock()):

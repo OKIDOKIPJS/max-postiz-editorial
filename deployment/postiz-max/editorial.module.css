@@ -1,5 +1,6 @@
 /* Панель сжимается внутри flex-контейнера Postiz; широкая таблица прокручивается отдельно. */
 .panel { box-sizing: border-box; width: 100%; min-width: 0; max-width: 1120px; margin: 0 auto; padding: 32px 24px; color: var(--new-text-primary, #e5e7eb); }
+.panel *, .panel *::before, .panel *::after { box-sizing: border-box; }
 .header, .actions, .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .header { justify-content: space-between; margin-bottom: 24px; }
 .panel h1 { font-size: 28px; font-weight: 650; margin: 0; }
@@ -26,4 +27,19 @@
 .table th { color: #cbd5e1; }
 .detail { display: block; margin-top: 5px; font-size: 12px; color: #a5adba; }
 .srOnly { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+.routesGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 16px; }
+.routeTarget, .routeDraft { min-width: 0; border: 1px solid #475569; background: #101a28; border-radius: 9px; padding: 18px; }
+.routeDraft { display: grid; gap: 16px; margin-bottom: 18px; }
+.routeHeading { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.routeHeading h3 { min-width: 0; margin: 0; font-size: 17px; overflow-wrap: anywhere; }
+.destination { overflow-wrap: anywhere; }
+.subheading { font-size: 17px; margin: 28px 0 16px; }
+.fullBody { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; padding: 16px; background: #0b1320; border: 1px solid #334155; border-radius: 8px; }
+.consent { display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; font-size: 14px; }
+.consent input { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 3px; }
+.field input[type="datetime-local"] { color-scheme: dark; }
+.imagePreview { margin: 16px 0 0; padding: 14px; border: 1px solid #475569; border-radius: 8px; background: #0b1320; }
+.imagePreview img { display: block; max-width: 100%; max-height: 420px; object-fit: contain; border-radius: 6px; }
+.imagePreview figcaption { margin-top: 10px; }
+.button:focus-visible, .field input:focus-visible, .consent input:focus-visible { outline: 2px solid #93c5fd; outline-offset: 3px; }
 @media (max-width: 600px) { .panel { padding: 20px 12px; } .card { padding: 16px; } }

@@ -2,11 +2,13 @@
 import copy
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 import httpx
 
 from max_postiz_agent.browser_worker import _request_record, _snapshot_request, save
+from max_postiz_agent.article_reserve import _postiz_due_matches
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit
 from max_postiz_agent.hub_models import BridgePost, Dispatch, DispatchAttempt, Target, TargetApproval, Variant
@@ -16,7 +18,7 @@ from test_reserve_cancelled_slot_recovery import database_snapshot, other_dispat
 pytest_plugins = ["test_hourly_reserve_controller", "test_illustrated_article_flow"]
 
 
-def positive_failure(value, monkeypatch):
+def positive_failure(value, monkeypatch, *, error_code="BROWSER_COMPOSER_TEXT_MISMATCH", phase="composer_ready"):
     value.controller.prepare_once()
     value.controller.run_once()
     record = value.cycle._load()["records"][0]
@@ -34,8 +36,8 @@ def positive_failure(value, monkeypatch):
         assert payload["text"] == text and payload["attachment"] == attachment
         journal = {**_request_record(value.core.settings, payload),
             "contract": "browser-preclick-failure-v1", "state": "preclick_failed",
-            "send_started": False, "phase": "composer_ready", "failed_at": value.stamp[0],
-            "error": {"code": "BROWSER_COMPOSER_TEXT_MISMATCH", "type": "AgentError",
+            "send_started": False, "phase": phase, "failed_at": value.stamp[0],
+            "error": {"code": error_code, "type": "AgentError",
                       "message": "exact private diagnostic is preserved"}}
         path = value.core.settings.root / "data/browser-publications" / (request_id + ".json")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,11 +68,136 @@ def preclick_slot(reserve_controller, monkeypatch):
     return positive_failure(reserve_controller, monkeypatch)
 
 
+@pytest.fixture
+def millisecond_preclick_slot(illustrated, monkeypatch):
+    value = illustrated
+    # Set the production-like fraction BEFORE preparation, staging and approval.
+    value.stamp[0] = int(value.stamp[0]) + .308235
+    original_create, original_request = value.core.postiz.create, value.core.postiz.request
+
+    def milliseconds(date):
+        return datetime.fromisoformat(date.replace("Z", "+00:00")).isoformat(timespec="milliseconds")
+
+    def create(*args, **kwargs):
+        ident = original_create(*args, **kwargs)
+        value.posts[ident]["publishDate"] = milliseconds(value.posts[ident]["publishDate"])
+        return ident
+
+    def request(method, path, **kwargs):
+        kwargs = copy.deepcopy(kwargs)
+        if method == "POST" and path == "/posts":
+            kwargs["json"]["date"] = milliseconds(kwargs["json"]["date"])
+        return original_request(method, path, **kwargs)
+
+    monkeypatch.setattr(value.core.postiz, "create", create)
+    monkeypatch.setattr(value.core.postiz, "request", request)
+    return positive_failure(value, monkeypatch)
+
+
 def release(value, **kwargs):
     return value.store.release_preclick_failed_no_send(value.failed_slot["id"],
         token=kwargs.pop("token", value.failed_slot["token"]),
         remote=kwargs.pop("remote", copy.deepcopy(value.remote_error)),
         expected_revision=kwargs.pop("expected_revision", value.state.read()["revision"]), **kwargs)
+
+
+@pytest.mark.parametrize("delta,expected", [("0", True), ("-0.000235", True),
+    ("0.000999", True), ("-0.000999", True), ("0.001", False), ("-0.001", False),
+    ("0.001001", False), ("-0.001001", False)])
+def test_postiz_timestamp_requires_strictly_less_than_one_millisecond(delta, expected):
+    signed = 1793360548.308235
+    observed = float(Decimal(str(signed)) + Decimal(delta))
+    assert _postiz_due_matches(observed, signed) is expected
+
+
+@pytest.mark.parametrize("invalid", [None, True, False, "1793360548.308", float("nan"),
+    float("inf"), -float("inf"), -1, 253402300800, 10 ** 1000, 1e300])
+def test_invalid_or_out_of_range_timestamp_never_matches(invalid):
+    assert _postiz_due_matches(invalid, 1793360548.308235) is False
+    assert _postiz_due_matches(1793360548.308235, invalid) is False
+
+
+def test_millisecond_postiz_failure_releases_without_changing_signed_evidence(
+        millisecond_preclick_slot, monkeypatch):
+    value = millisecond_preclick_slot
+    before = database_snapshot(value.core)
+    signed_due = value.failed_slot["due_at"]
+    dispatch_before = next(row for row in before["hub_dispatches"] if row["id"] == value.failed_record["dispatch_id"])
+    approval_before = next(row for row in before["hub_approvals"] if row["id"] == dispatch_before["approval_id"])
+    metadata_due = dispatch_before["snapshot"]["metadata"]["postiz_due_at"]
+    assert metadata_due != signed_due
+    assert 0 < Decimal(str(signed_due)) - Decimal(str(metadata_due)) < Decimal("0.001")
+    assert dispatch_before["due_at"] == approval_before["scheduled_at"] == value.failed_record["due_at"] == signed_due
+    raw_paths = [value.browser_proof_path, value.image_path,
+        value.core.settings.root / value.failed_record["quality_trace"],
+        value.core.settings.root / value.failed_record["input_file"]]
+    raw_before = {path: path.read_bytes() for path in raw_paths}
+    def canonical_bytes(rows):
+        return json.dumps(rows, sort_keys=True, ensure_ascii=False).encode()
+    attempts_before = canonical_bytes(before["hub_dispatch_attempts"])
+    claims_before = canonical_bytes(before["editorial_preparation_claims"])
+
+    assert value.controller.run_once()["slot_state"] == "missed"
+    after = database_snapshot(value.core)
+    assert canonical_bytes(after["hub_dispatch_attempts"]) == attempts_before
+    assert canonical_bytes(after["editorial_preparation_claims"]) == claims_before
+    assert after["hub_variants"] == before["hub_variants"] and after["drafts"] == before["drafts"]
+    assert {path: path.read_bytes() for path in raw_paths} == raw_before
+    dispatch_after = next(row for row in after["hub_dispatches"] if row["id"] == dispatch_before["id"])
+    approval_after = next(row for row in after["hub_approvals"] if row["id"] == approval_before["id"])
+    assert dispatch_after == {**dispatch_before, "state": "cancelled"}
+    assert approval_after == {**approval_before, "revoked": True}
+    slot_after = value.store.get(value.failed_slot["id"])
+    for key in ("due_at", "token", "binding", "text_hash", "evidence_hash", "dispatch_id"):
+        assert slot_after[key] == value.failed_slot[key]
+    record = value.cycle._load()["records"][0]
+    assert record["state"] == "cancelled" and record["error"] == "BROWSER_PRECLICK_FAILED"
+    assert record["no_send_disposition"]["source_remains_used"] is True
+    assert (record["url"], record["original_hash"]) == (value.failed_record["url"], value.failed_record["original_hash"])
+    with pytest.raises(AgentError, match="ARTICLE_RESERVE_PRECLICK_NOT_SAFE"):
+        release(value)
+    assert database_snapshot(value.core) == after
+    monkeypatch.setattr(value.core.publisher, "publish", lambda *_a, **_k: pytest.fail("Never retry failed source"))
+    assert value.core.dispatch_tick() == 0
+    old_model_events = list(value.events)
+    claim = value.store.begin_preparation()
+    with pytest.raises(AgentError, match="ARTICLE_DUPLICATE_SOURCE"):
+        value.cycle.prepare(copy.deepcopy(value.article), reserve_claim=claim)
+    assert value.events == old_model_events and len(value.writes) == 1
+    assert {path: path.read_bytes() for path in raw_paths} == raw_before
+
+
+@pytest.mark.parametrize("damage", ["unknown_attempt", "proof_send_started", "revoked", "lease",
+    "remote_body", "signed_dispatch_due", "signed_approval_due", "signed_slot_due"])
+def test_millisecond_tolerance_never_bypasses_other_positive_gates(millisecond_preclick_slot, damage):
+    value = millisecond_preclick_slot
+    remote = copy.deepcopy(value.remote_error)
+    with value.core.db.session.begin() as session:
+        dispatch = session.get(Dispatch, value.failed_record["dispatch_id"])
+        if damage == "unknown_attempt":
+            session.query(DispatchAttempt).one().result = "unknown"
+        elif damage == "revoked":
+            session.get(TargetApproval, dispatch.approval_id).revoked = True
+        elif damage == "lease":
+            dispatch.lease_until = value.stamp[0] + 60
+        elif damage == "signed_dispatch_due":
+            dispatch.due_at += .0001
+        elif damage == "signed_approval_due":
+            session.get(TargetApproval, dispatch.approval_id).scheduled_at += .0001
+        elif damage == "signed_slot_due":
+            session.get(PublicationSlot, value.failed_slot["id"]).due_at += .0001
+    if damage == "proof_send_started":
+        proof = json.loads(value.browser_proof_path.read_text(encoding="utf-8"))
+        proof["send_started"] = True
+        value.browser_proof_path.write_text(json.dumps(proof), encoding="utf-8")
+    elif damage == "remote_body":
+        remote["content"] += " changed"
+    before, raw = database_snapshot(value.core), value.browser_proof_path.read_bytes()
+    with pytest.raises(AgentError):
+        release(value, remote=remote)
+    assert database_snapshot(value.core) == before
+    assert value.browser_proof_path.read_bytes() == raw
+    assert value.store.status()["active"] and len(value.writes) == 1
 
 
 def test_preclick_no_send_closes_atomically_and_preserves_attempt_source_qa_claims(preclick_slot):
@@ -263,6 +390,42 @@ def test_controller_failed_code_without_durable_proof_keeps_slot_blocked(preclic
         assert dispatch.state == "failed" and dispatch.attempts == 1
         assert session.query(DispatchAttempt).one().result == "failed"
     assert len(value.writes) == 1
+
+
+def test_channel_429_keeps_failed_slot_and_never_selects_or_sends_replacement(reserve_controller, monkeypatch):
+    value = positive_failure(reserve_controller, monkeypatch,
+        error_code="BROWSER_CHANNEL_RATE_LIMITED", phase="channel")
+    ready = second_candidate(value)
+    assert ready["state"] == "quality_ready"
+    before = database_snapshot(value.core)
+    records_before = copy.deepcopy(value.cycle._load()["records"])
+    raw_paths = [value.browser_proof_path, value.core.settings.root / value.failed_record["quality_trace"],
+        value.core.settings.root / value.failed_record["input_file"]]
+    raw_before = {path: path.read_bytes() for path in raw_paths}
+    model_calls, posts = list(value.model_calls), copy.deepcopy(value.posts)
+    with pytest.raises(AgentError, match="ARTICLE_RESERVE_PRECLICK_NOT_SAFE"):
+        release(value)
+    assert database_snapshot(value.core) == before
+    assert {path: path.read_bytes() for path in raw_paths} == raw_before
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("MAX 429 must not select, stage or send a replacement")
+
+    monkeypatch.setattr(value.controller, "selector", forbidden)
+    monkeypatch.setattr(value.core, "stage_remote", forbidden)
+    monkeypatch.setattr(value.core.publisher, "publish", forbidden)
+    for _ in range(2):
+        assert value.controller.run_once()["phase"] == "blocked"
+        assert value.core.dispatch_tick() == 0
+    after = database_snapshot(value.core)
+    for table in ("hub_dispatches", "hub_dispatch_attempts", "hub_approvals", "hub_variants", "drafts",
+                  "editorial_preparation_claims", "publication_slots", "materials", "stories"):
+        assert after[table] == before[table]
+    assert value.cycle._load()["records"] == records_before
+    assert {path: path.read_bytes() for path in raw_paths} == raw_before
+    assert value.model_calls == model_calls and value.posts == posts and len(value.writes) == 1
+    assert value.store.status()["active"][0]["id"] == value.failed_slot["id"]
+    assert not any(row["action"] == "reserve_preclick_no_send_missed" for row in after["audit_events"])
 
 
 def test_control_change_during_fresh_get_invalidates_preclick_disposal(preclick_slot, monkeypatch):

@@ -202,6 +202,44 @@ def test_default_browser_profile_is_private_when_profile_dir_is_implicit(project
         panel_files.selected(service, "data/max-browser/state.json", purpose="workflow")
 
 
+@pytest.mark.parametrize("profile", ["vk-browser", "vk-browser-personal", "VK-BROWSER-OWNER_2"])
+@pytest.mark.parametrize("purpose", ["file", "workflow", "private", "video"])
+def test_vk_profile_namespace_is_private_before_any_content_read(project, monkeypatch, profile, purpose):
+    service = SimpleNamespace(settings=Settings.load(project))
+    directory = project / "data" / profile
+    target = directory / "Default/synthetic-state.json"
+    target.parent.mkdir(parents=True)
+    original_bytes = b'{"metadata":"synthetic-private-vk-profile"}'
+    target.write_bytes(original_bytes)
+    original = Path.read_text
+    def read_text(path, *args, **kwargs):
+        if path == target:
+            pytest.fail("VK profile content must be rejected before reading")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    listed = panel_files.browse(service, "data", purpose=purpose)
+    assert profile not in {entry["name"] for entry in listed["entries"]}
+    with pytest.raises(AgentError, match="FILE_DIRECTORY_PRIVATE"):
+        panel_files.browse(service, directory.relative_to(project).as_posix(), purpose=purpose)
+    with pytest.raises(AgentError, match="FILE_DIRECTORY_PRIVATE"):
+        panel_files.selected(service, target.relative_to(project).as_posix(), purpose=purpose)
+    with pytest.raises(AgentError, match="FILE_DIRECTORY_PRIVATE"):
+        panel_files.selected(service, directory.relative_to(project).as_posix(), kind="directory", purpose=purpose)
+    with pytest.raises(AgentError, match="FILE_DIRECTORY_PRIVATE"):
+        panel_files.import_selected(service, str(target), "file", purpose)
+    assert target.read_bytes() == original_bytes
+
+
+def test_vk_profile_namespace_does_not_hide_unrelated_sibling_materials(project):
+    service = SimpleNamespace(settings=Settings.load(project))
+    path = project / "data/vk-browserish/public.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"1":{"class_type":"Fixture","inputs":{}}}', encoding="utf-8")
+    listed = panel_files.browse(service, "data", purpose="workflow")
+    assert "vk-browserish" in {entry["name"] for entry in listed["entries"]}
+    assert panel_files.selected(service, path.relative_to(project).as_posix(), purpose="workflow")["document"]
+
+
 @pytest.mark.parametrize("directory,section,key", [
     ("data/max-browser", "browser", "profile_dir"),
     ("data/opencode", "opencode", "isolated_state_dir"),
@@ -264,6 +302,25 @@ def test_private_profile_symlink_cannot_bypass_direct_selection(project):
     symlink(target, project / "config/visible.json")
     with pytest.raises(AgentError, match="FILE_DIRECTORY_PRIVATE"):
         panel_files.selected(service, "config/visible.json", purpose="workflow")
+
+
+def test_vk_profile_alias_cannot_bypass_selection_or_import(project, monkeypatch):
+    service = SimpleNamespace(settings=Settings.load(project))
+    target = project / "data/vk-browser-personal/Default/synthetic-state.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"metadata":"synthetic-private-vk-profile"}', encoding="utf-8")
+    alias = project / "config/visible-vk.json"
+    symlink(target, alias)
+    original = Path.read_text
+    def read_text(path, *args, **kwargs):
+        if path == target:
+            pytest.fail("VK profile alias must be rejected before reading")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AgentError, match="FILE_DIRECTORY_PRIVATE"):
+        panel_files.selected(service, "config/visible-vk.json", purpose="workflow")
+    with pytest.raises(AgentError, match="FILE_DIRECTORY_PRIVATE"):
+        panel_files.import_selected(service, str(alias), "file", "workflow")
 
 
 def test_private_imports_resolved_into_config_cannot_be_read_as_workflow(project, monkeypatch):

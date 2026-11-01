@@ -1,0 +1,20 @@
+{
+  "id": "vk_image_test",
+  "profile_id": "test",
+  "platform": "vk",
+  "route": "vk_browser",
+  "destination": "",
+  "enabled": false,
+  "options": {
+    "max_chars": 16384,
+    "profile_dir": "data/vk-browser-image",
+    "channel": "chrome",
+    "headless": true,
+    "operation_timeout_seconds": 180,
+    "dom_contract_profile": "personal-image-v1",
+    "dom_contract_verified": false,
+    "media_contract_verified": false,
+    "media_proof_policy": "exact-bytes-v1",
+    "dom_contract": {}
+  }
+}

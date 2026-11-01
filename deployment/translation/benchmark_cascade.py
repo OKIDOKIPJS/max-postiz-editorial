@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from max_postiz_agent.adapters import OpenCode, extract_object
 from max_postiz_agent.cli import load_env
 from max_postiz_agent.config import AgentError, Settings, fingerprint
+from max_postiz_agent.report_files import replace_report_file
 from max_postiz_agent.translation import DedicatedTranslator, restore_numeric_spelling
 
 HY_MODEL = 'hy-mt2-7b-q8'
@@ -144,7 +145,7 @@ class Report:
             json.dump(self.value, stream, ensure_ascii=False, indent=2)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, self.path)
+        replace_report_file(temporary, self.path)
 
 
 def numeric_counts(text):

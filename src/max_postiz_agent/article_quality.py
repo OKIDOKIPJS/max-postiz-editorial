@@ -44,6 +44,11 @@ MAX_REVIEW_WARNINGS = 8
 MAX_REVIEW_WARNINGS_BYTES = 8192
 REVIEW_PROTOCOL_CONTRACT = "meaning-first-advisory-v2"
 MAX_PROTOCOL_REVIEW_BYTES = 65536
+REVIEW_BOUNDS_V2_CONTRACT = "article-review-bounds-v2"
+MAX_V2_REVIEW_ISSUES = 16
+MAX_V2_REVIEW_WARNINGS = 16
+MAX_V2_REVIEW_FINDINGS_BYTES = 32768
+MAX_COMPLETED_REVIEW_BYTES = 262144
 LEGACY_REVIEW_RUBRIC = "legacy"
 MEANING_FIRST_REVIEW_RUBRIC = "meaning-first-v1"
 HOURLY_PRACTICAL_REVIEW_RUBRIC = "hourly-practical-v1"
@@ -92,13 +97,56 @@ def normalize_article_links(text):
     return "".join(parts).rstrip() + "\n\n" + "\n".join(destinations)
 
 
-def _normalize_review(value):
+def _review_protocol(review_protocol_contract):
+    if review_protocol_contract is None or review_protocol_contract == REVIEW_PROTOCOL_CONTRACT:
+        return REVIEW_PROTOCOL_CONTRACT
+    if review_protocol_contract == REVIEW_BOUNDS_V2_CONTRACT:
+        return REVIEW_BOUNDS_V2_CONTRACT
+    raise AgentError("ARTICLE_REVIEW_PROTOCOL_CONTRACT_INVALID", 409)
+
+
+def review_protocol_marker(review_protocol_contract, rubric):
+    """Новые поля появляются только при явном выборе нового parser-контракта."""
+    contract = _review_protocol(review_protocol_contract)
+    if contract == REVIEW_BOUNDS_V2_CONTRACT:
+        if rubric != HOURLY_PRACTICAL_V2_REVIEW_RUBRIC:
+            raise AgentError("ARTICLE_REVIEW_PROTOCOL_CONTRACT_INVALID", 409)
+        return {"review_protocol_contract": contract}
+    return {}
+
+
+def _review_object(raw_review, review_protocol_contract):
+    bounded = _review_protocol(review_protocol_contract) == REVIEW_BOUNDS_V2_CONTRACT
+    if bounded:
+        try:
+            if (not isinstance(raw_review, str) or not raw_review.strip()
+                    or len(raw_review.encode("utf-8")) > MAX_PROTOCOL_REVIEW_BYTES):
+                raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
+        except UnicodeError as exc:
+            raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID") from exc
+    try:
+        return extract_object(raw_review)
+    except (RecursionError, TypeError, ValueError) as exc:
+        if bounded:
+            raise AgentError("INVALID_EDITOR_RESULT") from exc
+        raise
+
+
+def decode_rubric_review(raw_review, rubric, *, review_protocol_contract=None):
+    review_protocol_marker(review_protocol_contract, rubric)
+    return normalize_rubric_review(_review_object(raw_review, review_protocol_contract), rubric,
+                                  review_protocol_contract=review_protocol_contract)
+
+
+def _normalize_review(value, *, review_protocol_contract=None):
     """Unwrap one unambiguous issue envelope without changing the verdict."""
+    maximum = (MAX_V2_REVIEW_ISSUES if _review_protocol(review_protocol_contract) == REVIEW_BOUNDS_V2_CONTRACT
+               else MAX_REVIEW_ISSUES)
     if (not isinstance(value, dict) or set(value) != {"approved", "topic", "issues"}
             or type(value["approved"]) is not bool
             or not isinstance(value["topic"], str)
             or not isinstance(value["issues"], list)
-            or len(value["issues"]) > MAX_REVIEW_ISSUES):
+            or len(value["issues"]) > maximum):
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     issues = []
     for issue in value["issues"]:
@@ -112,27 +160,34 @@ def _normalize_review(value):
     return {"approved": value["approved"], "topic": value["topic"], "issues": issues}
 
 
-def normalize_rubric_review(value, rubric):
+def normalize_rubric_review(value, rubric, *, review_protocol_contract=None):
     """Separate advisory wording from substantive issues without changing a verdict."""
     if not isinstance(rubric, str) or rubric not in REVIEW_RUBRICS:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+    marker = review_protocol_marker(review_protocol_contract, rubric)
     if rubric == LEGACY_REVIEW_RUBRIC:
         return _normalize_review(value)
     if rubric not in AUTOMATIC_REVIEW_RUBRICS:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
     if not isinstance(value, dict) or set(value) != {"approved", "topic", "issues", "warnings"}:
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
-    normalized = _normalize_review({key: value[key] for key in ("approved", "topic", "issues")})
+    normalized = _normalize_review({key: value[key] for key in ("approved", "topic", "issues")},
+                                   review_protocol_contract=review_protocol_contract)
+    if marker and normalized["topic"] not in TOPICS:
+        raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     if rubric in PRACTICAL_REVIEW_RUBRICS and normalized["approved"] and normalized["issues"]:
         # Противоречивый verdict не превращаем в passed или содержательное одобрение.
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     warnings = value["warnings"]
-    if (not isinstance(warnings, list) or len(warnings) > MAX_REVIEW_WARNINGS
+    maximum = MAX_V2_REVIEW_WARNINGS if marker else MAX_REVIEW_WARNINGS
+    if (not isinstance(warnings, list) or len(warnings) > maximum
             or any(not isinstance(item, str) or not item.strip()
                    or len(item) > MAX_REVIEW_ISSUE_CHARS for item in warnings)):
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     try:
-        if sum(len(item.encode("utf-8")) for item in warnings) > MAX_REVIEW_WARNINGS_BYTES:
+        findings = normalized["issues"] + warnings if marker else warnings
+        limit = MAX_V2_REVIEW_FINDINGS_BYTES if marker else MAX_REVIEW_WARNINGS_BYTES
+        if sum(len(item.encode("utf-8")) for item in findings) > limit:
             raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID")
     except UnicodeError as exc:
         raise AgentError("ARTICLE_REVIEW_SCHEMA_INVALID") from exc
@@ -155,14 +210,65 @@ def protocol_recovery_review(raw_review):
         raise AgentError(error, 409) from exc
 
 
-def review_parser_contract(raw_review):
+def review_parser_contract(raw_review, *, review_protocol_contract=None):
     """Bind the exact raw response to the bounded advisory parser contract."""
-    limits = {"contract": REVIEW_PROTOCOL_CONTRACT, "max_issues": MAX_REVIEW_ISSUES,
-              "max_issue_chars": MAX_REVIEW_ISSUE_CHARS, "max_warnings": MAX_REVIEW_WARNINGS,
-              "max_warning_chars": MAX_REVIEW_ISSUE_CHARS,
-              "max_warnings_utf8_bytes": MAX_REVIEW_WARNINGS_BYTES}
+    if _review_protocol(review_protocol_contract) == REVIEW_BOUNDS_V2_CONTRACT:
+        # Raw и нормализованные findings имеют независимые границы; ничего не обрезаем.
+        limits = {"contract": REVIEW_BOUNDS_V2_CONTRACT, "max_issues": MAX_V2_REVIEW_ISSUES,
+                  "max_issue_chars": MAX_REVIEW_ISSUE_CHARS, "max_warnings": MAX_V2_REVIEW_WARNINGS,
+                  "max_warning_chars": MAX_REVIEW_ISSUE_CHARS,
+                  "max_findings_utf8_bytes": MAX_V2_REVIEW_FINDINGS_BYTES,
+                  "max_raw_utf8_bytes": MAX_PROTOCOL_REVIEW_BYTES}
+    else:
+        limits = {"contract": REVIEW_PROTOCOL_CONTRACT, "max_issues": MAX_REVIEW_ISSUES,
+                  "max_issue_chars": MAX_REVIEW_ISSUE_CHARS, "max_warnings": MAX_REVIEW_WARNINGS,
+                  "max_warning_chars": MAX_REVIEW_ISSUE_CHARS,
+                  "max_warnings_utf8_bytes": MAX_REVIEW_WARNINGS_BYTES}
     return {**limits, "contract_hash": fingerprint(limits),
             "raw_review_sha256": hashlib.sha256(raw_review.encode("utf-8")).hexdigest()}
+
+
+def completed_review_rejection(raw_review, rubric, *, review_protocol_contract=None):
+    """Classify a complete invalid response, never approve or resample it.
+
+    Wider raw bounds apply only to source quarantine, not quality acceptance.
+    The caller must still bind the exact completed request, trace and durable claim.
+    """
+    error = "ARTICLE_COMPLETED_REVIEW_NOT_SAFE"
+    try:
+        marker = review_protocol_marker(review_protocol_contract, rubric)
+        if rubric != HOURLY_PRACTICAL_V2_REVIEW_RUBRIC:
+            raise ValueError
+        if (not isinstance(raw_review, str) or not raw_review.strip()
+                or len(raw_review.encode("utf-8")) > MAX_COMPLETED_REVIEW_BYTES):
+            raise ValueError
+        parser_error = None
+        try:
+            decode_rubric_review(raw_review, rubric, review_protocol_contract=review_protocol_contract)
+        except AgentError as exc:
+            if exc.code not in {"ARTICLE_REVIEW_SCHEMA_INVALID", "INVALID_EDITOR_RESULT"}:
+                raise ValueError from exc
+            parser_error = exc.code
+        else:
+            # A valid negative is an ordinary quality rejection, not a protocol exception.
+            raise ValueError
+        try:
+            value = extract_object(raw_review)
+            # PostgreSQL JSON и UTF-8 должны принимать proof; raw остаётся целым
+            # даже при NaN/Infinity или некорректных строках внутри ответа модели.
+            json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            value = copy.deepcopy(value)
+        except (AgentError, ValueError, TypeError, UnicodeError, RecursionError):
+            value = None
+        parser = review_parser_contract(raw_review, review_protocol_contract=review_protocol_contract)
+        return {"contract": "completed-review-protocol-v1",
+                "reason": "COMPLETED_REVIEW_PROTOCOL_REJECTED", "parser_error": parser_error,
+                "review_protocol_contract": marker.get("review_protocol_contract", REVIEW_PROTOCOL_CONTRACT),
+                "parser_contract": parser, "raw_review_sha256": parser["raw_review_sha256"],
+                "review_untrusted": value, "approval_permitted": False,
+                "quarantine_max_raw_utf8_bytes": MAX_COMPLETED_REVIEW_BYTES}
+    except (AgentError, ValueError, TypeError, KeyError, UnicodeError, RecursionError) as exc:
+        raise AgentError(error, 409) from exc
 
 
 def protocol_recovery_provenance(raw_review, review_prompt_hash):
@@ -196,7 +302,7 @@ def rubric_translation_gate(original, translated, rubric, *, reference_contract=
 
 
 def article_review_context(instruction, source, translation, rubric, prompt_hash,
-                           *, reference_contract=LEGACY_REFERENCE_CONTRACT):
+                           *, reference_contract=LEGACY_REFERENCE_CONTRACT, review_protocol_contract=None):
     """Старый контекст неизменен; V2 явно связывает диагностику с literal URL.
 
     Manifest вычисляется из тех же EN/RU, которые проверяет hard gate. Он не
@@ -207,7 +313,8 @@ def article_review_context(instruction, source, translation, rubric, prompt_hash
     source_urls = reference_urls(source, contract=reference_contract)
     candidate_urls = reference_urls(translation, contract=reference_contract)
     context = {"instruction": instruction, "source_untrusted": source,
-               "translation_untrusted": translation}
+               "translation_untrusted": translation,
+               **review_protocol_marker(review_protocol_contract, rubric)}
     if rubric != LEGACY_REVIEW_RUBRIC:
         context.update(review_rubric=rubric, review_prompt_hash=prompt_hash)
     if reference_contract == REFERENCE_CONTRACT:
@@ -367,7 +474,7 @@ def adjudicate_scientific_spelling(original, translated, matches, *, allow_space
     return adjudicated, unresolved
 
 
-def review_prompt_name(rubric):
+def review_prompt_name(rubric, *, review_protocol_contract=None):
     """Сохранённые рубрики всегда читают свой неизменённый review prompt."""
     names = {LEGACY_REVIEW_RUBRIC: "ARTICLE_REVIEW.txt",
              MEANING_FIRST_REVIEW_RUBRIC: "ARTICLE_REVIEW_MEANING_FIRST_V1.txt",
@@ -375,6 +482,8 @@ def review_prompt_name(rubric):
              HOURLY_PRACTICAL_V2_REVIEW_RUBRIC: "ARTICLE_REVIEW_HOURLY_PRACTICAL_V2.txt"}
     if not isinstance(rubric, str) or rubric not in names:
         raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
+    if review_protocol_marker(review_protocol_contract, rubric):
+        return "ARTICLE_REVIEW_HOURLY_PRACTICAL_V2_BOUNDS_V2.txt"
     return names[rubric]
 
 
@@ -519,7 +628,8 @@ class ArticleQuality:
     def __init__(self, translator, reviewer, spelling_url=SPELLING_URL, transport=None,
                  prompt_dir=None, trace=None, allow_human_rejection=False,
                  review_rubric=LEGACY_REVIEW_RUBRIC, reference_contract=None,
-                 allow_registered_terms=False, presentation_contract=None, image_credit=None):
+                 allow_registered_terms=False, presentation_contract=None, image_credit=None,
+                 review_protocol_contract=None):
         if (translator is reviewer or (
                 getattr(translator, "model", None) and getattr(reviewer, "model", None)
                 and translator.model == reviewer.model)):
@@ -538,6 +648,8 @@ class ArticleQuality:
         if not isinstance(review_rubric, str) or review_rubric not in REVIEW_RUBRICS:
             raise AgentError("ARTICLE_REVIEW_RUBRIC_INVALID")
         self.review_rubric = review_rubric
+        review_protocol_marker(review_protocol_contract, review_rubric)
+        self.review_protocol_contract = review_protocol_contract
         if (type(allow_registered_terms) is not bool
                 or allow_registered_terms and review_rubric == LEGACY_REVIEW_RUBRIC):
             raise AgentError("ARTICLE_SCIENTIFIC_SPELLING_CONTRACT_INVALID", 409)
@@ -554,7 +666,7 @@ class ArticleQuality:
         self.reference_contract = reference_contract
         prompts = Path(prompt_dir) if prompt_dir else Path(__file__).resolve().parents[2] / "prompts"
         self.translation_prompt = (prompts / "ARTICLE_TRANSLATE.txt").read_text(encoding="utf-8")
-        review_file = review_prompt_name(review_rubric)
+        review_file = review_prompt_name(review_rubric, review_protocol_contract=review_protocol_contract)
         self.review_prompt = (prompts / review_file).read_text(encoding="utf-8")
         self.review_prompt_hash = hashlib.sha256(self.review_prompt.encode()).hexdigest()
         self.spelling_url = spelling_url
@@ -565,7 +677,7 @@ class ArticleQuality:
             try:
                 # A diagnostic observer cannot mutate the text being checked.
                 self.trace(copy.deepcopy({"phase": phase, "attempt": attempt,
-                    **self._presentation_marker(), **value}))
+                    **self._presentation_marker(), **self._review_protocol_marker(), **value}))
             except Exception as exc:
                 raise AgentError("ARTICLE_TRACE_FAILED", 503) from exc
 
@@ -587,12 +699,20 @@ class ArticleQuality:
     def _presentation_marker(self):
         return presentation_binding(self.presentation_contract, self.image_credit)
 
+    def _review_protocol_marker(self):
+        return review_protocol_marker(self.review_protocol_contract, self.review_rubric)
+
+    def _review_completion(self):
+        completed = getattr(self.reviewer, "last_completed_generation", None)
+        return ({"completion": copy.deepcopy(completed)}
+                if self._review_protocol_marker() and isinstance(completed, dict) else {})
+
     def _footer(self, url):
         return article_footer(url, **self._presentation_marker())
 
     def _human_evidence(self, prepared, title, original, reviewed, raw, matches,
                         adjudicated, unresolved, *, fresh_spelling=False):
-        prepared.update(self._presentation_marker())
+        prepared.update(self._presentation_marker(), **self._review_protocol_marker())
         if self.allow_human_rejection or self.review_rubric != LEGACY_REVIEW_RUBRIC:
             prepared["machine_review_status"] = "passed" if reviewed["approved"] else "rejected"
             prepared["machine_review_evidence"] = {
@@ -602,14 +722,15 @@ class ArticleQuality:
                 "spelling_unresolved": copy.deepcopy(unresolved), "hard_gates_passed": True,
                 "text_hash": fingerprint({"title": prepared["title"], "body": prepared["body"]}),
                 "source_hash": fingerprint({"title": title, "body": original, "url": prepared["url"]}),
-                **self._presentation_marker()}
+                **self._presentation_marker(), **self._review_protocol_marker()}
             if self.review_rubric != LEGACY_REVIEW_RUBRIC:
                 prepared.update(review_rubric=self.review_rubric,
                                 review_prompt_hash=self.review_prompt_hash,
                                 warnings=copy.deepcopy(reviewed["warnings"]))
                 prepared["machine_review_evidence"].update(
                     review_rubric=self.review_rubric, review_prompt_hash=self.review_prompt_hash,
-                    parser_contract=review_parser_contract(raw))
+                    parser_contract=review_parser_contract(raw,
+                        review_protocol_contract=self.review_protocol_contract))
                 if fresh_spelling is True:
                     prepared["machine_review_evidence"]["fresh_spelling_contract"] = FRESH_SPACETIME_SPELLING_CONTRACT
                     if self.allow_registered_terms:
@@ -620,7 +741,8 @@ class ArticleQuality:
                 prepared["machine_review_evidence"]["reference_check"] = article_review_context(
                     self.review_prompt, title + "\n\n" + original, prepared["translation"],
                     self.review_rubric, self.review_prompt_hash,
-                    reference_contract=self.reference_contract)["reference_check"]
+                    reference_contract=self.reference_contract,
+                    review_protocol_contract=self.review_protocol_contract)["reference_check"]
         return prepared
 
     def prepare(self, title, original, url):
@@ -629,7 +751,7 @@ class ArticleQuality:
         context = {"instruction": self.translation_prompt,
                    "source_untrusted": {"title": title, "body": original, "url": url},
                    "numeric_tokens_must_match_exactly": sorted(numbers(source)),
-                   **self._scientific_marker()}
+                   **self._scientific_marker(), **self._review_protocol_marker()}
         if self.reference_contract == REFERENCE_CONTRACT:
             context["reference_contract"] = self.reference_contract
         immutable_candidates = getattr(self.translator, "immutable_candidates", False) is True
@@ -694,20 +816,23 @@ class ArticleQuality:
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
             review_context = article_review_context(self.review_prompt, source, text,
-                self.review_rubric, self.review_prompt_hash, reference_contract=self.reference_contract)
+                self.review_rubric, self.review_prompt_hash, reference_contract=self.reference_contract,
+                review_protocol_contract=self.review_protocol_contract)
             self._emit("review_started", attempt, context=review_context)
             raw_review = None
             try:
                 raw_review = self.reviewer.generate_text(
                     json.dumps(review_context, ensure_ascii=False))[0]
-                self._emit("review_returned", attempt, raw=raw_review)
-                reviewed = extract_object(raw_review)
+                self._emit("review_returned", attempt, raw=raw_review, **self._review_completion())
+                reviewed = _review_object(raw_review, self.review_protocol_contract)
             except AgentError as exc:
-                if exc.code != "INVALID_EDITOR_RESULT" or exc.status >= 500:
+                bounded_schema = bool(self._review_protocol_marker() and exc.code == "ARTICLE_REVIEW_SCHEMA_INVALID")
+                if (exc.code != "INVALID_EDITOR_RESULT" and not bounded_schema) or exc.status >= 500:
                     if exc.code != "ARTICLE_TRACE_FAILED":
                         self._emit("review_failed", attempt, error=exc.code)
                     raise
-                context["repair_feedback"] = "Independent review returned invalid JSON; approval was not granted."
+                context["repair_feedback"] = ("Independent review response bounds invalid; approval was not granted."
+                    if bounded_schema else "Independent review returned invalid JSON; approval was not granted.")
                 if immutable_candidates:
                     context["repair_feedback"] = {"code": exc.code,
                         "raw_review_untrusted": raw_review,
@@ -717,7 +842,8 @@ class ArticleQuality:
                 self._emit("retry", attempt, feedback=context["repair_feedback"])
                 continue
             try:
-                normalized = normalize_rubric_review(reviewed, self.review_rubric)
+                normalized = normalize_rubric_review(reviewed, self.review_rubric,
+                    review_protocol_contract=self.review_protocol_contract)
             except AgentError:
                 context["repair_feedback"] = {"code": "ARTICLE_REVIEW_SCHEMA_INVALID",
                     "review_untrusted": reviewed,
@@ -794,15 +920,17 @@ class ArticleQuality:
             raise
         self._emit("gate_passed", 1, characters=len(full))
         review_context = article_review_context(self.review_prompt, source, text,
-            self.review_rubric, self.review_prompt_hash, reference_contract=self.reference_contract)
+            self.review_rubric, self.review_prompt_hash, reference_contract=self.reference_contract,
+            review_protocol_contract=self.review_protocol_contract)
         self._emit("review_started", 1, context=review_context)
         raw_review = None
         try:
             raw_review = self.reviewer.generate_text(json.dumps(review_context, ensure_ascii=False))[0]
-            self._emit("review_returned", 1, raw=raw_review)
-            reviewed = extract_object(raw_review)
+            self._emit("review_returned", 1, raw=raw_review, **self._review_completion())
+            reviewed = _review_object(raw_review, self.review_protocol_contract)
         except AgentError as exc:
-            if exc.code != "INVALID_EDITOR_RESULT" or exc.status >= 500:
+            bounded_schema = bool(self._review_protocol_marker() and exc.code == "ARTICLE_REVIEW_SCHEMA_INVALID")
+            if (exc.code != "INVALID_EDITOR_RESULT" and not bounded_schema) or exc.status >= 500:
                 if exc.code != "ARTICLE_TRACE_FAILED":
                     self._emit("review_failed", 1, error=exc.code)
                 raise
@@ -810,7 +938,8 @@ class ArticleQuality:
             self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED", **self._scientific_marker())
             raise AgentError("ARTICLE_QUALITY_REJECTED") from exc
         try:
-            normalized = normalize_rubric_review(reviewed, self.review_rubric)
+            normalized = normalize_rubric_review(reviewed, self.review_rubric,
+                review_protocol_contract=self.review_protocol_contract)
         except AgentError as exc:
             self._emit("review_invalid", 1, error="ARTICLE_REVIEW_SCHEMA_INVALID", review=reviewed)
             self._emit("rejected", 1, mode="candidate", error="ARTICLE_QUALITY_REJECTED", **self._scientific_marker())
