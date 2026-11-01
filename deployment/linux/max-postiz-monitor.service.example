@@ -1,0 +1,21 @@
+[Unit]
+Description=Isolated MAX browser monitoring (no Bot API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=maxagent
+WorkingDirectory=/opt/max-postiz-monitor
+Environment=PYTHONUTF8=1
+EnvironmentFile=/opt/max-postiz-monitor/.env.local
+ExecStart=/opt/max-postiz-monitor/.venv/bin/python -m max_postiz_agent.monitor_cli --root /opt/max-postiz-monitor run
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=40
+UMask=0077
+# Example only: separate checkout/DB/profile; never replace editorial service.
+# Not installed or enabled by this implementation.
+
+[Install]
+WantedBy=multi-user.target

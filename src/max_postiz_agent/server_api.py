@@ -105,6 +105,8 @@ def editorial_app(core, store=None):
 
     from .routes_api import attach_route_api
     attach_route_api(app, core, owner)
+    from .monitor_api import attach_monitor_api
+    attach_monitor_api(app, core, owner)
 
     @app.get("/health")
     def health():

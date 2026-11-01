@@ -34,11 +34,12 @@ jobs:
           cache-dependency-path: |
             requirements.lock
             requirements-dev.lock
+            requirements-deployment.lock
       - name: Verify Dependabot dependency manifest
         run: python scripts/check_ci_dependencies.py
       - name: Install pinned dependencies
         run: |
-          python -m pip install -r requirements.lock -r requirements-dev.lock
+          python -m pip install -r requirements.lock -r requirements-dev.lock -r requirements-deployment.lock
           python -m pip install --no-deps --no-build-isolation -e .
       - name: Ruff
         run: python -m ruff check src tests scripts deployment/translation/benchmark_articles.py
@@ -82,12 +83,13 @@ jobs:
             requirements.lock
             requirements-dev.lock
             requirements-browser.lock
+            requirements-deployment.lock
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
       - name: Install pinned dependencies
         run: |
-          python -m pip install -r requirements.lock -r requirements-dev.lock -r requirements-browser.lock
+          python -m pip install -r requirements.lock -r requirements-dev.lock -r requirements-browser.lock -r requirements-deployment.lock
           python -m pip install --no-deps --no-build-isolation -e .
       - name: Install Chrome and browser dependencies
         run: python -m playwright install --with-deps chrome
@@ -117,24 +119,43 @@ jobs:
           retention-days: 7
 
   postgres-tests:
-    name: PostgreSQL integration tests
+    name: Canonical full checks (${{ matrix.mode }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [normal, postgres]
     services:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_DB: max_postiz_ci
+          POSTGRES_DB: editorial_hub_tests
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ci-local-only
+          POSTGRES_INITDB_ARGS: --set=cluster_name=codex-max-routes-ci
         ports:
-          - 5432:5432
+          - 127.0.0.1:55448:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d max_postiz_ci"
+          --health-cmd "pg_isready -U postgres -d editorial_hub_tests"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+      monitor-postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: editorial_hub_tests
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-local-only
+          POSTGRES_INITDB_ARGS: --set=cluster_name=codex-max-monitor-qa
+        ports:
+          - 127.0.0.1:55449:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d editorial_hub_tests"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
       # Это одноразовая БД GitHub runner; production URL и секреты не используются.
-      TEST_DATABASE_URL: postgresql+psycopg://postgres:ci-local-only@127.0.0.1:5432/max_postiz_ci
+      MAX_POSTIZ_PG_TEST_CONTRACT: github-actions-isolated-pg-v1
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:ci-local-only@127.0.0.1:55448/editorial_hub_tests
+      MONITOR_OWNED_PG_TEST_URL: postgresql+psycopg://postgres:ci-local-only@127.0.0.1:55449/editorial_hub_tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -146,31 +167,57 @@ jobs:
           cache-dependency-path: |
             requirements.lock
             requirements-dev.lock
+            requirements-browser.lock
+            requirements-deployment.lock
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Create checkout-owned virtual environment
+        run: |
+          python -m venv .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Install pinned dependencies
         run: |
-          python -m pip install -r requirements.lock -r requirements-dev.lock
+          python -m pip install -r requirements.lock -r requirements-dev.lock -r requirements-browser.lock -r requirements-deployment.lock
           python -m pip install --no-deps --no-build-isolation -e .
-      - name: Create test directory
-        run: python -c "from pathlib import Path; Path('.test-state').mkdir(exist_ok=True)"
-      - name: Run PostgreSQL migrations, locking and reserve tests
-        run: >-
-          python -m pytest
-          tests/test_hub_postgres.py
-          tests/test_server_postgres.py
-          tests/test_automatic_repair_postgres.py
-          tests/test_article_reserve_preparation.py
-          tests/test_article_reserve_store.py
-          tests/test_hourly_reserve_controller.py
-          tests/test_reserve_preclick_recovery.py
-          --basetemp=.test-state/pytest-postgres
-          --junitxml=.test-state/postgres.xml -q
-      - name: Save PostgreSQL test report
+      - name: Install Chrome and browser dependencies
+        run: python -m playwright install --with-deps chrome
+      - name: Verify the two owned PostgreSQL identities without mutation
+        if: matrix.mode == 'postgres'
+        run: python scripts/check_ci_postgres.py
+      - name: Run canonical full checks without PostgreSQL
+        if: matrix.mode == 'normal'
+        run: python scripts/check.py
+      - name: Run canonical full checks with PostgreSQL
+        if: matrix.mode == 'postgres'
+        run: python scripts/check.py --postgres
+      - name: Require route and monitor PostgreSQL cases with zero skips
+        if: always() && matrix.mode == 'postgres'
+        run: |
+          python - <<'PY'
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          reports = list(Path("data/check-runs").glob("*/tests.xml"))
+          if len(reports) != 1:
+              raise SystemExit("Expected exactly one canonical pytest report")
+          subprocess.run(
+              [sys.executable, "scripts/check_ci_postgres.py", "--junit", str(reports[0])],
+              check=True,
+          )
+          PY
+      - name: Save canonical check report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: postgres-report
-          path: .test-state/postgres.xml
-          if-no-files-found: warn
+          name: canonical-${{ matrix.mode }}-report
+          # Только канонический run, без его временных pytest-данных.
+          path: |
+            data/check-runs/*/report.json
+            data/check-runs/*/tests.xml
+            data/check-runs/*/*.log
+          if-no-files-found: error
           include-hidden-files: true
           retention-days: 7
 

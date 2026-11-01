@@ -13,6 +13,23 @@ from .server_api import editorial_app, public_state
 from .server_state import DatabaseArticleLedger, ServerState
 
 
+def prepare_with_monitor(core, preparer):
+    """Неисправный необязательный монитор не останавливает обычное пополнение."""
+    chat_task = {"state": "idle"}
+    if ((core.settings.root / "config/monitor.json").is_file()
+            and core.db.engine.dialect.name == "postgresql"):
+        from .monitor_config import MonitorConfig
+        from .monitor_service import MonitorService
+        try:
+            monitor = MonitorService(core, MonitorConfig.load(core.settings.root))
+            chat_task = monitor.run_command_once(worker_owned=True)
+        except Exception:
+            logging.getLogger(__name__).warning("MONITOR_COMMAND_CONFIG_UNAVAILABLE")
+    if chat_task.get("state") in {"idle", "disabled", "paused"}:
+        return preparer.prepare_once()
+    return chat_task
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Автономная редакция Postiz")
     parser.add_argument("--root", type=Path, default=Path.cwd())
@@ -77,7 +94,7 @@ def main(argv=None):
                 def prepare_worker():
                     while not stop.is_set():
                         try:
-                            preparer.prepare_once()
+                            prepare_with_monitor(core, preparer)
                         except Exception as exc:
                             code = exc.code if isinstance(exc, AgentError) else "EDITORIAL_PREPARATION_ERROR"
                             try:
