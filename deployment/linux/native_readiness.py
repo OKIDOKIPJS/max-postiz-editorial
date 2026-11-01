@@ -100,6 +100,59 @@ def validate_scenario_entry(name, info, owner_uid):
         raise ReadinessError("SCENARIO_EVIDENCE_ENTRY_INVALID")
 
 
+def disabled_policy_template(raw):
+    required = {"enabled", "approval_mode", "review_rubric", "target_id", "source_id", "allowed_hosts",
+                "rights_evidence", "owner_instruction", "min_gap_seconds", "max_per_day", "max_source_age_hours"}
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        raise ReadinessError("NATIVE_DISABLED_POLICY_INVALID") from None
+    if not isinstance(value, dict) or set(value) != required or value.get("enabled") is not False:
+        raise ReadinessError("NATIVE_DISABLED_POLICY_INVALID")
+    return value
+
+
+def initialize_disabled_policy(project, owner_uid, owner_gid):
+    """One new private fixture, exact public template, never a policy update."""
+    project = Path(project)
+    if (not project.is_absolute() or ".." in project.parts
+            or any(path.is_symlink() for path in (project, *project.parents))):
+        raise ReadinessError("NATIVE_POLICY_PATH_INVALID")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    project_fd = os.open(project, flags)
+    descriptors = [project_fd]
+    try:
+        config_fd = os.open("config", flags, dir_fd=project_fd)
+        descriptors.append(config_fd)
+        source = os.open("hourly_article_policy.example.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=config_fd)
+        descriptors.append(source)
+        info = os.fstat(source)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 65536:
+            raise ReadinessError("NATIVE_DISABLED_POLICY_INVALID")
+        raw = os.read(source, 65537)
+        disabled_policy_template(raw)
+        data_fd = os.open("data", flags, dir_fd=project_fd)
+        descriptors.append(data_fd)
+        private = os.fstat(data_fd)
+        if private.st_uid != owner_uid or private.st_mode & 0o077:
+            raise ReadinessError("NATIVE_POLICY_PRIVATE_DIRECTORY_REQUIRED")
+        try:
+            target = os.open("hourly-article-policy.local.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=data_fd)
+        except FileExistsError:
+            raise ReadinessError("NATIVE_POLICY_ALREADY_EXISTS") from None
+        with os.fdopen(target, "wb") as output:
+            os.fchown(output.fileno(), owner_uid, owner_gid)
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        return {"created": True, "enabled": False, "exact_template_sha256": digest(raw), "targets_created": 0,
+                "approvals_created": 0, "external_mutations": 0}
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def collect_scenario_evidence(project, staging, owner_uid):
     """Copy only finished child evidence through held directory/file descriptors."""
     project, staging = Path(project), Path(staging)
@@ -817,6 +870,8 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
                 path.chmod(0o600)
         os.chown(topic_path, self.user.pw_uid, self.user.pw_gid)
         os.chown(self.project / "config", self.user.pw_uid, self.user.pw_gid)
+        self.report["checks"]["disabled_hourly_fixture"] = initialize_disabled_policy(
+            self.project, self.user.pw_uid, self.user.pw_gid)
 
     def app_environment(self, state, *, database=None):
         result = {"MAIN_URL": ORIGIN, "FRONTEND_URL": ORIGIN, "NEXT_PUBLIC_BACKEND_URL": ORIGIN + "/api",

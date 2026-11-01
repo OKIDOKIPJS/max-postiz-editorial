@@ -410,3 +410,61 @@ def test_scenario_artifacts_are_read_only_after_kernel_cleanup_confirmation(nati
     assert bool(copied) is closed and report["accepted"] is closed
     if not closed:
         assert report["scenario_artifact_collection_failed"] is True
+
+
+def test_disabled_hourly_template_matches_actual_policy_parser_without_enabling_or_external_calls(native, tmp_path):
+    from max_postiz_agent.article_cycle import HourlyArticleCycle
+    raw = (Path(__file__).resolve().parents[1] / "config/hourly_article_policy.example.json").read_bytes()
+    value = native.disabled_policy_template(raw)
+    folder = tmp_path / "data"
+    folder.mkdir()
+    (folder / "hourly-article-policy.local.json").write_bytes(raw)
+    cycle = HourlyArticleCycle.__new__(HourlyArticleCycle)
+    cycle.core = SimpleNamespace(settings=SimpleNamespace(root=tmp_path))
+    assert cycle._policy(enabled=False) == value and value["enabled"] is False
+    assert (folder / "hourly-article-policy.local.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("change", ["enabled", "extra", "missing"])
+def test_native_policy_template_rejects_enabled_or_wrong_shape_instead_of_reconstructing(native, change):
+    value = json.loads((Path(__file__).resolve().parents[1] / "config/hourly_article_policy.example.json").read_text())
+    if change == "enabled":
+        value["enabled"] = True
+    elif change == "extra":
+        value["unreviewed"] = True
+    else:
+        value.pop("target_id")
+    with pytest.raises(native.ReadinessError, match="NATIVE_DISABLED_POLICY_INVALID"):
+        native.disabled_policy_template(json.dumps(value))
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="Secure private fixture creation uses Linux directory descriptors")
+def test_native_policy_creation_is_private_exact_disabled_and_never_overwrites(native, tmp_path):
+    import os
+    import stat
+    config, data = tmp_path / "config", tmp_path / "data"
+    config.mkdir()
+    data.mkdir(mode=0o700)
+    raw = (Path(__file__).resolve().parents[1] / "config/hourly_article_policy.example.json").read_bytes()
+    (config / "hourly_article_policy.example.json").write_bytes(raw)
+    result = native.initialize_disabled_policy(tmp_path, os.getuid(), os.getgid())
+    target = data / "hourly-article-policy.local.json"
+    assert target.read_bytes() == raw and stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert target.stat().st_uid == os.getuid() and result["enabled"] is False
+    assert result["targets_created"] == result["approvals_created"] == result["external_mutations"] == 0
+    with pytest.raises(native.ReadinessError, match="NATIVE_POLICY_ALREADY_EXISTS"):
+        native.initialize_disabled_policy(tmp_path, os.getuid(), os.getgid())
+    assert target.read_bytes() == raw
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="Private-directory permission enforcement is Linux only")
+def test_native_policy_creation_rejects_public_data_directory(native, tmp_path):
+    import os
+    config, data = tmp_path / "config", tmp_path / "data"
+    config.mkdir()
+    data.mkdir(mode=0o755)
+    (config / "hourly_article_policy.example.json").write_bytes(
+        (Path(__file__).resolve().parents[1] / "config/hourly_article_policy.example.json").read_bytes())
+    with pytest.raises(native.ReadinessError, match="NATIVE_POLICY_PRIVATE_DIRECTORY_REQUIRED"):
+        native.initialize_disabled_policy(tmp_path, os.getuid(), os.getgid())
+    assert not (data / "hourly-article-policy.local.json").exists()

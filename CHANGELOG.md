@@ -1,5 +1,22 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: выключенная политика свежего native стенда
+
+- R8 run 41362209481 подтвердил реальный fresh Postiz owner register/login,
+  cookie и API key, отслеживаемый User unit и безопасный сбор bootstrap evidence.
+  Дальше явный editorial migrate отказал до API-сценария: в новом runtime не было
+  data/hourly-article-policy.local.json. Полная приёмка R8 не заявляется.
+- В новый приватный data перед первой миграцией эксклюзивно копируется точный
+  config/hourly_article_policy.example.json: enabled=false, проверка формы,
+  held directory FD/NOFOLLOW, права 0600 и editorial owner. Имеющийся файл не
+  перезаписывается; адресаты, согласования и отправки не создаются. В handoff
+  уточнена разница fixture нового стенда и сохраняемой политики существующей VM.
+- Проверки: 51 pure/mock passed, 7 Windows FD/symlink skips; совместимость
+  проверена самим HourlyArticleCycle._policy(enabled=False) без БД и сети.
+  Ruff/diff и независимый review прошли. Полный новый CI/canonical checks и
+  native acceptance требуются уже для дерева с main 16efb38 и этим исправлением.
+  Действий на рабочем сервере или в аккаунте Пикабу не было.
+
 ## 0.14.0 — 2026-11-02: объединение актуального main с тремя маршрутами
 
 - Включён main 16efb38 после Android/MAX monitoring 0.13.3: сохранены все команды,

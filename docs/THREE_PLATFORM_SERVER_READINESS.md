@@ -255,6 +255,13 @@ Python virtualenv, host Chrome, авторизованные профили ил
 явно получает `publishing.targets=[]` и `tasks=[]` до первой миграции. **При переносе
 существующей VM эти массивы и существующие строки не очищаются.**
 
+Для нового изолированного стенда перед первой миграцией также нужен
+`data/hourly-article-policy.local.json` из принятого
+`config/hourly_article_policy.example.json` с `enabled=false`, правами `0600`
+и владельцем `editorial`. Native runner создаёт его эксклюзивно до `migrate`.
+Это fixture нового стенда: существующий файл политики VM сохраняется и не
+подменяется примером; его изменение требует отдельной аудируемой миграции.
+
 До приёмки проверить зависимости Linux, cgroup delegation, права пользователя
 `editorial`, root-owned systemd units и Polkit rule для 7 owner-portal служб/наблюдателей.
 Python login/restart helpers работают от `editorial`, а не от root. Установка
