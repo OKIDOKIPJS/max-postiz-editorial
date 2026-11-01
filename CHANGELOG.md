@@ -1,5 +1,23 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: сохранение TOPIC при строгой проверке release source
+
+- Для существующей VM с собственным TOPIC.md добавлен явный режим отдельного
+  EDITORIAL_RELEASE_ROOT: весь принятый source проверяется по manifest/tree,
+  затем каждый публичный runtime-файл — по тем же SHA. Единственное исключение
+  TOPIC.md требует точного EDITORIAL_PRESERVED_TOPIC_SHA256 из приватного backup
+  до обновления. Неверный SHA, иной source, drift кода/compose и baseline без
+  отдельного source блокируются. Строгий режим по умолчанию сохранён.
+- В handoff добавлена сверка приватных hash-only снимков TOPIC/config/env до и
+  после обновления; config/*.example.json, prompts, schemas и код не исключаются.
+  Runtime app/publishing остаются приватными неотслеживаемыми файлами. Новая
+  framework миграции или изменение runtime-политик не добавлены.
+- Проверки: 40 pure release tests passed; шесть Bash blocks и shell wrapper
+  прошли только синтаксический разбор; Ruff/diff check прошли. VM/Docker/БД не
+  изменялись. Отдельно полный VK regression текущего pre-merge кода: 589 passed,
+  1 Windows symlink skip, 1 предупреждение Starlette; это loopback/временные данные.
+  Итоговое дерево после объединения с новым main требует новой CI/native приёмки.
+
 ## 0.14.0 — 2026-11-02: пути native evidence и стоимость свежего VK snapshot
 
 - R6 run 41360104726 подтвердил ранний nginx probe, полную Docker/Next сборку,

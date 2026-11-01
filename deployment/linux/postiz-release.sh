@@ -17,10 +17,17 @@ cd -- "$script_root"
 : "${EDITORIAL_POSTIZ_ARCHIVE_SHA256:?Set its accepted SHA256}"
 : "${EDITORIAL_NATIVE_ACCEPTANCE:?Set the accepted native acceptance.json path}"
 : "${EDITORIAL_SOURCE_COMMIT:?Set the accepted exact source commit}"
+source_arguments=()
+if [[ -n "${EDITORIAL_RELEASE_ROOT:-}" ]]; then
+  source_arguments+=(--release-root "$EDITORIAL_RELEASE_ROOT")
+fi
+if [[ -n "${EDITORIAL_PRESERVED_TOPIC_SHA256:-}" ]]; then
+  source_arguments+=(--preserved-topic-sha256 "$EDITORIAL_PRESERVED_TOPIC_SHA256")
+fi
 python3 deployment/linux/verify-three-platform-image.py --image-id "$EDITORIAL_POSTIZ_IMAGE" \
   --archive "$EDITORIAL_POSTIZ_ARCHIVE" --archive-sha256 "$EDITORIAL_POSTIZ_ARCHIVE_SHA256" \
   --env-file deployment/postiz/.env --acceptance "$EDITORIAL_NATIVE_ACCEPTANCE" \
-  --source-commit "$EDITORIAL_SOURCE_COMMIT"
+  --source-commit "$EDITORIAL_SOURCE_COMMIT" "${source_arguments[@]}"
 compose=(docker --context default compose --project-name max-postiz --env-file deployment/postiz/.env
   -f deployment/postiz/compose.yaml -f deployment/postiz/images.lock.yaml
   -f deployment/postiz-max/compose.bridge.yaml -f deployment/linux/compose.yaml

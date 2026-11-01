@@ -97,6 +97,8 @@ def validate_acceptance(value, *, commit, ident, archive, digest):
 def validate_source(root, commit, source_tree, source_manifest_sha256):
     manifest = root / "package-manifest.json"
     if manifest.exists():
+        require(manifest.is_file() and not manifest.is_symlink() and manifest.stat().st_size <= 2 * 1024 * 1024,
+                "RELEASE_SOURCE_MANIFEST_INVALID")
         value = json.loads(manifest.read_text(encoding="utf-8"))
         require(isinstance(value, dict) and value.get("contract") == "exact-git-source-package-v1"
                 and isinstance(value.get("commit"), str) and re.fullmatch(r"[a-f0-9]{40}", value["commit"])
@@ -111,11 +113,54 @@ def validate_source(root, commit, source_tree, source_manifest_sha256):
             require(not Path(name).is_absolute() and ".." not in Path(name).parts and path.resolve().is_relative_to(root.resolve())
                     and path.is_file() and not any(part.is_symlink() for part in (path, *path.parents)), "RELEASE_SOURCE_PATH_INVALID")
             require(hashlib.sha256(path.read_bytes()).hexdigest() == expected, "RELEASE_SOURCE_HASH_MISMATCH")
-        return
+        return value["hashes"]
     result = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, timeout=15, check=False)
     require(result.returncode == 0 and result.stdout.strip() == source_tree, "RELEASE_SOURCE_TREE_MISMATCH")
     result = subprocess.run(["git", "-C", str(root), "diff", "--quiet", "HEAD", "--"], capture_output=True, timeout=15, check=False)
     require(result.returncode == 0, "RELEASE_SOURCE_DIRTY")
+
+
+def source_file(root, name):
+    require(isinstance(name, str) and name and not Path(name).is_absolute()
+            and ".." not in Path(name).parts, "RELEASE_SOURCE_PATH_INVALID")
+    path = root / name
+    require(path.resolve().is_relative_to(root.resolve()) and path.is_file()
+            and not any(part.is_symlink() for part in (path, *path.parents)), "RELEASE_SOURCE_PATH_INVALID")
+    return path
+
+
+def validate_runtime_source(root, commit, source_tree, source_manifest_sha256, *, release_root=None, preserved_topic_sha256=None):
+    if release_root is None:
+        require(preserved_topic_sha256 is None, "RELEASE_PRESERVED_TOPIC_SOURCE_REQUIRED")
+        validate_source(root, commit, source_tree, source_manifest_sha256)
+        return "runtime_exact"
+    require(release_root.is_absolute() and ".." not in release_root.parts and release_root.is_dir()
+            and not any(part.is_symlink() for part in (release_root, *release_root.parents)), "RELEASE_IMMUTABLE_SOURCE_INVALID")
+    release_root, root = release_root.resolve(), root.resolve()
+    require(not release_root.is_relative_to(root) and not root.is_relative_to(release_root),
+            "RELEASE_SEPARATE_SOURCE_REQUIRED")
+    require(preserved_topic_sha256 is None or isinstance(preserved_topic_sha256, str)
+            and re.fullmatch(r"[a-f0-9]{64}", preserved_topic_sha256), "RELEASE_PRESERVED_TOPIC_SHA_INVALID")
+    hashes = validate_source(release_root, commit, source_tree, source_manifest_sha256)
+    if hashes is None:
+        result = subprocess.run(["git", "-C", str(release_root), "ls-files", "-z"],
+                                capture_output=True, text=True, timeout=15, check=False)
+        require(result.returncode == 0 and result.stdout.endswith("\0"), "RELEASE_SOURCE_MANIFEST_INVALID")
+        names = result.stdout[:-1].split("\0")
+        require(len(names) == len(set(names)), "RELEASE_SOURCE_MANIFEST_INVALID")
+        hashes = {name: hashlib.sha256(source_file(release_root, name).read_bytes()).hexdigest() for name in names}
+        require(hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest() == source_manifest_sha256,
+                "RELEASE_SOURCE_MANIFEST_MISMATCH")
+    require("TOPIC.md" in hashes, "RELEASE_SOURCE_MANIFEST_INVALID")
+    for name, expected in hashes.items():
+        actual = hashlib.sha256(source_file(root, name).read_bytes()).hexdigest()
+        if name == "TOPIC.md" and preserved_topic_sha256 is not None:
+            require(actual == preserved_topic_sha256, "RELEASE_PRESERVED_TOPIC_CHANGED")
+        else:
+            require(actual == expected, "RELEASE_RUNTIME_SOURCE_HASH_MISMATCH")
+    # The separate accepted source must remain exact during runtime comparison.
+    validate_source(release_root, commit, source_tree, source_manifest_sha256)
+    return "separate_source_preserved_topic" if preserved_topic_sha256 is not None else "separate_source_exact"
 
 
 def main(argv=None):
@@ -126,6 +171,8 @@ def main(argv=None):
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--acceptance", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--release-root", type=Path)
+    parser.add_argument("--preserved-topic-sha256")
     arguments = parser.parse_args(argv)
     try:
         require(re.fullmatch(r"sha256:[a-f0-9]{64}", arguments.image_id), "RELEASE_IMMUTABLE_IMAGE_REQUIRED")
@@ -145,8 +192,9 @@ def main(argv=None):
         acceptance = json.loads(arguments.acceptance.read_text(encoding="utf-8"))
         validate_acceptance(acceptance, commit=arguments.source_commit, ident=arguments.image_id,
                             archive=arguments.archive, digest=arguments.archive_sha256)
-        validate_source(Path(__file__).resolve().parents[2], arguments.source_commit,
-                        acceptance["source_tree"], acceptance["source_manifest_sha256"])
+        source_mode = validate_runtime_source(Path(__file__).resolve().parents[2], arguments.source_commit,
+                        acceptance["source_tree"], acceptance["source_manifest_sha256"],
+                        release_root=arguments.release_root, preserved_topic_sha256=arguments.preserved_topic_sha256)
         endpoint = inspect_json(["context", "inspect", "default", "--format", "{{json .Endpoints.docker.Host}}"])
         require(endpoint == "unix:///var/run/docker.sock", "RELEASE_LOCAL_DOCKER_REQUIRED")
         image = inspect_json(["image", "inspect", arguments.image_id, "--format", "{{json .}}"])
@@ -155,6 +203,7 @@ def main(argv=None):
                           "archive_sha256": arguments.archive_sha256, "origin": ORIGIN, "origin_profile": PROFILE,
                           "source_commit": arguments.source_commit, "deployment_performed": False,
                           "startup_contract": STARTUP_CONTRACT,
+                          "source_verification": source_mode,
                           "ci_acceptance_record_bound": True, "ci_run_authenticity_checked_by_this_script": False}))
         return 0
     except (ValueError, OSError, subprocess.SubprocessError) as error:

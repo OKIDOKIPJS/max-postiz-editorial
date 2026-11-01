@@ -205,3 +205,154 @@ def test_no_ddl_evidence_is_typed_and_source_startup_bytes_are_exact(tmp_path):
     with pytest.raises(ValueError, match="RELEASE_CONTEXT_STARTUP_MISMATCH"):
         module.validate_acceptance(proof, commit=COMMIT, ident=IDENT, archive=archive,
                                    digest=proof["portable_image"]["sha256"])
+
+
+def release_and_runtime(tmp_path):
+    release, runtime = tmp_path / "accepted-source", tmp_path / "runtime"
+    release.mkdir()
+    runtime.mkdir()
+    files = {"TOPIC.md": b"canonical public topic", "src/public.py": b"accepted code",
+             "schemas/topic.schema.json": b"accepted schema", "deployment/linux/compose.yaml": b"accepted infrastructure",
+             "config/publishing.example.json": b"accepted example", "AGENTS.md": b"accepted instructions"}
+    for name, raw in files.items():
+        for root in (release, runtime):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+    hashes = {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()}
+    (release / "package-manifest.json").write_text(json.dumps({"contract": "exact-git-source-package-v1",
+        "commit": COMMIT, "hashes": hashes}))
+    return release, runtime, hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+
+
+def test_existing_private_topic_is_preserved_only_with_explicit_exact_backup_baseline(tmp_path):
+    release, runtime, sha = release_and_runtime(tmp_path)
+    private_topic = b"existing owner policy - never replace with example"
+    (runtime / "TOPIC.md").write_bytes(private_topic)
+    baseline = hashlib.sha256(private_topic).hexdigest()
+    with pytest.raises(ValueError, match="RELEASE_RUNTIME_SOURCE_HASH_MISMATCH"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=release)
+    assert module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha,
+        release_root=release, preserved_topic_sha256=baseline) == "separate_source_preserved_topic"
+    assert (runtime / "TOPIC.md").read_bytes() == private_topic
+    assert (release / "TOPIC.md").read_bytes() != private_topic
+    (runtime / "TOPIC.md").write_bytes(private_topic + b"changed after backup")
+    with pytest.raises(ValueError, match="RELEASE_PRESERVED_TOPIC_CHANGED"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha,
+            release_root=release, preserved_topic_sha256=baseline)
+
+
+def test_canonical_topic_needs_no_exception_and_private_untracked_files_are_unchanged(tmp_path):
+    release, runtime, sha = release_and_runtime(tmp_path)
+    private = {"config/app.json": b"private app", "config/publishing.json": b"private targets", ".env.local": b"private credentials"}
+    for name, raw in private.items():
+        (runtime / name).write_bytes(raw)
+    assert module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=release) == "separate_source_exact"
+    assert all((runtime / name).read_bytes() == raw for name, raw in private.items())
+
+
+@pytest.mark.parametrize("name", ["src/public.py", "schemas/topic.schema.json", "deployment/linux/compose.yaml",
+                                  "config/publishing.example.json", "AGENTS.md"])
+def test_topic_exception_never_ignores_any_other_tracked_code_or_static_file(tmp_path, name):
+    release, runtime, sha = release_and_runtime(tmp_path)
+    baseline = hashlib.sha256((runtime / "TOPIC.md").read_bytes()).hexdigest()
+    (runtime / name).write_bytes(b"unaccepted runtime edit")
+    with pytest.raises(ValueError, match="RELEASE_RUNTIME_SOURCE_HASH_MISMATCH"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha,
+            release_root=release, preserved_topic_sha256=baseline)
+
+
+def test_missing_runtime_source_file_fails_even_with_valid_topic_baseline(tmp_path):
+    release, runtime, sha = release_and_runtime(tmp_path)
+    (runtime / "src/public.py").unlink()
+    with pytest.raises(ValueError, match="RELEASE_SOURCE_PATH_INVALID"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha,
+            release_root=release, preserved_topic_sha256=hashlib.sha256((runtime / "TOPIC.md").read_bytes()).hexdigest())
+
+
+def test_preserved_topic_cannot_waive_full_accepted_source_or_use_runtime_as_release(tmp_path):
+    release, runtime, sha = release_and_runtime(tmp_path)
+    baseline = hashlib.sha256((runtime / "TOPIC.md").read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="RELEASE_PRESERVED_TOPIC_SOURCE_REQUIRED"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, preserved_topic_sha256=baseline)
+    with pytest.raises(ValueError, match="RELEASE_SEPARATE_SOURCE_REQUIRED"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=runtime, preserved_topic_sha256=baseline)
+    (release / "TOPIC.md").write_bytes(b"tampered accepted source")
+    with pytest.raises(ValueError, match="RELEASE_SOURCE_HASH_MISMATCH"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=release, preserved_topic_sha256=baseline)
+
+
+@pytest.mark.parametrize("value", ["", "not-a-sha", "a" * 63, "A" * 64])
+def test_preserved_topic_baseline_is_a_strict_sha256(tmp_path, value):
+    release, runtime, sha = release_and_runtime(tmp_path)
+    with pytest.raises(ValueError, match="RELEASE_PRESERVED_TOPIC_SHA_INVALID"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=release, preserved_topic_sha256=value)
+
+
+def test_accepted_source_manifest_cannot_point_outside_or_through_a_link(tmp_path, monkeypatch):
+    release, runtime, _ = release_and_runtime(tmp_path)
+    hashes = {"../escape": "a" * 64, "TOPIC.md": "b" * 64}
+    path = release / "package-manifest.json"
+    path.write_text(json.dumps({"contract": "exact-git-source-package-v1", "commit": COMMIT, "hashes": hashes}))
+    sha = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+    with pytest.raises(ValueError, match="RELEASE_SOURCE_PATH_INVALID"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=release)
+    original = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda self: self == release or original(self))
+    with pytest.raises(ValueError, match="RELEASE_IMMUTABLE_SOURCE_INVALID"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=release)
+
+
+def test_separate_clean_git_source_also_binds_complete_actual_hash_map(tmp_path, monkeypatch):
+    release, runtime, sha = release_and_runtime(tmp_path)
+    manifest = json.loads((release / "package-manifest.json").read_text())
+    (release / "package-manifest.json").unlink()
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        output = ("d" * 40 + "\n" if "rev-parse" in command else
+                  "\0".join(manifest["hashes"]) + "\0" if "ls-files" in command else "")
+        return subprocess.CompletedProcess(command, 0, output, "")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    assert module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=release) == "separate_source_exact"
+    assert len(calls) == 5 and all(command[:3] == ["git", "-C", str(release)] for command in calls)
+    with pytest.raises(ValueError, match="RELEASE_SOURCE_MANIFEST_MISMATCH"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, "f" * 64, release_root=release)
+
+
+def test_separate_release_is_revalidated_after_runtime_byte_comparison(tmp_path, monkeypatch):
+    release, runtime, sha = release_and_runtime(tmp_path)
+    original = module.source_file
+    def read(root, name):
+        if root == runtime and name == "AGENTS.md":
+            (release / "src/public.py").write_bytes(b"changed during comparison")
+        return original(root, name)
+    monkeypatch.setattr(module, "source_file", read)
+    with pytest.raises(ValueError, match="RELEASE_SOURCE_HASH_MISMATCH"):
+        module.validate_runtime_source(runtime, COMMIT, "d" * 40, sha, release_root=release)
+
+
+def test_cli_passes_explicit_release_and_topic_baseline_without_relaxing_other_identity_checks(tmp_path, monkeypatch, capsys):
+    archive, env, proof = tmp_path / "image.tar.gz", tmp_path / ".env", tmp_path / "acceptance.json"
+    archive.write_bytes(b"synthetic image")
+    env.write_text("POSTIZ_PUBLIC_ORIGIN=" + module.ORIGIN)
+    proof.write_text(json.dumps(acceptance(archive)))
+    release, baseline = tmp_path / "separate-source", "f" * 64
+    calls = []
+    def source(*args, **kwargs):
+        assert kwargs == {"release_root": release, "preserved_topic_sha256": baseline}
+        return "separate_source_preserved_topic"
+    monkeypatch.setattr(module, "validate_runtime_source", source)
+    for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "BUILDKIT_HOST", "POSTIZ_PUBLIC_ORIGIN"):
+        monkeypatch.delenv(key, raising=False)
+    def run(command, **kwargs):
+        calls.append(command)
+        value = "unix:///var/run/docker.sock" if command[3] == "context" else image()
+        return subprocess.CompletedProcess(command, 0, json.dumps(value), "")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    args = ["--image-id", IDENT, "--archive", str(archive), "--archive-sha256", hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "--env-file", str(env), "--acceptance", str(proof), "--source-commit", COMMIT,
+            "--release-root", str(release), "--preserved-topic-sha256", baseline]
+    assert module.main(args) == 0
+    assert json.loads(capsys.readouterr().out)["source_verification"] == "separate_source_preserved_topic"
+    assert len(calls) == 2 and all(command[:3] == ["docker", "--context", "default"] for command in calls)
