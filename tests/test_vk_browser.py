@@ -4,11 +4,16 @@ import hashlib
 import html
 import io
 import json
+import os
+import re
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
+from xml.etree import ElementTree
 
 import pytest
 from PIL import Image
@@ -33,7 +38,7 @@ SELECTORS = {
 
 
 @pytest.fixture
-def sample(tmp_path):
+def sample(tmp_path, request):
     output = io.BytesIO()
     Image.new("RGB", (640, 480), "navy").save(output, format="PNG")
     raw = output.getvalue()
@@ -44,7 +49,8 @@ def sample(tmp_path):
                 "destination": OWNER, "media": [{"path": "approved.png", "mime": "image/png",
                 "sha256": hashlib.sha256(raw).hexdigest()}], "metadata": {}}
     payload = {"action": "publish", "destination": OWNER, "snapshot": snapshot, "request_id": "vk-fixture"}
-    return SimpleNamespace(root=tmp_path, raw=raw, options=options, snapshot=snapshot, payload=payload)
+    return SimpleNamespace(root=tmp_path, raw=raw, options=options, snapshot=snapshot, payload=payload,
+                           user_properties=request.node.user_properties)
 
 
 def post_html(state, text, ident, *, readback=False):
@@ -302,8 +308,60 @@ def page(browser):
 
 
 def run(page, sample, state, authorize=lambda: None):
-    return worker.run_publish(page, sample.root, sample.options, sample.payload, authorize,
-                              origin=state.origin, fixture=True)
+    result, completed = None, False
+    try:
+        result = worker.run_publish(page, sample.root, sample.options, sample.payload, authorize,
+                                    origin=state.origin, fixture=True)
+        completed = True
+        return result
+    finally:
+        _record_fixture_diagnostics(sample, state, result, None if completed else sys.exc_info()[1])
+
+
+def _record_fixture_diagnostics(sample, state, result, raised):
+    """Record only safe fixture fields; reporting must not alter an operation outcome."""
+    try:
+        states = {"intent", "editor_open_intent", "fill_intent", "upload_intent", "uploaded",
+                  "next_intent", "story_disable_intent", "click_intent", "readback_pending",
+                  "confirmed", "failed", "unknown"}
+        error_types = {"AgentError", "TimeoutError", "Error", "OSError", "ValueError",
+                       "TypeError", "RuntimeError", "AssertionError", "FileNotFoundError"}
+        try:
+            _, journal = worker._read(sample.root, sample.payload["request_id"])
+        except Exception:
+            journal = {}
+        journal = journal if isinstance(journal, dict) else {}
+        result = result if isinstance(result, dict) else {}
+        evidence = result.get("evidence")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        error = journal.get("private_error")
+        error = error if isinstance(error, dict) else {}
+        code = journal.get("failure_code") or evidence.get("failure_code") or getattr(raised, "code", None)
+        stage = journal.get("last_action_intent")
+        status = result.get("state") or journal.get("state")
+        record = {"fixture": True, "outcome": "raised" if raised is not None else "returned",
+                  "state": status if isinstance(status, str) and status in states else None,
+                  "last_action_intent": stage if isinstance(stage, str) and stage in states else None,
+                  "failure_code": code if isinstance(code, str) and re.fullmatch(
+                      r"(?:VK_BROWSER|TARGET|EDITORIAL)_[A-Z0-9_]{1,96}", code) else None,
+                  "private_error_type": error.get("type") if isinstance(error.get("type"), str)
+                      and error["type"] in error_types else None,
+                  "raised_error_type": type(raised).__name__ if raised is not None
+                      and type(raised).__name__ in error_types else None}
+        for key, value in (("clicks", journal.get("clicks")), ("uploads", state.uploads),
+                           ("publishes", state.publishes)):
+            record[key] = value if type(value) is int and 0 <= value <= 100000 else None
+        message = error.get("message")
+        context = re.match(
+            r"^(Locator\.(?:click|fill|set_input_files|uncheck|wait_for)|"
+            r"Page\.(?:goto|reload|wait_for_function)|Frame\.wait_for_function): "
+            r"Timeout ([0-9]{1,6})ms exceeded", message[:256]) if isinstance(message, str) else None
+        if context and 1 <= int(context[2]) <= 180000:
+            record.update(operation=context[1], timeout_ms=int(context[2]))
+        sample.user_properties.append(("vk_browser_diagnostics", json.dumps(record, sort_keys=True)))
+    except Exception:
+        # The original return or exception wins even if fixture diagnostics fail.
+        return None
 
 
 def publish_diagnostics(sample, state, result):
@@ -319,6 +377,123 @@ def publish_diagnostics(sample, state, result):
     details.update(uploads=state.uploads, publishes=state.publishes,
                    publish_readiness=state.publish_readiness, result=result)
     return details
+
+
+def test_fixture_diagnostics_are_serialized_to_junit_without_private_fields(tmp_path):
+    child = tmp_path / "test_diagnostic_case.py"
+    child.write_text(r'''
+from types import SimpleNamespace
+import pytest
+from test_vk_browser import sample as sample, run, worker
+
+SECRET = "diagnostic-private-fixture-canary"
+RAW_TEXT = "raw-snapshot-text-fixture-canary"
+
+@pytest.mark.parametrize("mode", ["unknown", "confirmed", "raised", "malicious"])
+def test_operation(sample, monkeypatch, mode):
+    sample.snapshot["body"] = RAW_TEXT
+    sample.options["private"] = SECRET
+    expected = {"state": "confirmed" if mode == "confirmed" else "unknown",
+                "evidence": {"failure_code": "VK_BROWSER_OPERATION_UNKNOWN"},
+                "raw_journal": SECRET}
+    journal = {"state": "unknown", "last_action_intent": "upload_intent", "clicks": 0,
+               "failure_code": "VK_BROWSER_OPERATION_UNKNOWN",
+               "snapshot": {"text": RAW_TEXT}, "credentials": SECRET,
+               "private_error": {"type": "TimeoutError", "message":
+                   "Locator.set_input_files: Timeout 1000ms exceeded.\nCall log: https://user:"
+                   + SECRET + "@private.invalid/" + RAW_TEXT}}
+    local = SimpleNamespace(origin="http://" + SECRET + "@private.invalid", uploads=0, publishes=0)
+    if mode == "malicious":
+        journal.update(state=SECRET, last_action_intent=SECRET, failure_code=SECRET,
+                       clicks=float("nan"), private_error={"type": SECRET, "message": SECRET})
+        local.uploads = local.publishes = SECRET
+    monkeypatch.setattr(worker, "_read", lambda *args: (None, journal))
+    planned_error = RuntimeError(SECRET)
+    def operation(*args, **kwargs):
+        if mode == "raised":
+            raise planned_error
+        return expected
+    monkeypatch.setattr(worker, "run_publish", operation)
+    if mode == "raised":
+        with pytest.raises(RuntimeError) as actual:
+            run(None, sample, local)
+        assert actual.value is planned_error
+    else:
+        assert run(None, sample, local) is expected
+    assert "user_properties" not in sample.options
+    assert "user_properties" not in sample.payload
+    assert sample.payload["snapshot"] is sample.snapshot
+''', encoding="utf-8")
+    config = tmp_path / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+    junit = tmp_path / "diagnostics.xml"
+    env = dict(os.environ)
+    for key in ("TEST_DATABASE_URL", "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_CURRENT_TEST"):
+        env.pop(key, None)
+    env.update(PYTHONPATH=str(Path(__file__).resolve().parent), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    completed = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", "-m", "pytest", "-c", str(config), str(child),
+         "-q", "--basetemp=" + str(tmp_path / "child-state"), "--junitxml=" + str(junit)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=30, check=False)
+    (tmp_path / "child-output.log").write_text(completed.stdout + completed.stderr, encoding="utf-8")
+    assert completed.returncode == 0, "Isolated diagnostic pytest failed; inspect child-output.log"
+    raw = junit.read_text(encoding="utf-8")
+    assert "diagnostic-private-fixture-canary" not in raw
+    assert "raw-snapshot-text-fixture-canary" not in raw
+    assert "private.invalid" not in raw and "Call log:" not in raw
+    cases = list(ElementTree.parse(junit).getroot().iter("testcase"))  # noqa: S314 -- local pytest report
+    assert len(cases) == 4 and all(case.find("failure") is None and case.find("error") is None for case in cases)
+    for case in cases:
+        properties = [json.loads(prop.get("value")) for prop in case.findall("./properties/property")
+                      if prop.get("name") == "vk_browser_diagnostics"]
+        assert len(properties) == 1
+        details = properties[0]
+        assert details["fixture"] is True
+        assert details["outcome"] == ("raised" if "raised" in case.get("name") else "returned")
+        if "malicious" in case.get("name"):
+            assert details["failure_code"] is details["last_action_intent"] is details["private_error_type"] is None
+            assert details["clicks"] is details["uploads"] is details["publishes"] is None
+            assert "operation" not in details and "timeout_ms" not in details
+        else:
+            assert details["failure_code"] == "VK_BROWSER_OPERATION_UNKNOWN"
+            assert details["last_action_intent"] == "upload_intent"
+            assert details["private_error_type"] == "TimeoutError"
+            assert details["operation"] == "Locator.set_input_files" and details["timeout_ms"] == 1000
+
+
+@pytest.mark.parametrize("fault", ["read", "serialize"])
+@pytest.mark.parametrize("raised", [False, True])
+def test_fixture_diagnostic_failure_does_not_change_return_or_original_exception(
+        sample, monkeypatch, fault, raised):
+    expected = {"state": "unknown", "evidence": {"failure_code": "VK_BROWSER_OPERATION_UNKNOWN"}}
+    planned_error = RuntimeError("Original operation error")
+    local = SimpleNamespace(origin="http://127.0.0.1", uploads=0, publishes=0)
+    attempts = []
+
+    def operation(*args, **kwargs):
+        if raised:
+            raise planned_error
+        return expected
+
+    def diagnostic_failure(*args, **kwargs):
+        attempts.append(True)
+        raise OSError("Fixture diagnostic storage failed")
+
+    monkeypatch.setattr(worker, "run_publish", operation)
+    monkeypatch.setattr(worker, "_read", lambda *args: (None, {}))
+    with monkeypatch.context() as scoped:
+        if fault == "read":
+            scoped.setattr(worker, "_read", diagnostic_failure)
+        else:
+            scoped.setattr(json, "dumps", diagnostic_failure)
+        if raised:
+            with pytest.raises(RuntimeError) as actual:
+                run(None, sample, local)
+            assert actual.value is planned_error
+        else:
+            assert run(None, sample, local) is expected
+    assert attempts == [True]
 
 
 def personal_wall(sample, state):
