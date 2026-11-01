@@ -696,7 +696,8 @@ def _photo_original(page, plan, selectors, expected_asset, *, origin, media_revi
             proof = accepted_proof(response.body(), plan["source_image"], plan["image_contract"], expected_asset,
                                    media_review, before["original"], origin=origin)
         else:
-            proof = derivative_proof(response.body(), plan["source_image"], expected_asset, plan["image_contract"])
+            proof = derivative_proof(response.body(), plan["source_image"], expected_asset, plan["image_contract"],
+                                     native_url=before["original"])
         after = capture()
         if before != after:
             raise AgentError("VK_BROWSER_PHOTO_VIEWER_CHANGED_DURING_READ")

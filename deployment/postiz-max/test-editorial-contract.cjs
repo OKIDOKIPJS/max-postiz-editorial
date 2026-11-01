@@ -343,7 +343,8 @@ test('native React records escape titles, reject unsafe URLs, loading page has R
   const markup = renderToStaticMarkup(React.createElement(ui.EditorialRecords, { records: [{ id: 'id', title: '<script>bad</script>', url: 'javascript:alert(1)' }] }));
   assert.ok(markup.includes('&lt;script&gt;')); assert.ok(!markup.includes('href='));
   const page = renderToStaticMarkup(React.createElement(ui.EditorialPanel));
-  for (const text of ['Редакция', 'Запустить цикл', 'Поставить на паузу', 'Последние материалы', 'Вход в MAX', '/owner-browser/vnc.html?autoconnect=1&amp;resize=scale']) assert.ok(page.includes(text));
+  for (const text of ['Редакция', 'Запустить цикл', 'Поставить на паузу', 'Последние материалы', 'Подключения и свои материалы']) assert.ok(page.includes(text));
+  assert.equal(page.includes('href="/owner-browser/vnc.html'), false);
   assert.ok(!page.includes('iframe')); assert.ok(!page.includes('private-test-key'));
   const nasa = renderToStaticMarkup(React.createElement(ui.NasaRatingField));
   assert.ok(nasa.includes('Источник не предоставляет оценку')); assert.ok(nasa.includes('disabled=""')); assert.ok(nasa.includes('value="0"'));
@@ -355,7 +356,7 @@ test('native React records escape titles, reject unsafe URLs, loading page has R
   }
   assert.notEqual(ui.readableTime(1761080400), '—'); assert.equal(ui.readableTime(undefined), '—');
 });
-test('MAX login link supplies the exact root-relative noVNC WebSocket proxy path', () => {
+test('MAX legacy noVNC path stays fixed while login now requires a selected channel', () => {
   const React = require(path.join(tooling, 'react'));
   const ui = loadModule('editorial-panel.tsx', { react: React, 'react/jsx-runtime': require(path.join(tooling, 'react/jsx-runtime')),
     './editorial-form': formApi, './editorial.module.css': new Proxy({}, { get: (_, key) => String(key) }) });
@@ -366,7 +367,8 @@ test('MAX login link supplies the exact root-relative noVNC WebSocket proxy path
   // Установленный noVNC добавляет '/' перед path, а не перед каталогом vnc.html.
   assert.equal(new URL('/' + url.searchParams.get('path'), url.origin).pathname, '/owner-browser/websockify');
   const source = fs.readFileSync(path.join(__dirname, 'editorial-panel.tsx'), 'utf8');
-  assert.ok(source.includes('path=owner-browser/websockify')); assert.ok(source.includes('href={OWNER_BROWSER_URL}'));
+  assert.ok(source.includes('path=owner-browser/websockify')); assert.equal(source.includes('href={OWNER_BROWSER_URL}'), false);
+  assert.ok(source.includes("action: 'prepare_login'")); assert.ok(source.includes("value?.login_url !== '/owner-browser/'"));
 });
 
 function routeUi(react, globals = {}) {
@@ -821,6 +823,313 @@ test('stale preview result never renders an image or enables owner approval', as
   const markup = renderToStaticMarkup(tree);
   assert.ok(!markup.includes('<img')); assert.ok(markup.includes('согласуйте новую версию'));
   assert.equal(harness.find(tree, 'input', 'type', 'checkbox').props.disabled, true);
+});
+
+// Новое подключение и авторские материалы: только mocks MAX/Telegram/VK.
+const setupTarget = { id: 'science_telegram', profile_id: 'science', platform: 'telegram', route: 'telegram_api',
+  destination: '-1001234567890', enabled: true, paused: true, binding_hash: 'a'.repeat(64), options: { media_layout: 'auto' },
+  capabilities: { can_configure: true, can_set_secret: true, can_create_original: true, can_upload_media: true, can_login: false },
+  diagnostics: { local_prerequisites: false, credentials_configured: false, blocked_reasons: ['TELEGRAM_TOKEN_REQUIRED'] } };
+const setupFixture = () => ({ config_hash: 'b'.repeat(64), targets: [{ ...setupTarget }],
+  max_channels: [{ id: '-123456', name: 'Разрешённый научный MAX' }],
+  profiles: [{ id: 'science', name: 'Наука', enabled: true, publication_mode: 'human' }],
+  restart: { required: false, can_request: false, blocked_reasons: [] }, external_mutations: 0 });
+const uploadReference = { path: `data/media/${'c'.repeat(64)}.png`, mime: 'image/png', sha256: 'c'.repeat(64) };
+const createAdmin = () => ({ action: 'create_original', id: setupTarget.id, expected_binding_hash: setupTarget.binding_hash,
+  original: { title: 'Своя заметка', body: 'Полный русский авторский текст без сокращений.', media: [], metadata: {} }, attest_original: true });
+
+test('onboarding BFF returns only managed setup fields and never secret/config internals', async () => {
+  const value = setupFixture(); value.token = 'private-token';
+  value.max_channels[0].name = 'К'.repeat(300);
+  value.targets[0].token = 'private-token'; value.targets[0].capabilities.token = 'private-token';
+  value.targets[0].diagnostics.raw = { token: 'private-token' };
+  const { instance, calls } = controller(() => response(value));
+  const result = await instance.routeSetup(request());
+  assert.equal(result.targets[0].id, setupTarget.id);
+  assert.equal(result.max_channels[0].name, 'К'.repeat(300));
+  assert.equal(JSON.stringify(result).includes('private-token'), false);
+  assert.equal(calls[0][0], `${env.EDITORIAL_INTERNAL_URL}/route-setup`);
+  const unsafe = setupFixture(); unsafe.targets[0].options.dom_contract_verified = true;
+  const invalid = controller(() => response(unsafe));
+  await rejected(invalid.instance.routeSetup(request()), 'EDITORIAL_ROUTE_ADMIN_INVALID');
+});
+
+test('onboarding BFF preserves owner/origin guard and strict target CAS envelope', async () => {
+  const configure = { action: 'configure_target', id: 'new_max', expected_config_hash: 'b'.repeat(64), expected_binding_hash: null,
+    target: { profile_id: 'science', platform: 'max', route: 'max_browser', destination: 'approved-channel', enabled: true, options: { max_chars: 4000 } } };
+  const { instance, calls } = controller(() => response({ target_id: 'new_max', binding_hash: 'c'.repeat(64), config_hash: 'd'.repeat(64), paused: true, restart_required: true, token: 'do-not-return' }));
+  const result = await instance.routeAdmin(request(), configure);
+  assert.equal(result.paused, true); assert.equal(result.restart_required, true); assert.equal(result.token, undefined);
+  assert.deepEqual(JSON.parse(calls[0][1].body), configure);
+  const foreign = request(); foreign.headers.origin = 'http://evil.test';
+  await rejected(instance.routeAdmin(foreign, configure), 'EDITORIAL_ORIGIN_REQUIRED');
+  for (const changed of [
+    { ...configure, due_at: 123 }, { ...configure, expected_binding_hash: 'old' },
+    { ...configure, target: { ...configure.target, options: { dom_contract_verified: true } } },
+    { ...configure, target: { ...configure.target, options: { token_env: 'PRIVATE_TOKEN' } } },
+    { ...configure, target: { ...configure.target, options: { profile_dir: 'data/other-profile' } } },
+    { ...configure, target: { ...configure.target, route: 'telegram_api' } },
+    { ...configure, target: { ...configure.target, platform: 'other', route: 'manual' } },
+  ]) await rejected(instance.routeAdmin(request(), changed), 'EDITORIAL_ROUTE_ADMIN_INVALID');
+  assert.equal(calls.length, 1);
+});
+
+test('onboarding BFF token is write-only even when upstream echoes it or fails', async () => {
+  const value = '123456:owner-test-private-token';
+  const body = { action: 'set_secret', id: setupTarget.id, expected_binding_hash: setupTarget.binding_hash, value };
+  const { instance, calls } = controller(() => response({ target_id: setupTarget.id, configured: true, paused: true, restart_required: true, value, token: value }));
+  assert.deepEqual(JSON.parse(JSON.stringify(await instance.routeAdmin(request(), body))),
+    { target_id: setupTarget.id, configured: true, restart_required: true, paused: true });
+  assert.equal(JSON.parse(calls[0][1].body).value, value);
+  for (const extra of [{ token_env: 'OTHER' }, { password: value }, { cookie: value }, { url: 'http://other' }]) {
+    await rejected(instance.routeAdmin(request(), { ...body, ...extra }), 'EDITORIAL_ROUTE_ADMIN_INVALID');
+  }
+  const failing = controller(() => response({ code: value, value, stack: value }, 422));
+  await rejected(failing.instance.routeAdmin(request(), body), 'EDITORIAL_REQUEST_FAILED', 422);
+  const upper = controller(() => response({ code: 'PRIVATEUPPERCASETOKEN' }, 422));
+  await rejected(upper.instance.routeAdmin(request(), { ...body, value: 'PRIVATEUPPERCASETOKEN' }), 'EDITORIAL_REQUEST_FAILED', 422);
+  assert.equal(calls.length, 1);
+});
+
+test('onboarding recovery reports only the fixed pause and reconciliation code without a secret', async () => {
+  const secret='123456:private-owner-token', code='ROUTE_ADMIN_RECOVERY_REQUIRED';
+  const {instance}=controller(()=>response({code,value:secret,trace:secret},409));
+  await rejected(instance.routeAdmin(request(),{action:'set_secret',id:setupTarget.id,
+    expected_binding_hash:setupTarget.binding_hash,value:secret}),code,409);
+  const ui=routeUi(), message=ui.errorText(code);
+  assert.ok(message.includes('сверки')); assert.ok(message.includes('на паузе'));
+  assert.equal(message.includes(secret),false); assert.equal(message.includes('успешно'),false);
+});
+
+test('onboarding BFF restart accepts only the fixed owner request with configuration CAS', async () => {
+  const body={action:'request_restart',id:'server',expected_binding_hash:null,expected_config_hash:'b'.repeat(64)};
+  const {instance,calls}=controller(()=>response({request_id:'c'.repeat(32),state:'restart_requested',restart_required:true,unit:'private-unit'}));
+  const result=await instance.routeAdmin(request(),body);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)),{request_id:'c'.repeat(32),state:'restart_requested',restart_required:true});
+  assert.deepEqual(JSON.parse(calls[0][1].body),body);
+  for(const changed of [{...body,id:'other-service'},{...body,unit:'arbitrary.service'},{...body,expected_binding_hash:'a'.repeat(64)},
+    {...body,expected_config_hash:'stale'},{...body,command:['restart']}]) {
+    await rejected(instance.routeAdmin(request(),changed),'EDITORIAL_ROUTE_ADMIN_INVALID');
+  }
+  assert.equal(calls.length,1);
+  const malformed=controller(()=>response({request_id:'c'.repeat(32),state:'running',restart_required:true}));
+  await rejected(malformed.instance.routeAdmin(request(),body),'EDITORIAL_RESPONSE_INVALID');
+});
+
+test('onboarding BFF upload binds MIME SHA content address and rejects excessive base64', async () => {
+  const body = { action: 'upload_media', id: setupTarget.id, expected_binding_hash: setupTarget.binding_hash,
+    mime: uploadReference.mime, sha256: uploadReference.sha256, data_base64: 'aA==' };
+  const { instance, calls } = controller(() => response({ media: uploadReference, external_mutations: 0, raw: 'never-return' }));
+  assert.deepEqual(JSON.parse(JSON.stringify(await instance.routeAdmin(request(), body))), { media: uploadReference, external_mutations: 0 });
+  for (const changed of [{ ...body, path: '../../secret' }, { ...body, mime: 'image/svg+xml' }, { ...body, data_base64: 'data:image/png;base64,aA==' },
+    { ...body, data_base64: 'AAAA'.repeat(3495254) }, { ...body, sha256: 'invalid' }]) {
+    await rejected(instance.routeAdmin(request(), changed), 'EDITORIAL_ROUTE_ADMIN_INVALID');
+  }
+  assert.equal(calls.length, 1);
+  const mismatch = controller(() => response({ media: { ...uploadReference, path: 'data/media/other.png' }, external_mutations: 0 }));
+  await rejected(mismatch.instance.routeAdmin(request(), body), 'EDITORIAL_RESPONSE_INVALID', 502);
+});
+
+test('onboarding BFF original create and UUID revise never carry approval or dispatch dates', async () => {
+  const created = { variant_id: '12345678-1234-1234-1234-123456789012', target_id: setupTarget.id,
+    revision: 1, content_hash: 'd'.repeat(64), state: 'review_pending', approval_created: false, external_mutations: 0 };
+  const { instance, calls } = controller(() => response(created));
+  await instance.routeAdmin(request(), createAdmin());
+  for (const changed of [{ ...createAdmin(), attest_original: false }, { ...createAdmin(), due_at: 9999999999 },
+    { ...createAdmin(), approval_created: true }, { ...createAdmin(), original: { ...createAdmin().original, media: [{ ...uploadReference, path: 'data/../secret.png' }] } },
+    { ...createAdmin(), original: { ...createAdmin().original, metadata: { origin: 'hourly_article_test' } } }]) {
+    await rejected(instance.routeAdmin(request(), changed), 'EDITORIAL_ROUTE_ADMIN_INVALID');
+  }
+  const revise = { ...createAdmin(), action: 'revise_original', id: created.variant_id, revision: 1, content_hash: created.content_hash };
+  const revised = controller(() => response({ ...created, revision: 2 }));
+  await revised.instance.routeAdmin(request(), revise);
+  assert.deepEqual(JSON.parse(revised.calls[0][1].body), revise);
+  const staleReply = controller(() => response(created));
+  await rejected(staleReply.instance.routeAdmin(request(), revise), 'EDITORIAL_RESPONSE_INVALID');
+  assert.equal(calls.length, 1);
+});
+
+test('onboarding BFF login accepts only fixed owner portal and bounded future selection', async () => {
+  const body = { action: 'prepare_login', id: 'own_vk', expected_binding_hash: 'c'.repeat(64) };
+  const result = { target_id: body.id, login_url: '/owner-browser/', expires_at: Math.floor(Date.now()/1000) + 599, live_verified: false };
+  const allowed = controller(() => response(result));
+  assert.equal((await allowed.instance.routeAdmin(request(), body)).login_url, '/owner-browser/');
+  for (const patch of [{ login_url: 'https://other.test' }, { live_verified: true }, { expires_at: 1 }, { expires_at: 999999999999 }]) {
+    const bad = controller(() => response({ ...result, ...patch }));
+    await rejected(bad.instance.routeAdmin(request(), body), 'EDITORIAL_RESPONSE_INVALID');
+  }
+});
+
+test('onboarding image SHA works on LAN HTTP without WebCrypto for padding boundaries and 10MiB', () => {
+  const crypto = require('node:crypto');
+  for (const length of [0, 1, 55, 56, 63, 64, 65, 1024*1024, 10*1024*1024]) {
+    const bytes = Buffer.alloc(length); for (let index=0; index<length; index++) bytes[index] = (index*131+17)%256;
+    assert.equal(formApi.imageSha256(bytes), crypto.createHash('sha256').update(bytes).digest('hex'), `binary length ${length}`);
+  }
+  const bytes = Buffer.from('Русская подпись — 🌌 наука\n', 'utf8');
+  assert.equal(formApi.imageSha256(bytes), crypto.createHash('sha256').update(bytes).digest('hex'));
+});
+
+test('onboarding channel form sends only editable options and keeps platforms separate', () => {
+  const form = formApi.channelForm(setupTarget), target = formApi.channelTarget(form);
+  assert.equal(target.route, 'telegram_api'); assert.equal(target.options.media_layout, 'auto');
+  assert.equal('token_env' in target.options, false); assert.equal('dom_contract_verified' in target.options, false);
+  const vk = formApi.channelForm(); Object.assign(vk, { id: 'own_vk', profile_id: 'science', platform: 'vk', destination: '123', owner: '123' });
+  assert.deepEqual(JSON.parse(JSON.stringify(formApi.channelTarget(vk).options)), { owner: '123' });
+  for (const [key, value] of [['owner', ''], ['operation_timeout_seconds', '29'], ['max_chars', '40001'], ['id', '../other']]) {
+    const copy = { ...vk, [key]: value }; assert.throws(() => formApi.channelTarget(copy));
+  }
+});
+
+function adminComponent(name, props, globals = {}) {
+  const React = require(path.join(tooling, 'react')), values = [];
+  let index = 0;
+  const hooks = { ...React, useState(initial) { const key=index++; if (!(key in values)) values[key]=initial;
+    return [values[key], next => { values[key]=typeof next==='function' ? next(values[key]) : next; }]; }, useEffect() {} };
+  const ui = routeUi(hooks, globals);
+  const elements = (node, predicate) => !node || typeof node !== 'object' ? [] : Array.isArray(node)
+    ? node.flatMap(item => elements(item,predicate)) : [...(predicate(node) ? [node] : []), ...elements(node.props?.children,predicate)];
+  const render=()=>{ index=0; return ui[name](props); };
+  const find=(tree, type, predicate=()=>true)=>elements(tree,node=>node.type===type&&predicate(node))[0];
+  return { ui, props, render, elements, find };
+}
+
+test('onboarding token form clears secret on both success and failure and never renders raw errors', async () => {
+  const { renderToStaticMarkup } = require(path.join(tooling,'react-dom/server'));
+  for (const failing of [false,true]) {
+    const calls=[], secret='123456:private-owner-token';
+    const harness=adminComponent('ChannelSetup',{setup:setupFixture(),pending:false,onAdmin:async body=>{
+      calls.push(body); if(failing)throw new Error(`raw request ${secret}`); return {configured:true}; }});
+    let tree=harness.render(); harness.find(tree,'select').props.onChange({target:{value:setupTarget.id}}); tree=harness.render();
+    harness.find(tree,'input',node=>node.props.type==='password').props.onChange({target:{value:secret}}); tree=harness.render();
+    await harness.find(tree,'form',node=>node.props.autoComplete==='off').props.onSubmit({preventDefault(){}}); tree=harness.render();
+    assert.equal(harness.find(tree,'input',node=>node.props.type==='password').props.value,'');
+    assert.equal(calls[0].action,'set_secret'); assert.equal(calls[0].value,secret);
+    assert.equal(renderToStaticMarkup(tree).includes(secret),false);
+  }
+});
+
+test('onboarding original composer requires author attestation and edits exact saved version without approval', async () => {
+  const calls=[], editing={...routeDetailsFixture({...routeVariant,target_id:setupTarget.id,media_count:0},setupTarget),media:[],metadata:{origin:'owner_original'}};
+  const harness=adminComponent('OriginalComposer',{setup:setupFixture(),pending:false,editing,onCancel(){},onAdmin:async body=>{calls.push(body); return {};}});
+  let tree=harness.render();
+  assert.equal(harness.find(tree,'button',node=>node.props.type==='submit').props.disabled,true);
+  harness.find(tree,'input',node=>node.props.type==='checkbox').props.onChange({target:{checked:true}}); tree=harness.render();
+  harness.find(tree,'textarea').props.onChange({target:{value:'Исправленный русский текст.'}}); tree=harness.render();
+  assert.equal(harness.find(tree,'input',node=>node.props.type==='checkbox').props.checked,false);
+  harness.find(tree,'input',node=>node.props.type==='checkbox').props.onChange({target:{checked:true}}); tree=harness.render();
+  await harness.find(tree,'form').props.onSubmit({preventDefault(){}});
+  assert.equal(calls.length,1); const body=calls[0];
+  assert.equal(body.action,'revise_original'); assert.equal(body.id,editing.variant_id); assert.equal(body.revision,editing.revision);
+  assert.equal(body.content_hash,editing.content_hash); assert.equal(body.expected_binding_hash,setupTarget.binding_hash);
+  assert.equal(body.original.body,'Исправленный русский текст.'); assert.deepEqual(Object.keys(body.original.metadata),[]);
+  assert.equal('due_at' in body,false); assert.equal('approved' in body,false);
+});
+
+test('onboarding renders only three managed choices and does not offer passwords or verification flags', () => {
+  const React=require(path.join(tooling,'react')), {renderToStaticMarkup}=require(path.join(tooling,'react-dom/server'));
+  const ui=routeUi(), markup=renderToStaticMarkup(React.createElement(ui.ChannelSetup,{setup:setupFixture(),pending:false,onAdmin:async()=>{}}));
+  for(const text of ['MAX','Telegram','ВКонтакте','Сохранить подключение на паузе','Редакционный профиль']) assert.ok(markup.includes(text));
+  for(const text of ['Пикабу','dom_contract_verified','media_contract_verified','profile_dir','localStorage','Пароль VK']) assert.equal(markup.includes(text),false);
+  const source=fs.readFileSync(path.join(__dirname,'editorial-panel.tsx'),'utf8');
+  assert.equal(source.includes('localStorage'),false); assert.equal(source.includes('sessionStorage'),false);
+});
+
+test('onboarding selected configuration CAS is not silently rebased by refresh', async () => {
+  const calls=[], harness=adminComponent('ChannelSetup',{setup:setupFixture(),pending:false,onAdmin:async body=>{calls.push(body);return {};}});
+  let tree=harness.render(); harness.find(tree,'select').props.onChange({target:{value:setupTarget.id}}); tree=harness.render();
+  harness.props.setup={...setupFixture(),config_hash:'f'.repeat(64),targets:[{...setupTarget,binding_hash:'e'.repeat(64)}]}; tree=harness.render();
+  assert.equal(harness.find(tree,'button',node=>node.props.type==='submit').props.disabled,true);
+  await harness.find(tree,'form',node=>node.props.autoComplete!=='off').props.onSubmit({preventDefault(){}});
+  assert.equal(calls.length,0);
+  harness.find(tree,'select').props.onChange({target:{value:setupTarget.id}}); tree=harness.render();
+  assert.equal(harness.find(tree,'button',node=>node.props.type==='submit').props.disabled,false);
+});
+
+test('onboarding oversized or invalid file never calls upload or grants author attestation', async () => {
+  const calls=[], harness=adminComponent('OriginalComposer',{setup:setupFixture(),pending:false,editing:null,onCancel(){},onAdmin:async body=>{calls.push(body);return {};}});
+  let tree=harness.render(); harness.find(tree,'select').props.onChange({target:{value:setupTarget.id}}); tree=harness.render();
+  for(const file of [{type:'image/svg+xml',size:10},{type:'image/png',size:10485761}]) {
+    let read=false; const target={files:[{...file,arrayBuffer:async()=>{read=true;return new ArrayBuffer(0);}}],value:'chosen'};
+    harness.find(tree,'input',node=>node.props.type==='file').props.onChange({target});
+    await new Promise(resolve=>setImmediate(resolve)); tree=harness.render();
+    assert.equal(read,false); assert.equal(target.value,''); assert.equal(calls.length,0);
+    assert.equal(harness.find(tree,'input',node=>node.props.type==='checkbox').props.checked,false);
+  }
+});
+
+test('onboarding file upload uses original frozen bytes and rejects a mismatched server reference', async () => {
+  const crypto=require('node:crypto'), bytes=Buffer.from([137,80,78,71,0,1,2,3]), calls=[];
+  const harness=adminComponent('OriginalComposer',{setup:setupFixture(),pending:false,editing:null,onCancel(){},onAdmin:async body=>{
+    calls.push(body); return {media:uploadReference,external_mutations:0}; }},{btoa:value=>Buffer.from(value,'binary').toString('base64')});
+  let tree=harness.render(); harness.find(tree,'select').props.onChange({target:{value:setupTarget.id}}); tree=harness.render();
+  const target={files:[{type:'image/png',size:bytes.length,arrayBuffer:async()=>Uint8Array.from(bytes).buffer}],value:'chosen'};
+  harness.find(tree,'input',node=>node.props.type==='file').props.onChange({target});
+  await new Promise(resolve=>setImmediate(resolve)); tree=harness.render();
+  assert.equal(calls.length,1); assert.equal(calls[0].action,'upload_media');
+  assert.equal(calls[0].sha256,crypto.createHash('sha256').update(bytes).digest('hex'));
+  assert.deepEqual(Buffer.from(calls[0].data_base64,'base64'),bytes);
+  assert.equal(harness.elements(tree,node=>node.type==='img').length,0);
+  assert.equal(harness.find(tree,'input',node=>node.props.type==='checkbox').props.checked,false);
+});
+
+test('onboarding changed target binding blocks edits of an old exact version', () => {
+  const editing={...routeDetailsFixture({...routeVariant,target_id:setupTarget.id,media_count:0},setupTarget),media:[],metadata:{origin:'owner_original'}};
+  const setup={...setupFixture(),targets:[{...setupTarget,binding_hash:'e'.repeat(64)}]};
+  const harness=adminComponent('OriginalComposer',{setup,pending:false,editing,onCancel(){},onAdmin:async()=>assert.fail('No stale save')});
+  const tree=harness.render();
+  assert.equal(harness.find(tree,'button',node=>node.props.type==='submit').props.disabled,true);
+  assert.equal(harness.find(tree,'input',node=>node.props.type==='checkbox').props.disabled,true);
+});
+
+test('onboarding exact VK image policy is visible before consent and missing or changed policy blocks old review', async () => {
+  const {renderToStaticMarkup}=require(path.join(tooling,'react-dom/server'));
+  const harness=routeDraftHarness(async()=>true);
+  harness.props.target={...harness.props.target,route:'vk_browser'};
+  harness.props.variant={...harness.props.variant,media_count:1};
+  harness.props.onPreview=async variant=>previewPayload(variant);
+  harness.props.details={...routeDetailsFixture(harness.props.variant,harness.props.target),media_policy:null};
+  let tree=harness.render();
+  await harness.buttons(tree).find(button=>button.props.children==='Показать изображение').props.onClick(); tree=harness.render();
+  await harness.buttons(tree).find(button=>button.props.children==='Проверить перед согласованием').props.onClick(); tree=harness.render();
+  harness.find(tree,'input','type','datetime-local').props.onChange({target:{value:new Date(Date.now()+8*3600000).toISOString().slice(0,16)}}); tree=harness.render();
+  assert.equal(harness.find(tree,'input','type','checkbox').props.disabled,true);
+  harness.props.details={...harness.props.details,media_policy:{id:'native-asset-lineage-v1',label:'Исходные размеры',description:'Пережатие допускается, обрезка и изменение размеров запрещены.'}};
+  harness.render(); tree=harness.render();
+  assert.ok(renderToStaticMarkup(tree).includes('обрезка и изменение размеров запрещены'));
+  assert.equal(harness.find(tree,'input','type','checkbox').props.checked,false);
+  assert.equal(harness.find(tree,'input','type','checkbox').props.disabled,true);
+  const ui=routeUi();
+  assert.throws(()=>ui.routeDetailsResult({...harness.props.details,media_policy:{...harness.props.details.media_policy,id:'accepted-actual-media-v1'}},harness.props.variant,harness.props.target));
+  assert.throws(()=>ui.routeDetailsResult({...harness.props.details,media_policy:{...harness.props.details.media_policy,enable_crop:true}},harness.props.variant,harness.props.target));
+});
+
+test('onboarding MAX selector lists existing allowed names and rejects an injected unlisted ID', async () => {
+  const calls=[], harness=adminComponent('ChannelSetup',{setup:setupFixture(),pending:false,onAdmin:async body=>{calls.push(body);return {};}});
+  let tree=harness.render();
+  assert.ok(harness.elements(tree,node=>node.type==='option'&&node.props.value==='-123456')[0].props.children.includes('Разрешённый научный MAX'));
+  const inputs=harness.elements(tree,node=>node.type==='input'&&node.props.required);
+  inputs[0].props.onChange({target:{value:'science_max'}});
+  const selects=harness.elements(tree,node=>node.type==='select');
+  selects.find(node=>node.props.required&&node.props.children.flat().some(child=>child?.props?.value==='science')).props.onChange({target:{value:'science'}});
+  selects.find(node=>node.props.required&&node.props.children.flat().some(child=>child?.props?.value==='-123456')).props.onChange({target:{value:'-999999'}});
+  tree=harness.render(); await harness.find(tree,'form').props.onSubmit({preventDefault(){}});
+  assert.equal(calls.length,0);
+});
+
+test('onboarding editing an original clears the old checked review before opening the editor', async () => {
+  const edits=[], harness=routeDraftHarness(async()=>true);
+  harness.props.variant={...harness.props.variant,origin:'owner_original'};
+  harness.props.onEdit=details=>edits.push(details);
+  let tree=harness.render();
+  await harness.buttons(tree).find(button=>button.props.children==='Проверить перед согласованием').props.onClick(); tree=harness.render();
+  harness.find(tree,'input','type','datetime-local').props.onChange({target:{value:new Date(Date.now()+8*3600000).toISOString().slice(0,16)}}); tree=harness.render();
+  harness.find(tree,'input','type','checkbox').props.onChange({target:{checked:true}}); tree=harness.render();
+  assert.equal(harness.find(tree,'input','type','checkbox').props.checked,true);
+  harness.buttons(tree).find(button=>button.props.children==='Редактировать авторский материал').props.onClick(); tree=harness.render();
+  assert.equal(edits.length,1); assert.equal(edits[0].revision,harness.props.variant.revision);
+  assert.equal(harness.find(tree,'input','type','checkbox').props.checked,false);
+  assert.equal(harness.find(tree,'input','type','checkbox').props.disabled,true);
 });
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'postiz-editorial-'));

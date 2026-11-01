@@ -25,7 +25,9 @@ def main(argv=None):
     serve.add_argument("--api-only", action="store_true",
                        help="Проверка внутреннего API без второго обработчика")
     args = parser.parse_args(argv)
-    core = build(args.root.resolve())
+    # A restart/status must not activate configuration, synchronize every target,
+    # revoke approvals or silently migrate the production database.
+    core = build(args.root.resolve(), activate=False, initialize=args.command == "migrate")
     store = ServerState(core)
     try:
         if args.command == "migrate":

@@ -31,11 +31,19 @@ def init(root, sqlite=False):
         shutil.copy2(root / "config/publishing.example.json", target)
 
 
-def build(root, activate=True):
+def build(root, activate=True, *, initialize=True):
     load_env(root)
     settings = Settings.load(root)
     db = Database(settings)
-    db.initialize()
+    if initialize:
+        db.initialize()
+    else:
+        from .server_bootstrap import require_schema
+        try:
+            require_schema(db)
+        except Exception:
+            db.engine.dispose()
+            raise
     service = HubService(settings, db, bootstrap_targets=activate)
     if activate:
         service.activate()

@@ -3,13 +3,15 @@ include AGENTS.md CHANGELOG.md
 include .gitignore .dockerignore .gitattributes
 include deployment/postiz/.env.example
 include requirements*.lock
+include .github/workflows/*.yml
+include .github/ci-node/package.json .github/ci-node/package-lock.json
 recursive-include schemas *.json
 recursive-include config *.example.json
 recursive-include config/extraction *.json
 recursive-include prompts *.md
 recursive-include prompts *.txt
 recursive-include migrations *.py *.sql
-recursive-include scripts *.py *.ps1 *.sh
+recursive-include scripts *.py *.ps1 *.sh *.cjs
 recursive-include docs *.md *.json *.png
 recursive-include docs *.jpg
 include tests/conftest.py
@@ -21,6 +23,7 @@ recursive-include deployment *.css
 recursive-include deployment Dockerfile.*
 recursive-include deployment *.sh *.service
 recursive-include deployment *.conf
+recursive-include deployment *.path *.rules
 include deployment/translation/candle_t5_worker.rs
 include deployment/translation/candle-t5-causal-position.patch
 include deployment/translation/requirements.txt

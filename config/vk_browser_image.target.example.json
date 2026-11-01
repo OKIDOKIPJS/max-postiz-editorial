@@ -14,7 +14,7 @@
     "dom_contract_profile": "personal-image-v1",
     "dom_contract_verified": false,
     "media_contract_verified": false,
-    "media_proof_policy": "exact-bytes-v1",
+    "media_proof_policy": "native-uniform-edge-lineage-v1",
     "dom_contract": {}
   }
 }

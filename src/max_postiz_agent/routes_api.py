@@ -22,6 +22,8 @@ class RouteAction(BaseModel):
 
 
 def attach_route_api(app, core, owner):
+    from .server_route_api import attach_admin_api
+    attach_admin_api(app, core, owner)
     owner_dependency = Depends(owner)
     @app.get("/internal/editorial/routes")
     def routes(request: Request, actor=owner_dependency):

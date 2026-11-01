@@ -10,6 +10,8 @@ RUN test -n "$PUBLIC_ORIGIN" && node /adapter/patch-image.cjs
 # Both official API/menu source hashes are still checked. Historical compiled API
 # hashes are deliberately unused: all three native targets are rebuilt below.
 RUN node -e "const fs=require('node:fs'),path=require('node:path');const {planPatch}=require('/adapter/patch-editorial.cjs');const m=JSON.parse(fs.readFileSync('/adapter/editorial-manifest.json'));const p=planPatch('/app','/adapter',{...m,compiled:{}});for(const [name,text]of p.plans){const dest=path.join('/app',name);fs.mkdirSync(path.dirname(dest),{recursive:true});fs.writeFileSync(dest,text);}"
+COPY patch-production-backend.cjs /adapter/
+RUN node /adapter/patch-production-backend.cjs
 WORKDIR /app
 # Client generation only; no db push/migration, model, worker or application start.
 RUN pnpm exec prisma generate --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma
@@ -22,5 +24,12 @@ RUN pnpm --filter ./apps/frontend exec next build --webpack
 # Validate direct Docker invocations too; an omitted/contradictory mode fails.
 COPY production-origin.cjs /adapter/
 ARG PRODUCTION_NOT_SECURED=__UNSET__
-RUN node /adapter/production-origin.cjs "$PUBLIC_ORIGIN" "$PRODUCTION_NOT_SECURED"
+ARG PRODUCTION_ORIGIN_PROFILE=https-or-loopback-v1
+RUN node /adapter/production-origin.cjs "$PUBLIC_ORIGIN" "$PRODUCTION_NOT_SECURED" "$PRODUCTION_ORIGIN_PROFILE"
 ENV NOT_SECURED=$PRODUCTION_NOT_SECURED
+ENV PRODUCTION_ORIGIN_PROFILE=$PRODUCTION_ORIGIN_PROFILE
+# Normal boot must never invoke the upstream root PM2 alias (it changes schema).
+COPY production-startup.cjs start-production.sh /adapter/
+RUN node /adapter/production-startup.cjs --check /app
+ENTRYPOINT []
+CMD ["/bin/sh", "/adapter/start-production.sh"]

@@ -240,9 +240,9 @@ def prepare(root, options, destination, snapshot):
             "author_id_attribute": selectors.get("author_id_attribute"),
             "allowed_text_urls": approved_text_urls(text, snapshot)}
     if options.get("dom_contract_profile") == "personal-image-v1":
-        from .vk_media import LINK_CONTRACT, image_identity, require_contract
+        from .vk_media import LINK_CONTRACT, require_contract, source_identity
         result["image_contract"] = require_contract(root, options, selectors, result["owner"])
-        result["source_image"] = image_identity(frozen_raw)
+        result["source_image"] = source_identity(frozen_raw, result["image_contract"]["policy"])
         if result["source_image"]["source_sha256"] != checked[0]["sha256"]:
             raise AgentError("VK_BROWSER_IMAGE_HASH_CHANGED")
         result["link_contract"] = LINK_CONTRACT

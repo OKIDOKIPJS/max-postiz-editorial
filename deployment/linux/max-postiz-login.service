@@ -1,7 +1,7 @@
 [Unit]
-Description=Manual MAX owner login in the isolated Linux browser
-After=max-postiz-display.service
-Requires=max-postiz-display.service
+Description=Manual MAX or VK owner login in its selected dedicated profile
+After=max-postiz-display.service max-postiz-novnc.service
+Requires=max-postiz-display.service max-postiz-novnc.service
 
 [Service]
 Type=simple
@@ -11,4 +11,10 @@ Environment=DISPLAY=:99
 ExecStart=/opt/max-postiz/.venv/bin/python deployment/linux/login-browser.py
 UMask=0077
 NoNewPrivileges=true
+Delegate=yes
+KillMode=control-group
+RuntimeMaxSec=630
+TimeoutStopSec=20
+MemoryMax=768M
+TasksMax=1024
 # Interactive sign-in is started explicitly and is never enabled on boot.

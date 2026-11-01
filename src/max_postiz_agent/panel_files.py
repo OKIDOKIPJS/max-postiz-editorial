@@ -44,7 +44,9 @@ def project_path(service, value):
 # Приватность зависит от настроенных каталогов, а не от их расположения под data/.
 def private_roots(root, app, purpose="file"):
     # Стандартный каталог остаётся приватным и после переноса активного профиля.
-    paths = ["data/max-browser", app.get("max", {}).get("browser", {}).get("profile_dir")]
+    paths = ["data/max-browser", app.get("max", {}).get("browser", {}).get("profile_dir"),
+             "data/route-admin-private", "data/owner-browser-selection.json", "data/owner-browser-result.json",
+             "data/editorial-restart-request.json", "data/editorial-restart-claims"]
     if purpose != "private":
         paths.extend(["data/opencode", app.get("opencode", {}).get("isolated_state_dir"), "data/private-imports"])
     return tuple(dict.fromkeys(inside(root, value) for value in paths if value))

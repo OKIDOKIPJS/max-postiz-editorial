@@ -86,7 +86,8 @@ def _input(value):
 
 
 def _route(target):
-    if target.route not in DIRECT_ROUTES or DIRECT_ROUTES[target.route] != target.platform:
+    routes = {**DIRECT_ROUTES, "max_browser": "max"}
+    if target.route not in routes or routes[target.route] != target.platform:
         raise AgentError("OWNER_ORIGINAL_ROUTE_REQUIRED", 409)
 
 
@@ -101,6 +102,11 @@ def _story_hash(target_id, digest):
 def create_original(core, target_id, value, *, attest_original=False):
     """Одна транзакция; никакого approval, enable/resume, transport или модели."""
     assert_isolated(core.settings.root, environment=False)
+    return _create_original(core, target_id, value, attest_original=attest_original)
+
+
+def _create_original(core, target_id, value, *, attest_original=False, expected_binding=None, owner_actor=None):
+    """Общий canonical writer; сервер вызывает его только после owner dependency."""
     if attest_original is not True:
         raise AgentError("OWNER_ORIGINAL_ATTESTATION_REQUIRED", 403)
     supplied = _input(value)
@@ -111,6 +117,8 @@ def create_original(core, target_id, value, *, attest_original=False):
             target = core._target(session, target_id)
             # Сериализуем повторные создания для одного адресата в PostgreSQL.
             session.refresh(target, with_for_update=True)
+            if expected_binding is not None and target.binding_hash != expected_binding:
+                raise AgentError("TARGET_BINDING_CONFLICT", 409)
             _route(target)
             profile = core.settings.channel(target.profile_id)
             if not profile["enabled"] or profile["publication"]["mode"] == "dry_run":
@@ -151,6 +159,9 @@ def create_original(core, target_id, value, *, attest_original=False):
                           contract=CONTRACT, attestation_hash=digest, target_id=target.id,
                           draft_id=draft.id, revision=1, metadata_hash=fingerprint(metadata),
                           original_rights_attested=True, approval_granted=False, model_verified=False)
+            if owner_actor is not None:
+                core.db.audit(session, owner_actor, "server_owner_original_created", variant.id,
+                              revision=1, content_hash=fingerprint(core.snapshot(variant, target)))
             return {"story_id": story.id, "draft_id": draft.id, "variant_id": variant.id,
                     "target_id": target.id, "revision": 1, "state": "review_pending",
                     "content_hash": fingerprint(core.snapshot(variant, target)),
@@ -200,6 +211,7 @@ def require_attestation(core, session, variant, target):
                 "draft_id": draft.id, "revision": variant.revision,
                 "metadata_hash": fingerprint(supplied_metadata), "original_rights_attested": True,
                 "approval_granted": False, "model_verified": False}
+    audits = [audit for audit in audits if audit.details.get("revision") == variant.revision]
     if len(audits) != 1 or audits[0].actor != ACTOR or audits[0].details != expected:
         raise AgentError("OWNER_ORIGINAL_AUDIT_REQUIRED", 409)
     return True
