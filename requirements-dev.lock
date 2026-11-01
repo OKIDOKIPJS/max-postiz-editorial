@@ -5,12 +5,12 @@ anyio==4.15.1
 attrs==26.1.0
 beautifulsoup4==4.15.0
 build==1.6.1
-certifi==2026.7.22
+certifi==2026.10.23
 cffi==2.1.1
 click==8.5.0
 colorama==0.4.6
 coverage==7.16.2
-cryptography==49.0.0
+cryptography==50.0.2
 fastapi==0.142.2
 feedparser==6.0.14
 feedparser-sgmllib==2.1.0
@@ -25,7 +25,7 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 Mako==1.4.3
 MarkupSafe==3.0.4
-opentelemetry-api==1.45.0
+opentelemetry-api==1.45.2
 packaging==26.3
 pluggy==1.6.0
 psycopg==3.3.6
@@ -40,7 +40,7 @@ pytest-cov==7.1.0
 referencing==0.37.0
 rpds-py==2026.9.1
 ruff==0.16.10
-setuptools==84.0.0
+setuptools==84.2.1
 soupsieve==2.10
 SQLAlchemy==2.0.54
 starlette==1.7.0

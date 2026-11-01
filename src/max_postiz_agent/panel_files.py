@@ -14,7 +14,7 @@ from .config import AgentError, inside, parse_json
 
 SUFFIXES = {".mp4", ".png", ".jpg", ".jpeg", ".webp", ".json", ".md", ".txt",
             ".yaml", ".yml", ".onnx", ".safetensors", ".bin", ".pt", ".pth", ".gguf"}
-HIDDEN_NAMES = {"__pycache__", "panel-access-key.txt", "secrets.env"}
+HIDDEN_NAMES = {"__pycache__", "panel-access-key.txt", "secrets.env", "opencode.private.json"}
 DIALOG_LOCK = threading.Lock()
 
 
@@ -33,20 +33,26 @@ def project_path(service, value):
     root = service.settings.root.resolve()
     path = inside(root, value or ".")
     relative = path.relative_to(root)
-    if any(part.startswith(".") or part in HIDDEN_NAMES for part in relative.parts):
+    if any(part.startswith(".") or part.casefold() in HIDDEN_NAMES for part in relative.parts):
         raise AgentError("FILE_PATH_FORBIDDEN", 403)
     if path.suffix.lower() in {".key", ".pem", ".enc", ".db", ".sqlite", ".sqlite3"}:
         raise AgentError("FILE_PATH_FORBIDDEN", 403)
     return path
 
 
+# Приватность зависит от настроенных каталогов, а не от их расположения под data/.
+def private_roots(root, app, purpose="file"):
+    # Стандартный каталог остаётся приватным и после переноса активного профиля.
+    paths = ["data/max-browser", app.get("max", {}).get("browser", {}).get("profile_dir")]
+    if purpose != "private":
+        paths.extend(["data/opencode", app.get("opencode", {}).get("isolated_state_dir"), "data/private-imports"])
+    return tuple(dict.fromkeys(inside(root, value) for value in paths if value))
+
+
 # Каталоги авторизации не перечисляем через HTTP; открытие их папки в Проводнике остаётся локальным.
 def browsable(service, path, purpose="file"):
-    app = service.settings.app
-    paths = [app.get("max", {}).get("browser", {}).get("profile_dir")]
-    if purpose != "private":
-        paths.extend([app.get("opencode", {}).get("isolated_state_dir"), "data/private-imports"])
-    return not any(path.is_relative_to(inside(service.settings.root, value)) for value in paths if value)
+    return not any(path.is_relative_to(directory)
+                   for directory in private_roots(service.settings.root, service.settings.app, purpose))
 
 
 # Фильтр файлов одинаков для встроенного выбора, системного диалога и проверки результата.
@@ -96,12 +102,15 @@ def browse(service, value="", purpose="file"):
 
 # Выбранный путь проверяем до подстановки; workflow возвращаем вместе с графом для согласованного сохранения.
 def selected(service, value, kind="file", purpose="file"):
+    allowed = extensions(purpose)
     path = project_path(service, value)
+    if not browsable(service, path, purpose):
+        raise AgentError("FILE_DIRECTORY_PRIVATE", 403)
     if kind == "directory":
         if not path.is_dir():
             raise AgentError("FILE_DIRECTORY_REQUIRED")
     elif kind == "file":
-        if not path.is_file() or path.suffix.lower() not in extensions(purpose):
+        if not path.is_file() or path.suffix.lower() not in allowed:
             raise AgentError("FILE_TYPE_INVALID")
     else:
         raise AgentError("FILE_KIND_INVALID")
@@ -157,7 +166,7 @@ def import_selected(service, value, kind, purpose):
     if not 0 < path.stat().st_size <= limit:
         raise AgentError("FILE_TOO_LARGE")
     # Приватные файлы не импортируем даже при совпадении расширения с текстовым материалом.
-    if path.name.startswith(".") or path.name in HIDDEN_NAMES:
+    if path.name.startswith(".") or path.name.casefold() in HIDDEN_NAMES:
         raise AgentError("FILE_PATH_FORBIDDEN", 403)
     # Файл доступа хранится отдельно от медиа и не попадает в переносимый архив с обычными материалами.
     directory = inside(root, "data/private-imports") if purpose == "private" else inside(root, service.settings.app["media_dir"]) / "imports"
