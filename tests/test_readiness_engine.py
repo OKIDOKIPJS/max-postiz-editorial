@@ -24,7 +24,7 @@ def test_construction_and_plan_are_pure_on_windows(tmp_path, monkeypatch):
     plan = engine.plan(14 * GIB)
     assert not engine.root.exists()
     assert plan["limits"]["memory_bytes"] == 10 * GIB
-    assert plan["limits"]["native_memory_bytes"] == 6 * GIB
+    assert plan["limits"]["native_memory_bytes"] == 8 * GIB
     assert plan["limits"]["daemon_memory_bytes"] == GIB
     assert plan["cgroup_parent"] == "/" + engine.slice
     assert "--data-root=" + str(engine.data_root) in plan["daemon"]
@@ -58,6 +58,21 @@ def test_memory_budget_reserves_two_gib_and_rejects_low_host():
     for value in (6 * GIB, -1, True, float(14 * GIB)):
         with pytest.raises(EngineError):
             engine_module._limits(value)
+
+
+@pytest.mark.parametrize("available,native", [
+    (8 * GIB, 4 * GIB), (11 * GIB, 7 * GIB), (12 * GIB - 1, 8 * GIB - 1),
+    (12 * GIB, 8 * GIB), (16 * GIB, 8 * GIB),
+])
+def test_eight_gib_run_cap_preserves_daemon_headroom_and_host_reserve(available, native):
+    limits = engine_module._limits(available)
+    assert limits["native_memory_bytes"] == native
+    assert limits["memory_bytes"] <= 10 * GIB
+    assert limits["memory_bytes"] <= available - 2 * GIB
+    assert native <= limits["memory_bytes"] - 2 * GIB
+    assert limits["daemon_memory_bytes"] == GIB
+    assert limits["native_swap_bytes"] == 4 * GIB
+    assert limits["cpus"] == 4 and limits["host_reserve_bytes"] == 2 * GIB
 
 
 def test_paths_must_be_new_plain_children_of_runner_temp(tmp_path, monkeypatch):

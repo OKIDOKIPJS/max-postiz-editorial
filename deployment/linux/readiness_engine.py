@@ -144,7 +144,7 @@ def _limits(available: int) -> dict:
         raise EngineError("OWN_ENGINE_MEMORY_INSUFFICIENT")
     # At least 2 GiB remain outside this entire slice; the daemon has its own cap.
     total = min(10 * GIB, available - 2 * GIB)
-    native = min(6 * GIB, total - 2 * GIB)
+    native = min(8 * GIB, total - 2 * GIB)
     if native < 3 * GIB:
         raise EngineError("OWN_ENGINE_MEMORY_INSUFFICIENT")
     return {"memory_bytes": total, "swap_bytes": 8 * GIB, "cpus": 4,

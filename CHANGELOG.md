@@ -1,5 +1,21 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: память полной Next/TypeScript сборки
+
+- R11 run 41363544861 прошёл строгий resource/network probe и оба Nest builds;
+  webpack нового объединённого UI собран за 3.7 минуты. Затем TypeScript worker
+  получил SIGKILL, BuildKit сообщил ResourceExhausted/cannot allocate memory.
+  Kernel OOM event не зафиксирован; кодовая ошибка TypeScript не выведена.
+  R11 имеет accepted=false, экспорт образа пропущен, proof/privacy сохранены.
+- Максимум native RUN увеличен с 6 до 8 GiB при прежнем общем пределе 10 GiB,
+  ограничении common−2 GiB, внешнем запасе не менее 2 GiB, daemon 1 GiB,
+  native swap 4 GiB и CPU 4. Фактический probe/guards не ослаблены. Heap 6144 MiB,
+  Docker recipe, функции приложения и полная TypeScript-проверка не изменены.
+- Проверки: 53 pure/mock Engine tests passed, включая пять границ доступной памяти;
+  Ruff/diff и независимый review прошли. Это не успешный новый native build:
+  для точного commit остаются обязательны полные CI/canonical и native проверки.
+  Рабочий сервер и Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: выключенная политика свежего native стенда
 
 - R8 run 41362209481 подтвердил реальный fresh Postiz owner register/login,
