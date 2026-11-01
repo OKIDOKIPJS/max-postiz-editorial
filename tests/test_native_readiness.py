@@ -1,7 +1,7 @@
 """Pure artifact/host guards; never start Docker, systemd, WSL or an HTTP client."""
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -203,3 +203,102 @@ def test_ddl_logger_records_also_detect_prepared_or_commented_statements(native,
 def test_ddl_logger_counter_ignores_unrelated_errors_and_details(native):
     unrelated = "2026-11-02 UTC [42] ERROR: syntax error\nSTATEMENT: SELECT missing\nDETAIL: execute client failed\n"
     assert native.count_logged_schema_statements(unrelated) == 0
+
+
+def test_readonly_proxy_confines_all_module_temporary_files_to_private_tmpfs(native):
+    import re
+    outer = "server{listen 10.20.30.45:4007;location /owner-browser/{auth_request /_owner;}}"
+    result = native.proxy_configuration(outer)
+    paths = dict(re.findall(r"(client_body|proxy|fastcgi|uwsgi|scgi)_temp_path\s+([^;]+);", result))
+    assert set(paths) == {"client_body", "proxy", "fastcgi", "uwsgi", "scgi"}
+    assert all(PurePosixPath(value).parts[:2] == ("/", "tmp") and ".." not in value for value in paths.values())
+    assert outer in result and "pid /tmp/nginx.pid;" in result
+
+
+def diagnostic_engine(native, supplied):
+    calls = []
+    def docker(*args, **kwargs):
+        calls.append(args)
+        assert args[0] == "inspect"
+        return SimpleNamespace(stdout=json.dumps([supplied]))
+    engine = SimpleNamespace(label_value="owned-fixture", cgroup_parent="/owned-fixture.slice", docker=docker,
+        docker_binary=Path("/owned-fixture/docker"), socket="unix:///owned-fixture/docker.sock", config_dir=Path("/owned-fixture/client"))
+    return engine, calls
+
+
+def diagnostic_container(native):
+    return {"Config": {"Labels": {native.LABEL_KEY: "owned-fixture", "editorial.readiness.role": "proxy"},
+                       "Env": ["UNRELATED_SECRET=not-for-diagnostics"]},
+        "HostConfig": {"CgroupParent": "/owned-fixture.slice"},
+        "State": {"Status": "exited", "Running": False, "ExitCode": 1, "OOMKilled": False}}
+
+
+@pytest.mark.parametrize("mismatch", ["owner", "cgroup", "role"])
+def test_dependency_diagnostic_refuses_foreign_scope_before_reading_logs(native, tmp_path, monkeypatch, mismatch):
+    acceptance = failed_acceptance(native, tmp_path)
+    supplied = diagnostic_container(native)
+    if mismatch == "owner":
+        supplied["Config"]["Labels"][native.LABEL_KEY] = "unrelated-owner"
+    elif mismatch == "cgroup":
+        supplied["HostConfig"]["CgroupParent"] = "/unrelated.slice"
+    else:
+        supplied["Config"]["Labels"]["editorial.readiness.role"] = "../outside"
+    acceptance.engine, calls = diagnostic_engine(native, supplied)
+    monkeypatch.setattr(native, "bounded_diagnostic_output", lambda *a, **k: pytest.fail("foreign logs forbidden"))
+    with pytest.raises(native.ReadinessError, match="DEPENDENCY_DIAGNOSTIC_OWNER_MISMATCH"):
+        acceptance.dependency_diagnostic("owned-container-fixture")
+    assert calls == [("inspect", "owned-container-fixture")] and list(acceptance.private.iterdir()) == []
+
+
+def test_owned_dependency_diagnostic_keeps_only_typed_state_and_redacts_public_logs(native, tmp_path, monkeypatch):
+    acceptance = failed_acceptance(native, tmp_path)
+    acceptance.engine, _ = diagnostic_engine(native, diagnostic_container(native))
+    secret = acceptance.runtime_passwords["token"]
+    raw = ("fixture error " + secret + "\n").encode()
+    def capture(command, environment):
+        assert command[-4:] == ["logs", "--tail", "128", "owned-container-fixture"]
+        return raw, {"captured_bytes": len(raw), "truncated": False, "timed_out": False}
+    acceptance.engine.environment = {}
+    monkeypatch.setattr(native, "bounded_diagnostic_output", capture)
+    acceptance.dependency_diagnostic("owned-container-fixture")
+    assert acceptance.report["failed_dependency"]["exit_code"] == 1
+    assert (acceptance.private / "dependency-proxy.log").read_bytes() == raw
+    acceptance.final_report(RuntimeError("DEPENDENCY_FAILED"))
+    public = (acceptance.public / "diagnostic-summary.json").read_text(encoding="utf-8")
+    assert secret not in public and "not-for-diagnostics" not in public and "[REDACTED]" in public
+
+
+@pytest.mark.parametrize("failure", ["thread_start", "terminate", "wait"])
+def test_diagnostic_client_is_reaped_and_pipe_closed_when_thread_start_or_cleanup_raises(native, monkeypatch, failure):
+    import io
+    calls = []
+    class Process:
+        stdout = io.BytesIO(b"fixture private output")
+        def poll(self):
+            return None
+        def terminate(self):
+            calls.append("terminate")
+            if failure == "terminate":
+                raise OSError("private terminate detail")
+        def wait(self, *, timeout):
+            calls.append("wait")
+            if failure == "wait" and calls.count("wait") == 1:
+                raise OSError("private wait detail")
+            return 0
+        def kill(self):
+            calls.append("kill")
+    class Thread:
+        def __init__(self, **kwargs):
+            pass
+        def start(self):
+            raise RuntimeError("private thread detail")
+        def join(self, **kwargs):
+            pytest.fail("Unstarted diagnostic reader must never be joined")
+    process = Process()
+    monkeypatch.setattr(native.subprocess, "Popen", lambda *a, **k: process)
+    monkeypatch.setattr(native.threading, "Thread", Thread)
+    with pytest.raises(native.ReadinessError, match="^DEPENDENCY_DIAGNOSTIC_CAPTURE_FAILED$"):
+        native.bounded_diagnostic_output(["owned-fixture-client"], {})
+    assert calls[0] == "terminate" and "wait" in calls and process.stdout.closed
+    if failure == "wait":
+        assert calls == ["terminate", "wait", "kill", "wait"]

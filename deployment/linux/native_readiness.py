@@ -77,6 +77,72 @@ def count_logged_schema_statements(text):
     return sum(bool(event.match(line)) for line in text.splitlines())
 
 
+def proxy_configuration(outer):
+    return ("user www;worker_processes 1;pid /tmp/nginx.pid;error_log /tmp/nginx-error.log warn;"
+        "events{worker_connections 512;}http{include /etc/nginx/mime.types;access_log off;"
+        "client_body_temp_path /tmp/client-body;proxy_temp_path /tmp/proxy;"
+        "fastcgi_temp_path /tmp/fastcgi;uwsgi_temp_path /tmp/uwsgi;scgi_temp_path /tmp/scgi;" + outer +
+        "server{listen 127.0.0.1:14007;client_max_body_size 15m;location /api/ {proxy_pass http://127.0.0.1:3000/;"
+        "proxy_set_header Host $http_host;proxy_set_header X-Forwarded-Proto $scheme;}"
+        "location / {proxy_pass http://127.0.0.1:4200;proxy_set_header Host $http_host;"
+        "proxy_set_header X-Forwarded-Proto $scheme;}}}")
+
+
+def bounded_diagnostic_output(command, environment, *, limit=65536, timeout=10):
+    """Only an owned read-only Docker log client; never retain a cut final line."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
+    captured = []
+
+    def read():
+        try:
+            captured.append(process.stdout.read(limit + 1))
+        except OSError:
+            captured.append(b"")
+
+    worker, started, timed_out, failed, cleanup_failed = None, False, False, False, False
+    try:
+        worker = threading.Thread(target=read, daemon=True)
+        worker.start()
+        started = True
+        worker.join(timeout=timeout)
+        timed_out = worker.is_alive()
+    except BaseException:
+        failed = True
+    finally:
+        try:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except OSError:
+                pass  # The wait/kill path still verifies this owned client.
+            try:
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    cleanup_failed = True
+        finally:
+            try:
+                if started:
+                    worker.join(timeout=2)
+                    cleanup_failed = cleanup_failed or worker.is_alive()
+            finally:
+                process.stdout.close()
+    if failed or cleanup_failed:
+        raise ReadinessError("DEPENDENCY_DIAGNOSTIC_CAPTURE_FAILED")
+    raw = captured[0] if captured else b""
+    truncated = len(raw) > limit or timed_out
+    if truncated:
+        raw = raw[:limit]
+        raw = raw.rsplit(b"\n", 1)[0] + b"\n" if b"\n" in raw else b""
+    return raw, {"byte_limit": limit, "captured_bytes": len(raw), "truncated": truncated, "timed_out": timed_out}
+
+
 def github_guard(environment=None, platform=None, uid=None):
     env = os.environ if environment is None else environment
     platform = sys.platform if platform is None else platform
@@ -452,17 +518,73 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
                 return result.stdout
             state = json.loads(self.engine.docker("inspect", ident).stdout)[0]["State"]
             if not state["Running"]:
+                self.dependency_diagnostic(ident)
                 raise ReadinessError("DEPENDENCY_EXITED_BEFORE_READY")
             time.sleep(1)
+        self.dependency_diagnostic(ident)
         raise ReadinessError("DEPENDENCY_READINESS_TIMEOUT")
 
-    def runtime_dependencies(self):
-        self.phase("real_database_runtime")
-        self.anchor = self.container("network", self.image, entrypoint="/bin/sleep", command=["infinity"],
+    def dependency_diagnostic(self, ident):
+        value = json.loads(self.engine.docker("inspect", ident).stdout)[0]
+        labels = value.get("Config", {}).get("Labels", {})
+        role = labels.get("editorial.readiness.role", "")
+        if (labels.get(LABEL_KEY) != self.engine.label_value
+                or value.get("HostConfig", {}).get("CgroupParent") != self.engine.cgroup_parent
+                or not re.fullmatch(r"[a-z][a-z0-9-]{0,60}", role)):
+            raise ReadinessError("DEPENDENCY_DIAGNOSTIC_OWNER_MISMATCH")
+        state = value["State"]
+        summary = {"role": role, "status": state.get("Status"), "running": state.get("Running"),
+                   "exit_code": state.get("ExitCode"), "oom_killed": state.get("OOMKilled")}
+        if (summary["status"] not in {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
+                or type(summary["running"]) is not bool or type(summary["exit_code"]) is not int
+                or type(summary["oom_killed"]) is not bool):
+            raise ReadinessError("DEPENDENCY_DIAGNOSTIC_STATE_INVALID")
+        command = [str(self.engine.docker_binary), "--host", self.engine.socket, "--config", str(self.engine.config_dir),
+                   "logs", "--tail", "128", ident]
+        raw, bounded = bounded_diagnostic_output(command, self.engine.environment)
+        logfile = self.private / ("dependency-" + role + ".log")
+        with logfile.open("xb") as output:
+            output.write(raw)
+        summary.update(log_sha256=digest(raw), **bounded)
+        self.report["failed_dependency"] = summary
+        private_write(self.private / ("dependency-" + role + ".json"), summary)
+
+    def network_anchor(self):
+        if hasattr(self, "anchor"):
+            self.namespace_proof()
+            return
+        self.anchor = self.container("network", BASE, entrypoint="/bin/sleep", command=["infinity"],
                                      join=False, memory="32m", swap="96m")
         self.anchor_pid = json.loads(self.engine.docker("inspect", self.anchor).stdout)[0]["State"]["Pid"]
         subprocess.run(self.namespace(["ip", "address", "add", "10.20.30.45/32", "dev", "lo"]), check=True, timeout=10)
         self.report["checks"]["runtime_namespace"] = self.namespace_proof()
+
+    def proxy_preflight(self):
+        self.phase("early_proxy_preflight")
+        self.network_anchor()
+        self.proxy_dir = self.engine.root / "proxy"
+        self.proxy_dir.mkdir()
+        outer = (self.project / "deployment/linux/editorial-postiz.nginx.conf").read_text()
+        raw = proxy_configuration(outer)
+        (self.proxy_dir / "nginx.conf").write_text(raw)
+        self.proxy_sha256 = digest(raw.encode())
+        proxy = self.container("proxy-preflight", BASE, entrypoint="/usr/sbin/nginx", memory="96m", swap="256m",
+            volumes=[str(self.proxy_dir) + ":/readiness:ro"], command=["-c", "/readiness/nginx.conf", "-g", "daemon off;"])
+        probe = "Promise.all(['http://127.0.0.1:14007/','http://10.20.30.45:4007/'].map(url=>new Promise(resolve=>require('http').get(url,r=>resolve(r.statusCode===502&&String(r.headers.server).includes('nginx'))).on('error',()=>resolve(false))))).then(values=>process.exit(values.every(Boolean)?0:1))"
+        self.wait_exec(proxy, ["node", "-e", probe], seconds=30)
+        self.engine.docker("stop", "--time", "10", proxy)
+        if json.loads(self.engine.docker("inspect", proxy).stdout)[0]["State"]["Running"]:
+            raise ReadinessError("PROXY_PREFLIGHT_NOT_STOPPED")
+        release = "import socket; handles=[]\nfor host,port in [('127.0.0.1',14007),('10.20.30.45',4007)]:\n s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((host,port));handles.append(s)\nfor s in handles:s.close()"
+        self.run(self.namespace([sys.executable, "-c", release]), name="proxy-ports-released", timeout=10)
+        self.report["checks"]["early_proxy_preflight"] = {"passed": True, "read_only": True,
+            "read_only_profile": "five-private-tmpfs-paths-v1",
+            "pinned_base_used": True, "both_listeners_reached": True, "ports_released": True,
+            "database_started": False, "default_cmd_executed": False, "configuration_sha256": self.proxy_sha256}
+
+    def runtime_dependencies(self):
+        self.phase("real_database_runtime")
+        self.network_anchor()
         self.runtime_passwords = {key: secrets.token_hex(32) for key in ("postiz", "hub", "temporal", "redis", "jwt", "internal")}
         self.pg = {}
         for role, image, port, user, database in (
@@ -632,14 +754,10 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
             extra=["--tmpfs", "/app/apps/frontend/.next/cache:rw,nosuid,nodev,size=128m"],
             volumes=[self.upload_volume + ":/uploads"],
             command=["/app/node_modules/next/dist/bin/next", "start", "/app/apps/frontend", "-p", "4200", "--hostname", "127.0.0.1"])
-        proxy_dir = self.engine.root / "proxy"
-        proxy_dir.mkdir()
-        outer = (self.project / "deployment/linux/editorial-postiz.nginx.conf").read_text()
-        proxy = "user www;worker_processes 1;pid /tmp/nginx.pid;error_log /tmp/nginx-error.log warn;events{worker_connections 512;}http{include /etc/nginx/mime.types;access_log off;client_body_temp_path /tmp/client-body;proxy_temp_path /tmp/proxy;" + outer
-        proxy += "server{listen 127.0.0.1:14007;client_max_body_size 15m;location /api/ {proxy_pass http://127.0.0.1:3000/;proxy_set_header Host $http_host;proxy_set_header X-Forwarded-Proto $scheme;}location / {proxy_pass http://127.0.0.1:4200;proxy_set_header Host $http_host;proxy_set_header X-Forwarded-Proto $scheme;}}}"
-        (proxy_dir / "nginx.conf").write_text(proxy)
+        if digest((self.proxy_dir / "nginx.conf").read_bytes()) != self.proxy_sha256:
+            raise ReadinessError("PROXY_CONFIGURATION_CHANGED_AFTER_PREFLIGHT")
         self.proxy = self.container("proxy", self.image, entrypoint="/usr/sbin/nginx", memory="96m", swap="256m",
-            volumes=[str(proxy_dir) + ":/readiness:ro"], command=["-c", "/readiness/nginx.conf", "-g", "daemon off;"])
+            volumes=[str(self.proxy_dir) + ":/readiness:ro"], command=["-c", "/readiness/nginx.conf", "-g", "daemon off;"])
         self.wait_exec(self.proxy, ["node", "-e", "require('http').get('http://127.0.0.1:14007/api/auth/can-register',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"], seconds=180)
         self.scenario("bootstrap-owner")
         state = json.loads(self.state_path.read_text())
@@ -980,6 +1098,7 @@ finally:s.client.close()
                 self.source_copy()
                 self.dependencies()
                 self.image_pull()
+                self.proxy_preflight()
                 self.build()
                 self.inspect_image()
                 self.runtime_dependencies()

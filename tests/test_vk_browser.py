@@ -276,8 +276,54 @@ def page(browser):
 
 
 def run(page, sample, state, authorize=lambda: None):
-    return worker.run_publish(page, sample.root, sample.options, sample.payload, authorize,
-                              origin=state.origin, fixture=True)
+    result = worker.run_publish(page, sample.root, sample.options, sample.payload, authorize,
+                                origin=state.origin, fixture=True)
+    if result.get("state") != "confirmed":
+        # Assertion rewriting abbreviates the result dictionary. Keep only
+        # stable synthetic-fixture metadata for a failing CI's captured stdout.
+        try:
+            journal = json.loads(worker._path(sample.root, sample.payload["request_id"]).read_text(encoding="utf-8"))
+        except (AgentError, OSError, ValueError, TypeError):
+            journal = {}
+        journal = journal if isinstance(journal, dict) else {}
+        evidence = result.get("evidence")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        private_error = journal.get("private_error")
+        private_error = private_error if isinstance(private_error, dict) else {}
+        diagnostic = {
+            "failure_code": evidence.get("failure_code"), "journal_failure_code": journal.get("failure_code"),
+            "result_state": result.get("state"), "journal_state": journal.get("state"),
+            "last_action_intent": journal.get("last_action_intent"), "clicks": journal.get("clicks"),
+            "exception_type": private_error.get("type"),
+            "fixture_publishes": getattr(state, "publishes", None), "fixture_uploads": getattr(state, "uploads", None),
+        }
+        print("VK_FIXTURE_DIAGNOSTIC " + json.dumps(diagnostic, sort_keys=True))
+    return result
+
+
+def test_fixture_failure_diagnostic_preserves_result_and_journal_without_private_payload(sample, monkeypatch, capsys):
+    secret = "synthetic-private-value-must-not-be-logged"
+    result = {"state": "unknown", "evidence": {"failure_code": "VK_BROWSER_OPERATION_UNKNOWN", "private": secret}}
+    journal = worker._path(sample.root, sample.payload["request_id"])
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({"state": "unknown", "failure_code": "VK_BROWSER_OPERATION_UNKNOWN",
+        "last_action_intent": "fill_intent", "clicks": 0, "snapshot": {"body": secret},
+        "private_error": {"type": "TimeoutError", "message": secret}}), encoding="utf-8")
+    before = journal.read_bytes()
+    monkeypatch.setattr(worker, "run_publish", lambda *args, **kwargs: result)
+    state = SimpleNamespace(origin="http://127.0.0.1:1", publishes=0, uploads=0)
+    assert run(None, sample, state) is result
+    output = capsys.readouterr().out
+    assert secret not in output
+    diagnostic = json.loads(output.removeprefix("VK_FIXTURE_DIAGNOSTIC "))
+    assert diagnostic == {"failure_code": "VK_BROWSER_OPERATION_UNKNOWN", "journal_failure_code": "VK_BROWSER_OPERATION_UNKNOWN",
+        "result_state": "unknown", "journal_state": "unknown", "last_action_intent": "fill_intent", "clicks": 0,
+        "exception_type": "TimeoutError", "fixture_publishes": 0, "fixture_uploads": 0}
+    assert journal.read_bytes() == before
+    journal.write_text("[]", encoding="utf-8")
+    assert run(None, sample, state) is result
+    assert json.loads(capsys.readouterr().out.removeprefix("VK_FIXTURE_DIAGNOSTIC "))["journal_state"] is None
+    assert journal.read_bytes() == b"[]"
 
 
 def personal_wall(sample, state):
