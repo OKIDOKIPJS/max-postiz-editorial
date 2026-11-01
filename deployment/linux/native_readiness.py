@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,12 @@ ORIGIN = "http://10.20.30.45:4007"
 PROFILE = "legacy-private-lan-http-v1"
 STARTUP_CONTRACT = "postiz-no-implicit-schema-v1"
 SAFE_COMMAND = ["/bin/sh", "/adapter/start-production.sh"]
+ENGINE_FAILURE_STAGES = frozenset({
+    "NOT_STARTED", "GUARD", "UNIT_LIST_QUERY", "UNIT_FILE_LIST_QUERY", "ANCHOR_START", "SLICE_LIMITS",
+    "SLICE_IDENTITY", "CGROUP_CAPTURE", "DAEMON_START", "DAEMON_READY", "EMPTY_ENGINE_CHECK",
+    "CLEANUP_CONTAINERS", "CLEANUP_DAEMON_STOP", "CLEANUP_ANCHOR_STOP", "CLEANUP_CGROUP",
+    "CLEANUP_SLICE_STOP", "CLEANUP_SLICE_REVERT",
+})
 BASE = "ghcr.io/gitroomhq/postiz-app@sha256:d2b37802e96757729fdea2d3d71287f841c2b619faa1cb4c21dac07df657fde1"
 PINS = {
     "postgres": "postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
@@ -56,6 +63,17 @@ class ReadinessError(RuntimeError):
 
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def count_logged_schema_statements(text):
+    """Count SQL events after PostgreSQL itself classifies log_statement=ddl.
+
+    Simple and extended protocols use different prefixes. SQL can begin with
+    comments or span lines, so neither command words nor SQL content are parsed.
+    ERROR/DETAIL/STATEMENT records are not LOG events.
+    """
+    event = re.compile(r"^(?:[^\r\n]*\]\s+)?LOG:[ \t]+(?:statement:|execute[ \t]+[^:\r\n]+:)")
+    return sum(bool(event.match(line)) for line in text.splitlines())
 
 
 def github_guard(environment=None, platform=None, uid=None):
@@ -865,7 +883,7 @@ finally:s.client.close()
         pglog = logs.stdout + logs.stderr
         # No other component is allowed to perform schema operations during this
         # window. log_statement=ddl records even a redundant CREATE/ALTER call.
-        ddl_count = len(re.findall(r"\bstatement:\s*(?:CREATE|ALTER|DROP|TRUNCATE|COMMENT|GRANT|REVOKE|REINDEX)\b", pglog, re.I))
+        ddl_count = count_logged_schema_statements(pglog)
         if ddl_count:
             raise ReadinessError("DEFAULT_STARTUP_IMPLICIT_SCHEMA_CHANGE")
         self.report["checks"]["default_cmd_fresh_clone"] = {"passed": True, "bounded": True,
@@ -930,6 +948,7 @@ finally:s.client.close()
 
     def execute(self):
         self.report["disk"] = disk_preflight(self.job, self.workspace)
+        self.phase("owned_engine_bootstrap")
         with Engine(self.job / "engine", self.private / "engine.json") as engine:
             self.engine = engine
             try:
@@ -978,10 +997,35 @@ finally:s.client.close()
         if error is not None:
             diagnostics = []
             for path in sorted(self.private.glob("*.log")):
-                text = path.read_bytes()[-16000:].decode("utf-8", errors="replace")
+                raw = path.read_bytes()
+                text = raw.decode("utf-8", errors="replace")
                 for value in sorted(values, key=len, reverse=True):
                     text = text.replace(value, "[REDACTED]")
-                diagnostics.append({"stage": path.stem, "sha256": digest(path.read_bytes()), "tail": text})
+                diagnostics.append({"stage": path.stem, "sha256": digest(raw), "tail": text[-16000:]})
+            # An early daemon/unit probe may fail before any stage log exists.
+            # Private tails may start midway through a secret. Publish no output
+            # fragments at all: only typed enum/number fields and content hashes.
+            engine_failure = self.private / "engine-failure.json"
+            try:
+                info = engine_failure.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+                    raise ValueError
+                raw = engine_failure.read_bytes()
+                if len(raw) > 64 * 1024:
+                    raise ValueError
+                value = json.loads(raw)
+                if (not isinstance(value, dict) or value.get("contract") != "github-owned-engine-failure-v1"
+                        or not isinstance(value.get("stage"), str) or value["stage"] not in ENGINE_FAILURE_STAGES
+                        or value.get("error_kind") not in ("exit", "timeout", "os_error")
+                        or "returncode" not in value or not (value["returncode"] is None or type(value["returncode"]) is int)
+                        or any(not isinstance(value.get(key), str) or not re.fullmatch(r"[a-f0-9]{64}", value[key])
+                               for key in ("stdout_sha256", "stderr_sha256"))):
+                    raise ValueError
+                fields = ("contract", "stage", "error_kind", "returncode", "stdout_sha256", "stderr_sha256")
+                diagnostics.append({"stage": "engine_failure", "sha256": digest(raw),
+                                    "engine": {key: value[key] for key in fields}})
+            except (OSError, ValueError, UnicodeError):
+                pass
             (self.public / "diagnostic-summary.json").write_text(json.dumps(diagnostics, ensure_ascii=False))
         self.report["platform_account_login_performed"] = False
         self.report["artifact_upload_is_a_separate_workflow_result"] = True

@@ -128,3 +128,78 @@ def test_finalization_never_overwrites_a_previous_validated_directory(native, tm
     with pytest.raises(native.ReadinessError, match="PUBLIC_FINALIZATION_PATH_INVALID"):
         native.finalize_public(staging, {"accepted": True}, set(), validated)
     assert original.read_text(encoding="utf-8") == '{"previous": true}' and list(staging.iterdir()) == []
+
+
+def failed_acceptance(native, tmp_path):
+    acceptance = native.Acceptance.__new__(native.Acceptance)
+    acceptance.private, acceptance.public = tmp_path / "private", tmp_path / "public"
+    acceptance.private.mkdir()
+    acceptance.public.mkdir()
+    acceptance.report = {}
+    acceptance.current_phase = "preflight"
+    acceptance.runtime_passwords = {"token": "opaque-fixture-credential-redacted"}
+    return acceptance
+
+
+def test_engine_failure_collector_exposes_only_typed_metadata_and_source_hash(native, tmp_path):
+    acceptance = failed_acceptance(native, tmp_path)
+    path = acceptance.private / "engine-failure.json"
+    secret = acceptance.runtime_passwords["token"]
+    path.write_text(json.dumps({"contract": "github-owned-engine-failure-v1", "stage": "UNIT_FILE_LIST_QUERY",
+        "error_kind": "exit", "returncode": 1, "stdout_sha256": "a" * 64, "stderr_sha256": "b" * 64,
+        "stdout_tail": secret, "stderr_tail": secret[-12:]}), encoding="utf-8")
+    report, _ = acceptance.final_report(RuntimeError("ENGINE_FAILED"))
+    diagnostic = (acceptance.public / "diagnostic-summary.json").read_text(encoding="utf-8")
+    assert report["accepted"] is False and acceptance.runtime_passwords["token"] not in diagnostic
+    assert secret[-12:] not in diagnostic and native.digest(path.read_bytes()) in diagnostic
+    record = json.loads(diagnostic)[0]
+    assert "tail" not in record and record["engine"]["stage"] == "UNIT_FILE_LIST_QUERY"
+    assert record["engine"]["returncode"] == 1 and "stderr_tail" not in record["engine"]
+
+
+def test_regular_log_redaction_happens_before_tail_truncation(native, tmp_path):
+    acceptance = failed_acceptance(native, tmp_path)
+    secret = acceptance.runtime_passwords["token"]
+    raw = ("begin" + secret + "x" * 15990).encode()
+    assert secret[-10:].encode() in raw[-16000:] and secret.encode() not in raw[-16000:]
+    (acceptance.private / "build.log").write_bytes(raw)
+    acceptance.final_report(RuntimeError("ENGINE_FAILED"))
+    diagnostic = (acceptance.public / "diagnostic-summary.json").read_text(encoding="utf-8")
+    assert secret[-10:] not in diagnostic and "[REDACTED]" in diagnostic
+    assert native.digest(raw) in diagnostic
+
+
+def test_oversized_engine_failure_cannot_enter_public_diagnostics(native, tmp_path):
+    acceptance = failed_acceptance(native, tmp_path)
+    (acceptance.private / "engine-failure.json").write_bytes(b"unbounded-engine-diagnostic" * 4096)
+    acceptance.final_report(RuntimeError("ENGINE_FAILED"))
+    diagnostic = (acceptance.public / "diagnostic-summary.json").read_text(encoding="utf-8")
+    assert "unbounded-engine-diagnostic" not in diagnostic
+
+
+def test_symlink_engine_failure_is_not_read_or_exposed(native, tmp_path):
+    acceptance = failed_acceptance(native, tmp_path)
+    outside = tmp_path / "unrelated-private.json"
+    outside.write_text('{"value": "unrelated-sensitive-source"}', encoding="utf-8")
+    try:
+        (acceptance.private / "engine-failure.json").symlink_to(outside)
+    except OSError:
+        pytest.skip("Windows account cannot create a symbolic link")
+    acceptance.final_report(RuntimeError("ENGINE_FAILED"))
+    diagnostic = (acceptance.public / "diagnostic-summary.json").read_text(encoding="utf-8")
+    assert "unrelated-sensitive-source" not in diagnostic
+
+
+@pytest.mark.parametrize("record", [
+    "2026-11-02 UTC [42] LOG:  statement: CREATE TABLE ci_probe(id int)",
+    "2026-11-02 UTC [42] LOG:  execute <unnamed>: CREATE TABLE ci_probe(id int)",
+    "2026-11-02 UTC [42] LOG:  execute s7: ALTER TABLE ci_probe ADD COLUMN value text",
+    "2026-11-02 UTC [42] LOG:  statement: -- client comment\nCREATE TABLE ci_probe(id int)",
+])
+def test_ddl_logger_records_also_detect_prepared_or_commented_statements(native, record):
+    assert native.count_logged_schema_statements(record) == 1
+
+
+def test_ddl_logger_counter_ignores_unrelated_errors_and_details(native):
+    unrelated = "2026-11-02 UTC [42] ERROR: syntax error\nSTATEMENT: SELECT missing\nDETAIL: execute client failed\n"
+    assert native.count_logged_schema_statements(unrelated) == 0

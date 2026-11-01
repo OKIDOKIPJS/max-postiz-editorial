@@ -1073,6 +1073,28 @@ test('onboarding file upload uses original frozen bytes and rejects a mismatched
   assert.equal(harness.find(tree,'input',node=>node.props.type==='checkbox').props.checked,false);
 });
 
+test('original preview uses frozen uploaded bytes with an explicit raster Blob MIME', async () => {
+  const bytes=Buffer.from([137,80,78,71,0,1,2,3]);
+  const sha=hash(bytes);
+  for(const mime of ['image/png','image/jpeg']) {
+    const blobs=[], urls=[], uploads=[];
+    class RasterBlob { constructor(parts, options) { this.parts=parts; this.type=options.type; blobs.push(this); } }
+    const harness=adminComponent('OriginalComposer',{setup:setupFixture(),pending:false,editing:null,onCancel(){},onAdmin:async body=>{
+      uploads.push(body); return {media:{path:`data/media/${sha}.${mime==='image/png'?'png':'jpg'}`,mime,sha256:sha},external_mutations:0};
+    }},{btoa:value=>Buffer.from(value,'binary').toString('base64'),Blob:RasterBlob,
+      URL:{createObjectURL:value=>{urls.push(value);return 'blob:synthetic-raster';},revokeObjectURL(){}}});
+    let tree=harness.render(); harness.find(tree,'select').props.onChange({target:{value:setupTarget.id}}); tree=harness.render();
+    const file={type:mime,size:bytes.length,arrayBuffer:async()=>Uint8Array.from(bytes).buffer};
+    harness.find(tree,'input',node=>node.props.type==='file').props.onChange({target:{files:[file],value:'chosen'}});
+    await new Promise(resolve=>setImmediate(resolve)); tree=harness.render();
+    assert.equal(blobs.length,1); assert.equal(urls[0],blobs[0]); assert.notEqual(urls[0],file);
+    assert.equal(blobs[0].type,mime); assert.deepEqual(Buffer.from(blobs[0].parts[0]),bytes);
+    assert.deepEqual(Buffer.from(uploads[0].data_base64,'base64'),bytes);
+    assert.equal(harness.find(tree,'img').props.src,'blob:synthetic-raster');
+    assert.equal(harness.find(tree,'input',node=>node.props.type==='checkbox').props.checked,false);
+  }
+});
+
 test('onboarding changed target binding blocks edits of an old exact version', () => {
   const editing={...routeDetailsFixture({...routeVariant,target_id:setupTarget.id,media_count:0},setupTarget),media:[],metadata:{origin:'owner_original'}};
   const setup={...setupFixture(),targets:[{...setupTarget,binding_hash:'e'.repeat(64)}]};

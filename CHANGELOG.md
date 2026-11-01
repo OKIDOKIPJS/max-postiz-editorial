@@ -1,5 +1,26 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: исправления первого независимого CI
+
+- Первый native run 41353716315 остановился в preflight до копирования исходников,
+  сборки и runtime. Учтена несовместимость systemd при пустом фильтрованном списке:
+  проверяются полные inventories с обязательным RC=0 и точными собственными именами.
+  Добавлены приватная диагностика этапа/кода и публичные только typed metadata/SHA.
+  Общие логи редактируются до усечения, чтобы граница tail не раскрывала секрет.
+- Первый PostgreSQL job выявил рассинхронизацию временных MAX fixtures: их
+  намеренные правки publishing/TOPIC теперь записываются и во временные файлы.
+  Production guards не ослаблены. Локальная затронутая SQLite-регрессия:
+  348 passed, 9 deselected; PostgreSQL требует повторного настоящего CI.
+- Для отмеченного CodeQL пути локального preview URL создаётся новый Blob
+  из тех же загруженных байтов с явным растровым MIME. DOM File не используется
+  напрямую как источник URL. SHA, upload и отдельное согласование сохранены.
+  CodeQL suppression не добавлен; новый результат сканирования ещё требуется.
+- В native default-startup учтены и обычные, и prepared записи PostgreSQL
+  log_statement=ddl, включая SQL с комментариями. Проверки: 174 Node passed;
+  59 native/engine pure tests passed, 1 Windows symlink skip; Ruff/diff-check прошли.
+  Source ZIP, wheel/sdist и relocation первого commit прошли privacy/610-file audit,
+  но не заменяют нативную приёмку следующего исправленного commit.
+
 ## 0.14.0 — 2026-11-02: заморозка кандидата для независимой нативной приёмки
 
 - Итоговый совместный набор guard/scenario/engine/portal/restart/handoff:

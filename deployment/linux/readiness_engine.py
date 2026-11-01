@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import ctypes
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -26,6 +27,11 @@ LABEL_KEY = "editorial.readiness.owner"
 
 class EngineError(RuntimeError):
     """A stable code, without command arguments/output or environment values."""
+
+    def __init__(self, code, *, stage=None, returncode=None):
+        super().__init__(code)
+        self.stage = stage
+        self.returncode = returncode
 
 
 def _inside_plain(path: Path, parent: Path) -> Path:
@@ -105,6 +111,9 @@ class Engine:
         self._cgroup_fd = None
         self._cgroup_inode = None
         self.observed_cgroup_limits = {}
+        self._stage = "NOT_STARTED"
+        self._transient_failure = None
+        self.last_failure = None
 
     @property
     def environment(self):
@@ -150,7 +159,45 @@ class Engine:
                 raise EngineError("OWN_ENGINE_DEPENDENCY_MISSING")
         self.commonlimits = _limits(_available_memory())
 
-    def _run(self, command, **kwargs):
+    def _failure(self, error, *, persist):
+        def output(value):
+            if isinstance(value, bytes):
+                return value
+            return value.encode("utf-8", errors="replace") if isinstance(value, str) else b""
+        stdout, stderr = output(getattr(error, "stdout", None)), output(getattr(error, "stderr", None))
+        returncode = getattr(error, "returncode", None)
+        failure = {"contract": "github-owned-engine-failure-v1", "stage": self._stage,
+                   "error_kind": "timeout" if isinstance(error, subprocess.TimeoutExpired) else
+                   "exit" if isinstance(error, subprocess.CalledProcessError) else "os_error",
+                   "returncode": returncode if type(returncode) is int else None,
+                   "stdout_sha256": hashlib.sha256(stdout).hexdigest(), "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                   "stdout_tail": stdout[-4096:].decode("utf-8", errors="replace"),
+                   "stderr_tail": stderr[-4096:].decode("utf-8", errors="replace")}
+        self._transient_failure = failure
+        if persist:
+            self._persist_failure(failure)
+        return failure
+
+    def _persist_failure(self, failure):
+        # First fatal failure survives cleanup errors. Raw output is private;
+        # the outer collector redacts it before its separate public privacy scan.
+        if self.last_failure is None:
+            self.last_failure = failure
+        if not self._created or not hasattr(self, "_evidence_file"):
+            return
+        try:
+            target = self._evidence_file.parent / "engine-failure.json"
+            _inside_plain(target, Path(os.environ["RUNNER_TEMP"]))
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(json.dumps(self.last_failure, sort_keys=True).encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+        except (OSError, KeyError):
+            pass  # Diagnostic I/O must not hide the command's stable failure.
+
+    def _run(self, command, *, record_failure=True, **kwargs):
         options = {"check": True, "capture_output": True, "text": True, "timeout": 60}
         options.update(kwargs)
         if (not isinstance(options["timeout"], (int, float)) or isinstance(options["timeout"], bool)
@@ -160,8 +207,29 @@ class Engine:
             options["capture_output"] = False
         try:
             return subprocess.run(command, **options)
-        except (OSError, subprocess.SubprocessError):
-            raise EngineError("OWN_ENGINE_COMMAND_FAILED") from None
+        except (OSError, subprocess.SubprocessError) as error:
+            failure = self._failure(error, persist=record_failure)
+            raise EngineError("OWN_ENGINE_COMMAND_FAILED", stage=self._stage,
+                              returncode=failure["returncode"]) from None
+
+    def _assert_unused_units(self):
+        expected = {self.slice, self.daemon_unit, self.anchor_unit}
+        environment = dict(self.environment, LC_ALL="C", SYSTEMD_COLORS="0", SYSTEMD_URLIFY="0")
+        # No patterns: systemd 262 returns ENOENT for a no-match filtered list.
+        # A failed full inventory is never interpreted as absence.
+        for verb, stage in (("list-units", "UNIT_LIST_QUERY"), ("list-unit-files", "UNIT_FILE_LIST_QUERY")):
+            self._stage = stage
+            result = self._run(["/usr/bin/systemctl", verb, "--all", "--full", "--plain", "--no-legend", "--no-pager"],
+                               env=environment)
+            if result.returncode != 0:
+                self._failure(subprocess.CalledProcessError(result.returncode, "unit-inventory",
+                              output=result.stdout, stderr=result.stderr), persist=True)
+                raise EngineError("OWN_ENGINE_COMMAND_FAILED", stage=stage, returncode=result.returncode)
+            if not isinstance(result.stdout, str):
+                raise EngineError("OWN_ENGINE_UNIT_INVENTORY_INVALID")
+            names = {line.split()[0] for line in result.stdout.splitlines() if line.split()}
+            if names & expected:
+                raise EngineError("OWN_ENGINE_UNIT_ALREADY_EXISTS")
 
     def docker(self, *args, **kwargs):
         if not self._created or self._closed:
@@ -177,9 +245,10 @@ class Engine:
         return self._run(["/usr/bin/docker", "--host", self.socket, "--config", str(self.config_dir), *args],
                          env=environment, **kwargs)
 
-    def _info(self):
+    def _info(self, *, record_failure=True):
         try:
-            value = json.loads(self.docker("info", "--format", "{{json .}}", timeout=5).stdout)
+            value = json.loads(self.docker("info", "--format", "{{json .}}", timeout=5,
+                                           record_failure=record_failure).stdout)
             labels = value.get("Labels", [])
             if (not isinstance(value, dict) or value.get("DockerRootDir") != str(self.data_root)
                     or not isinstance(labels, list) or labels.count(LABEL_KEY + "=" + self.label_value) != 1
@@ -279,6 +348,7 @@ class Engine:
         os.replace(temporary, target)
 
     def __enter__(self):
+        self._stage = "GUARD"
         self._guard()
         self.root.mkdir(mode=0o700)
         self._created = True
@@ -286,41 +356,45 @@ class Engine:
             self.config_dir.mkdir(mode=0o700)
             (self.root / "daemon.json").write_text("{}\n", encoding="ascii")
             os.chmod(self.root / "daemon.json", 0o600)
-            # Query membership without loading an implicit slice via `show`.
-            for verb in ("list-units", "list-unit-files"):
-                result = self._run(["/usr/bin/systemctl", verb, "--all", "--full", "--no-legend", "--no-pager",
-                                    self.slice, self.daemon_unit, self.anchor_unit])
-                if result.stdout.strip():
-                    raise EngineError("OWN_ENGINE_UNIT_ALREADY_EXISTS")
+            self._assert_unused_units()
             # A harmless owned child creates the implicit slice; cap it before
             # any daemon/container starts. No existing host slice is modified.
             self._anchor_started = True
+            self._stage = "ANCHOR_START"
             self._run(["/usr/bin/systemd-run", "--unit=" + self.anchor_unit, "--slice=" + self.slice,
                        "--service-type=exec", "--collect", "--property=MemoryMax=16777216",
                        "--property=KillMode=control-group", "/usr/bin/sleep", "infinity"])
+            self._stage = "SLICE_LIMITS"
             self._run(["/usr/bin/systemctl", "set-property", "--runtime", self.slice,
                        "MemoryMax=" + str(self.commonlimits["memory_bytes"]),
                        "MemorySwapMax=" + str(self.commonlimits["swap_bytes"]), "CPUQuota=400%"])
+            self._stage = "SLICE_IDENTITY"
             group = self._run(["/usr/bin/systemctl", "show", "--property=ControlGroup", "--value", self.slice]).stdout.strip()
             if group != self.cgroup_parent:
                 raise EngineError("OWN_ENGINE_CGROUP_MISMATCH")
+            self._stage = "CGROUP_CAPTURE"
             self._capture_cgroup()
             self._daemon_started = True
+            self._stage = "DAEMON_START"
             self._run(["/usr/bin/systemd-run", "--unit=" + self.daemon_unit, "--slice=" + self.slice,
                        "--service-type=exec", "--collect", "--property=Delegate=yes",
                        "--property=MemoryMax=" + str(GIB), "--property=MemorySwapMax=0",
                        "--property=KillMode=control-group", "--property=TimeoutStopSec=20",
                        *self.plan(self.commonlimits["memory_bytes"] + 2 * GIB)["daemon"]])
             deadline = time.monotonic() + 40
+            self._stage = "DAEMON_READY"
             while True:
                 try:
-                    value = self._info()
+                    value = self._info(record_failure=False)
                     break
                 except EngineError:
                     if time.monotonic() >= deadline:
-                        raise EngineError("OWN_ENGINE_START_TIMEOUT") from None
+                        if self._transient_failure is not None:
+                            self._persist_failure(self._transient_failure)
+                        raise EngineError("OWN_ENGINE_START_TIMEOUT", stage=self._stage) from None
                     time.sleep(0.25)
             self.engine_id = value["ID"]
+            self._stage = "EMPTY_ENGINE_CHECK"
             containers = self.docker("ps", "-aq").stdout.strip()
             volumes = self.docker("volume", "ls", "-q").stdout.strip()
             if containers or volumes:
@@ -352,6 +426,7 @@ class Engine:
         errors = []
         if self._validated:
             try:
+                self._stage = "CLEANUP_CONTAINERS"
                 self._info()
                 ids = self.docker("ps", "-aq", "--filter", "label=" + LABEL_KEY + "=" + self.label_value).stdout.split()
                 if any(not re.fullmatch(r"[a-f0-9]{12,64}", item) for item in ids):
@@ -368,12 +443,14 @@ class Engine:
         for started, unit in ((self._daemon_started, self.daemon_unit), (self._anchor_started, self.anchor_unit)):
             if started:
                 try:
+                    self._stage = "CLEANUP_DAEMON_STOP" if unit == self.daemon_unit else "CLEANUP_ANCHOR_STOP"
                     self._run(["/usr/bin/systemctl", "stop", unit], timeout=30)
                 except EngineError:
                     errors.append("owned_unit_stop_unconfirmed")
         cgroup_empty = False
         if self._daemon_started:
             try:
+                self._stage = "CLEANUP_CGROUP"
                 self._kill_owned_cgroup()
                 cgroup_empty = True
             except EngineError:
@@ -383,7 +460,9 @@ class Engine:
             self._cgroup_fd = None
         if self._anchor_started:
             try:
+                self._stage = "CLEANUP_SLICE_STOP"
                 self._run(["/usr/bin/systemctl", "stop", self.slice], timeout=30)
+                self._stage = "CLEANUP_SLICE_REVERT"
                 self._run(["/usr/bin/systemctl", "revert", self.slice])
             except EngineError:
                 errors.append("owned_slice_stop_unconfirmed")

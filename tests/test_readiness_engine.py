@@ -307,3 +307,78 @@ def test_empty_held_cgroup_requires_no_kill(tmp_path, monkeypatch):
     engine, state = fake_cgroup(tmp_path, monkeypatch, populated=False)
     engine._kill_owned_cgroup()
     assert state["opens"] == [] and state["writes"] == []
+
+
+def test_full_unit_inventory_ignores_unrelated_units_and_queries_without_empty_patterns(tmp_path):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        # systemd 262: filtered names with zero matches return ENOENT. The new
+        # full inventories never submit those patterns in the first place.
+        assert engine.slice not in command and engine.daemon_unit not in command and engine.anchor_unit not in command
+        assert "--plain" in command and "--no-legend" in command
+        assert kwargs["env"]["SYSTEMD_COLORS"] == "0"
+        return subprocess.CompletedProcess(command, 0, "ssh.service loaded active running SSH\nunrelated.slice loaded active active Slice\n", "")
+    engine._run = run
+    engine._assert_unused_units()
+    assert [command[1] for command in calls] == ["list-units", "list-unit-files"]
+
+
+@pytest.mark.parametrize("kind", ["slice", "daemon_unit", "anchor_unit"])
+def test_full_inventory_exact_owned_name_collision_blocks_before_any_start(tmp_path, kind):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._run = lambda command, **kwargs: subprocess.CompletedProcess(command, 0, getattr(engine, kind) + " loaded inactive dead owned\n", "")
+    with pytest.raises(EngineError, match="OWN_ENGINE_UNIT_ALREADY_EXISTS"):
+        engine._assert_unused_units()
+    assert not engine._anchor_started and not engine._daemon_started
+
+
+def test_failing_full_inventory_is_never_treated_as_absence(tmp_path):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._run = lambda command, **kwargs: subprocess.CompletedProcess(command, 1, "", "bus unavailable")
+    with pytest.raises(EngineError, match="OWN_ENGINE_COMMAND_FAILED") as caught:
+        engine._assert_unused_units()
+    assert caught.value.returncode == 1 and caught.value.stage == "UNIT_LIST_QUERY"
+    assert not engine._anchor_started and not engine._daemon_started
+
+
+def test_private_failure_records_stage_and_bounded_output_without_argv_or_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._created = True
+    engine._evidence_file = tmp_path / "private/engine.json"
+    engine._stage = "UNIT_FILE_LIST_QUERY"
+    def failed(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["never-store-this-argument"], output="x" * 12000, stderr="bounded private stderr")
+    monkeypatch.setattr(engine_module.subprocess, "run", failed)
+    with pytest.raises(EngineError) as caught:
+        engine._run(["/usr/bin/systemctl", "list-unit-files"], env={"PRIVATE": "never-store-this-environment"})
+    assert str(caught.value) == "OWN_ENGINE_COMMAND_FAILED"
+    assert caught.value.stage == "UNIT_FILE_LIST_QUERY" and caught.value.returncode == 1
+    path = tmp_path / "private/engine-failure.json"
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    assert value["stage"] == "UNIT_FILE_LIST_QUERY" and value["returncode"] == 1
+    assert value["stdout_tail"] == "x" * 4096 and value["stderr_tail"] == "bounded private stderr"
+    assert "never-store-this" not in raw.decode() and len(raw) < 65536
+    # Cleanup's different failure must not replace the first fatal operation.
+    engine._stage = "CLEANUP_SLICE_STOP"
+    with pytest.raises(EngineError):
+        engine._run(["/usr/bin/systemctl", "stop", engine.slice])
+    assert path.read_bytes() == raw
+
+
+def test_readiness_poll_failures_are_not_persisted_unless_startup_times_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._created = True
+    engine._evidence_file = tmp_path / "private/engine.json"
+    engine._stage = "DAEMON_READY"
+    monkeypatch.setattr(engine_module.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+        subprocess.CalledProcessError(1, ["docker"], stderr="not ready yet")))
+    with pytest.raises(EngineError):
+        engine._run(["docker", "info"], record_failure=False)
+    assert engine.last_failure is None and not (tmp_path / "private/engine-failure.json").exists()
+    engine._persist_failure(engine._transient_failure)
+    assert json.loads((tmp_path / "private/engine-failure.json").read_bytes())["stage"] == "DAEMON_READY"

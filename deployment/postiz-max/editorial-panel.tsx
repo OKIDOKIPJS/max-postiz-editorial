@@ -425,7 +425,11 @@ export function OriginalComposer({ setup, pending, editing, onAdmin, onCancel }:
         mime: file.type, sha256, data_base64: btoa(binary) });
       const saved = originalMedia(value?.media);
       if (saved.sha256 !== sha256 || saved.mime !== file.type || value?.external_mutations !== 0) throw new Error('EDITORIAL_ORIGINAL_MEDIA_INVALID');
-      setMedia([saved]); setPreview(URL.createObjectURL(file));
+      // Просмотр использует проверенные байты с явным растровым MIME.
+      const image = saved.mime === 'image/png'
+        ? new Blob([bytes], { type: 'image/png' })
+        : new Blob([bytes], { type: 'image/jpeg' });
+      setMedia([saved]); setPreview(URL.createObjectURL(image));
     } catch (reason) { setError(adminErrorCode(reason, 'EDITORIAL_UPLOAD_INVALID')); }
     finally { setUploading(false); }
   };
