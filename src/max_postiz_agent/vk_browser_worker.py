@@ -517,6 +517,20 @@ def _author(scope, selector, plan, selectors, *, origin):
     return {"id": expected, "href": href, "id_attribute": attribute, "numeric_id": numeric}
 
 
+def _wait_preview_images_ready(page, selectors, expected, *, timeout):
+    """Wait for the new preview nodes to decode before the exact safety snapshot."""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    try:
+        ready = page.wait_for_function("""({selector, expected}) => {
+          const images = [...document.querySelectorAll(selector)];
+          return images.length === expected && images.every(image =>
+            image.complete === true && image.naturalWidth > 0 && image.naturalHeight > 0);
+        }""", arg={"selector": selectors["preview_images"], "expected": expected}, timeout=timeout)
+        ready.dispose()
+    except PlaywrightTimeoutError:
+        raise AgentError("VK_BROWSER_IMAGE_NOT_READY") from None
+
+
 def _images(scope, selector):
     nodes = scope.locator(selector)
     result = []
@@ -1076,6 +1090,9 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
                                          else story_switch.uncheck(timeout=timeout)), origin=origin)
                 _wait_story_disabled(page, selectors, timeout=transition_timeout)
             _personal_settings(page, plan, selectors, origin=origin)
+        # Native preview has two DOM representations of the single approved photo.
+        preview_count = 2 if plan.get("image_contract") else len(plan["media"])
+        _wait_preview_images_ready(page, selectors, preview_count, timeout=transition_timeout)
         before = _final_snapshot(page, plan, selectors, origin=origin)
         if plan.get("image_contract"):
             _native_preview_proof(page, before["images"], plan, journal.get("upload_proof"), journal["request_id"], origin=origin)

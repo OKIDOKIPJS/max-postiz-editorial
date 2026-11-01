@@ -231,9 +231,11 @@ def test_full_postgres_job_requires_one_owned_report_and_ignores_nested_fixtures
 @pytest.mark.parametrize("skipped", [False, True])
 def test_junit_gate_rejects_skips_and_requires_all_new_pg_cases(tmp_path, skipped, capsys):
     root = ET.Element("testsuite")
-    for group, count in (("test_route_dispatch_postgres", 1), ("test_monitor_configuration_postgres", 9)):
+    for group, count in (("test_route_dispatch_postgres", 1), ("test_route_recovery", 1), ("test_monitor_configuration_postgres", 9)):
         for index in range(count):
-            case = ET.SubElement(root, "testcase", classname=group, name="test_guard_" + str(index))
+            name = ("test_postgres_recovery_skips_locked_sender_then_reconciles_during_pause"
+                    if group == "test_route_recovery" else "test_guard_" + str(index))
+            case = ET.SubElement(root, "testcase", classname=group, name=name)
             if skipped and group == "test_monitor_configuration_postgres" and index == 0:
                 ET.SubElement(case, "skipped", message="synthetic missing fixture")
     report = tmp_path / "tests.xml"

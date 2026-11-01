@@ -168,11 +168,21 @@ def owned_postgres_summary(path: Path) -> dict:
     """Явный новый PG-контракт не может стать зелёным через пропуски его тестов."""
     cases = list(ET.parse(path).getroot().iter("testcase"))  # noqa: S314 -- локальный pytest
     groups = {}
-    for name, minimum in (
-        ("test_route_dispatch_postgres", 1),
-        ("test_monitor_configuration_postgres", 9),
+    for name, minimum, required_test in (
+        ("test_route_dispatch_postgres", 1, None),
+        (
+            "test_route_recovery",
+            1,
+            "test_postgres_recovery_skips_locked_sender_then_reconciles_during_pause",
+        ),
+        ("test_monitor_configuration_postgres", 9, None),
     ):
-        selected = [case for case in cases if case.get("classname", "").split(".")[-1] == name]
+        selected = [
+            case
+            for case in cases
+            if case.get("classname", "").split(".")[-1] == name
+            and (required_test is None or case.get("name") == required_test)
+        ]
         passed = sum(
             not any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
             for case in selected

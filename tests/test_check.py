@@ -71,27 +71,69 @@ def test_contracts_verify_current_checkout_and_all_locks(checkout):
     assert check.contracts(checkout) == {"package_version": "1.2.3", "locked_dependencies": 1}
 
 
-@pytest.mark.parametrize("damage", [None, "missing", "skipped", "failure", "error"])
-def test_owned_postgres_report_requires_both_suites_without_skips(tmp_path, damage):
-    cases = ['<testcase classname="tests.test_route_dispatch_postgres" name="claim"/>']
-    for index in range(9):
-        marker = "" if damage not in {"skipped", "failure", "error"} or index else f"<{damage}/>"
-        cases.append(
-            '<testcase classname="tests.test_monitor_configuration_postgres" '
-            f'name="fence_{index}">{marker}</testcase>'
+@pytest.mark.parametrize(
+    "damaged_group,damage",
+    [(None, None)]
+    + [
+        (group, damage)
+        for group in (
+            "test_route_dispatch_postgres",
+            "test_route_recovery",
+            "test_monitor_configuration_postgres",
         )
-    if damage == "missing":
-        cases.pop()
+        for damage in ("missing", "skipped", "failure", "error")
+    ],
+)
+def test_owned_postgres_report_requires_all_three_suites_without_skips(
+    tmp_path, damaged_group, damage
+):
+    groups = (
+        ("test_route_dispatch_postgres", 1),
+        ("test_route_recovery", 1),
+        ("test_monitor_configuration_postgres", 9),
+    )
+    cases = []
+    for group, count in groups:
+        for index in range(count):
+            damaged = group == damaged_group and index == 0
+            if damaged and damage == "missing":
+                continue
+            marker = f"<{damage}/>" if damaged else ""
+            case_name = (
+                "test_postgres_recovery_skips_locked_sender_then_reconciles_during_pause"
+                if group == "test_route_recovery"
+                else f"case_{index}"
+            )
+            cases.append(
+                f'<testcase classname="tests.{group}" name="{case_name}">{marker}</testcase>'
+            )
     path = tmp_path / "junit.xml"
     path.write_text("<testsuites><testsuite>" + "".join(cases) + "</testsuite></testsuites>")
     if damage is None:
         assert check.owned_postgres_summary(path) == {
             "test_route_dispatch_postgres": {"total": 1, "passed": 1},
+            "test_route_recovery": {"total": 1, "passed": 1},
             "test_monitor_configuration_postgres": {"total": 9, "passed": 9},
         }
     else:
         with pytest.raises(ValueError, match="PostgreSQL cases missing or not passed"):
             check.owned_postgres_summary(path)
+
+
+def test_sqlite_recovery_cannot_replace_the_required_postgres_recovery_case(tmp_path):
+    cases = [
+        '<testcase classname="tests.test_route_dispatch_postgres" name="claim"/>',
+        '<testcase classname="tests.test_route_recovery" '
+        'name="test_worker_expires_owned_lease_once_and_fences_original_callback"/>',
+    ]
+    cases.extend(
+        f'<testcase classname="tests.test_monitor_configuration_postgres" name="fence_{index}"/>'
+        for index in range(9)
+    )
+    path = tmp_path / "junit.xml"
+    path.write_text("<testsuites><testsuite>" + "".join(cases) + "</testsuite></testsuites>")
+    with pytest.raises(ValueError, match="PostgreSQL cases missing or not passed"):
+        check.owned_postgres_summary(path)
 
 
 def test_owned_postgres_identity_failure_blocks_all_pytest_before_database_mutations(
