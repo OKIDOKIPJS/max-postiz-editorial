@@ -118,7 +118,7 @@ def _target(root, settings, value, row):
             owner_id(options)
             profile_path(root, options)
             wall_url(destination, options)
-            if options.get("dom_contract_profile") == "personal-text-v1" and destination != options["owner"]:
+            if options.get("dom_contract_profile") in {"personal-text-v1", "personal-image-v1"} and destination != options["owner"]:
                 raise AgentError("VK_BROWSER_PERSONAL_WALL_REQUIRED")
             try:
                 dom_contract({**options, "dom_contract_verified": True}, publish=True)
@@ -128,6 +128,16 @@ def _target(root, settings, value, row):
             if options.get("dom_contract_profile") == "personal-text-v1":
                 row["media_contract_verified"] = False
                 row["warnings"].append("VK_BROWSER_PROFILE_TEXT_ONLY")
+            elif options.get("dom_contract_profile") == "personal-image-v1":
+                from .vk_media import require_contract
+
+                row["media_contract_verified"] = False
+                try:
+                    selectors = dom_contract(options, publish=True)
+                    require_contract(root, options, selectors, options["owner"])
+                    row["media_contract_verified"] = True
+                except AgentError:
+                    row["blockers"].append("VK_BROWSER_MEDIA_EVIDENCE_UNVERIFIED")
         else:
             from .pikabu_browser_worker import _dom
             from .pikabu_delivery import owner_name

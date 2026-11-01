@@ -179,3 +179,49 @@ def test_wrapper_imports_checkout_scripts_without_pythonpath_from_another_cwd(tm
     assert saved["total_count"] == saved["selected_count"] == 1
     assert saved["full_nodeids"] == saved["selected_nodeids"] == ["tests/test_import.py::test_import_from_checkout"]
     assert saved["full_collection_hash"] == collection_hash(saved["full_nodeids"])
+
+
+def test_wrapper_imports_project_namespace_helpers_like_python_m_pytest(tmp_path):
+    project = tmp_path / "namespace-project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    # No __init__.py: repository helpers are an ordinary namespace package.
+    (scripts / "helper.py").write_text("VALUE = 'project-root-helper'\n", encoding="utf-8")
+    tests = project / "tests"
+    tests.mkdir()
+    fixture = tests / "test_namespace_import.py"
+    fixture.write_text(
+        "from pathlib import Path\n"
+        "from scripts import helper\n\n"
+        "def test_root_helper_namespace():\n"
+        "    assert helper.VALUE == 'project-root-helper'\n"
+        "    assert Path(helper.__file__).resolve() == "
+        "Path(__file__).resolve().parents[1] / 'scripts/helper.py'\n",
+        encoding="utf-8",
+    )
+    config = project / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+    pytest_args = ["-c", str(config), "--confcutdir", str(project),
+                   "tests/test_namespace_import.py", "-q"]
+    allowed = {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP", "HOME", "USERPROFILE",
+               "LOCALAPPDATA", "APPDATA", "COMSPEC", "PATHEXT"}
+    environment = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    environment.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONUTF8="1")
+    baseline = subprocess.run([sys.executable, "-m", "pytest", *pytest_args], cwd=project,
+                              env=environment, capture_output=True, text=True, encoding="utf-8",
+                              timeout=60, check=False)
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    receipt = project / "receipt.json"
+    wrapped = subprocess.run(
+        [sys.executable, str(WRAPPER), "--shard-index", "0", "--shard-count", "1",
+         "--shard-receipt", str(receipt), *pytest_args],
+        cwd=project, env=environment, capture_output=True, text=True, encoding="utf-8",
+        timeout=60, check=False,
+    )
+    saved = json.loads(receipt.read_text(encoding="utf-8"))
+    nodeids = ["tests/test_namespace_import.py::test_root_helper_namespace"]
+    assert wrapped.returncode == saved["exit_code"] == baseline.returncode
+    assert saved["collection_completed"] is True
+    assert saved["full_nodeids"] == saved["selected_nodeids"] == nodeids
+    assert saved["full_collection_hash"] == collection_hash(nodeids)
+    assert (saved["total_count"], saved["selected_count"], saved["deselected_count"]) == (1, 1, 0)

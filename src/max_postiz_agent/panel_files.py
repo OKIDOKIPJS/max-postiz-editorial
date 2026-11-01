@@ -3,6 +3,7 @@
 import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,15 @@ def private_roots(root, app, purpose="file"):
 # Каталоги авторизации не перечисляем через HTTP; открытие их папки в Проводнике остаётся локальным.
 def browsable(service, path, purpose="file", *, roots=None):
     roots = private_roots(service.settings.root, service.settings.app, purpose) if roots is None else roots
+    # VK разрешает только data/vk-browser[-имя]. Весь этот namespace остаётся
+    # приватным и после смены/отключения выбранного профиля, без чтения его файлов.
+    try:
+        parts = path.relative_to(service.settings.root.resolve()).parts
+    except ValueError:
+        parts = ()
+    if (len(parts) >= 2 and parts[0].casefold() == "data"
+            and re.fullmatch(r"vk-browser(?:-[A-Za-z0-9_-]+)?", parts[1], re.IGNORECASE)):
+        return False
     return not any(path.is_relative_to(directory)
                    for directory in roots)
 

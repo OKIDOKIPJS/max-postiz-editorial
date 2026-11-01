@@ -310,10 +310,10 @@ async function run(change = {}, ack = 'valid', rows = [validRow]) {
   assert.equal(result.error,'MAX_BROWSER_CAS_INVALID'); assert.equal(result.calls.length,0);
  }
  for (const entry of [
-  {integration:{id:'integration-max'},value:[{id:post,content:'corrected'}]},
-  {group:'group-max',value:[{id:post,content:'corrected'}]},
-  {group:'wrong-group',integration:{id:'integration-max'},value:[{id:post,content:'corrected'}]},
-  {group:'group-max',integration:{id:'wrong-integration'},value:[{id:post,content:'corrected'}]},
+  {integration:{id:integrationId},value:[{id:post,content:'corrected'}]},
+  {group,value:[{id:post,content:'corrected'}]},
+  {group:'other-group',integration:{id:integrationId},value:[{id:post,content:'corrected'}]},
+  {group,integration:{id:'other-integration'},value:[{id:post,content:'corrected'}]},
  ]) {
   result = await run({body:{type:'draft',republish:false,posts:[entry]}});
   assert.equal(result.error,'MAX_BROWSER_CAS_INVALID'); assert.equal(result.calls.length,0);

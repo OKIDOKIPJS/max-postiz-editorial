@@ -10,7 +10,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .browser_runtime import profile_lock
 from .config import AgentError, fingerprint, parse_json
@@ -131,9 +131,91 @@ def _rendered_text(node, selectors):
 def _text_links(node, plan):
     links = node.evaluate("""root=>[...(root.matches('a')?[root]:[]),
       ...root.querySelectorAll('a')].map(n=>n.getAttribute('href'))""")
+    if plan.get("image_contract"):
+        from .vk_media import LINK_CONTRACT, approved_link
+        if plan.get("link_contract") != LINK_CONTRACT:
+            raise AgentError("VK_BROWSER_UNAPPROVED_LINK")
+        return [approved_link(href, plan["allowed_text_urls"]) for href in links]
     if any(not isinstance(href, str) or href not in plan["allowed_text_urls"] for href in links):
         raise AgentError("VK_BROWSER_UNAPPROVED_LINK")
     return links
+
+
+def _caption_text(node, plan, selectors):
+    """The image route alone projects the observed native caption/link grammar."""
+    if not plan.get("image_contract"):
+        return _rendered_text(node, selectors)
+    from .vk_media import LINK_CONTRACT, rendered_approved_link
+    if plan.get("link_contract") != LINK_CONTRACT or selectors.get("text_contract") != "vk-native-text-v2":
+        raise AgentError("VK_BROWSER_RENDERED_TEXT_UNSUPPORTED")
+    result = node.evaluate("""root=>{
+      let invalid=false;
+      const id=e=>e.getAttribute('data-testid');
+      const visible=e=>{for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n);
+        if(s.display==='none'||s.visibility!=='visible'||Number(s.opacity)===0)return false;}return true;};
+      const bare=(e,expected)=>[...e.childNodes].every(n=>expected.includes(n)||n.nodeType===Node.TEXT_NODE&&n.textContent==='');
+      const style=(e,allowed)=>visible(e)&&allowed.includes(getComputedStyle(e).display);
+      let content=root;
+      if(root.tagName==='SPAN'&&id(root)==='post_text'){
+        if(!style(root,['block']))invalid=true;
+        const children=[...root.children];
+        if(children.length===1&&children[0].tagName==='DIV'&&id(children[0])==='showmoretext'){
+          const host=children[0],parts=[...host.children];
+          if(!bare(root,[host])||!style(host,['block','flow-root'])||!bare(host,parts))invalid=true;
+          const bodies=parts.filter(n=>n.tagName==='DIV'&&['showmoretext-in','showmoretext-in-expanded'].includes(id(n)));
+          const after=parts.filter(n=>n.tagName==='DIV'&&id(n)==='showmoretext-after');
+          if(bodies.length!==1||after.length>1||parts.length!==bodies.length+after.length
+             ||parts[0]!==bodies[0])invalid=true;
+          if(bodies.length===1){content=bodies[0];
+            if(after.length){const control=after[0],buttons=[...control.children];
+              if(id(content)!=='showmoretext-in'||parts[1]!==control||!style(control,['block'])
+                 ||buttons.length!==1||!bare(control,buttons))invalid=true;
+              else {const b=buttons[0];if(b.tagName!=='SPAN'||b.getAttribute('role')!=='button'
+                ||b.getAttribute('data-id')!=='showMoreButton'||b.getAttribute('tabindex')!=='0'
+                ||b.children.length||b.textContent!=='Показать ещё'||!style(b,['inline'])
+                ||[...b.childNodes].some(n=>n.nodeType!==Node.TEXT_NODE))invalid=true;}
+            }
+          }
+        }
+      }else if(root.tagName!=='DIV'||!['showmoretext-in','showmoretext-in-expanded'].includes(id(root)))invalid=true;
+      if(content!==root&&!style(content,['block','flow-root','inline']))invalid=true;
+      if(content===root&&root.tagName==='DIV'&&!style(root,['block','flow-root','inline']))invalid=true;
+      const inline=(n,inLink=false)=>{
+        if(n.nodeType===Node.TEXT_NODE)return[n.textContent];
+        if(n.nodeType!==Node.ELEMENT_NODE||!visible(n)){invalid=true;return[];}
+        if(n.tagName==='BR'&&!inLink)return['\\n'];
+        if(!['SPAN','A'].includes(n.tagName)||!style(n,['inline'])){invalid=true;return[];}
+        if(n.tagName==='A'){
+          if(inLink){invalid=true;return[];}
+          const pieces=[...n.childNodes].flatMap(c=>inline(c,true));
+          if(pieces.some(p=>typeof p!=='string')){invalid=true;return[];}
+          return[{href:n.getAttribute('href'),label:pieces.join('')}];
+        }
+        return[...n.childNodes].flatMap(c=>inline(c,inLink));
+      };
+      const spacer=n=>{const parts=[...n.childNodes],br=parts.filter(c=>c.nodeType===Node.ELEMENT_NODE&&c.tagName==='BR');
+        return br.length===1&&parts.every(c=>c===br[0]||c.nodeType===Node.TEXT_NODE&&['',' '].includes(c.textContent));};
+      const body=e=>[...e.childNodes].flatMap(n=>{
+        if(n.nodeType===Node.ELEMENT_NODE&&n.tagName==='DIV'){
+          const parts=[...n.childNodes],br=parts.filter(c=>c.nodeType===Node.ELEMENT_NODE&&c.tagName==='BR');
+          if(!style(n,['block'])||br.length!==1||!visible(br[0])
+             ||!parts.every(c=>c===br[0]||c.nodeType===Node.TEXT_NODE&&['',' '].includes(c.textContent)))invalid=true;
+          return['\\n\\n'];
+        }
+        return inline(n);
+      });
+      // Exactly the observed unary content wrapper; arbitrary nested blocks are rejected.
+      const kids=[...content.children];let textRoot=content;
+      if(['showmoretext-in','showmoretext-in-expanded'].includes(id(content))
+         &&kids.length===1&&kids[0].tagName==='DIV'&&bare(content,kids)&&!spacer(kids[0])){
+        textRoot=kids[0];if(!style(textRoot,['inline','block']))invalid=true;
+      }
+      return {tokens:body(textRoot),invalid};
+    }""")
+    if result["invalid"]:
+        raise AgentError("VK_BROWSER_RENDERED_TEXT_UNSUPPORTED")
+    return "".join(token if isinstance(token, str) else rendered_approved_link(
+        token["href"], token["label"], plan["allowed_text_urls"]) for token in result["tokens"])
 
 
 def _origin(page, origin):
@@ -218,7 +300,7 @@ def _mutation_stamp(page, selectors):
     keys = ("account", "open_editor", "editor", "modal", "upload_input", "uploaded_images",
             "next", "recipient", "preview_author", "preview_text", "preview_images", "publish",
             "story_switch", "story_toggle_label", "coauthors", "visibility", "forbidden_settings", "extra_attachments",
-            "blocked", "errors")
+            "uploaded_asset", "preview_asset", "image_edit_active", "blocked", "errors")
     try:
         result = page.evaluate("""selectors => {
           const state = e => {
@@ -226,6 +308,8 @@ def _mutation_stamp(page, selectors):
             return {value:'value' in e?e.value:null,checked:'checked' in e?e.checked:null,
               disabled:'disabled' in e?e.disabled:null,inert:e.inert,
               files:e.files?[...e.files].map(f=>[f.name,f.size,f.lastModified]):null,
+              image:e.tagName==='IMG'?{url:e.currentSrc||e.src,complete:e.complete,
+                width:e.naturalWidth,height:e.naturalHeight}:null,
               visible:r.width>0&&r.height>0,display:s.display,visibility:s.visibility,
               opaque:Number(s.opacity)>0,pointerEvents:s.pointerEvents,clip:s.clip,clipPath:s.clipPath};
           };
@@ -380,6 +464,20 @@ def _personal_settings(page, plan, selectors, *, origin, require_story_disabled=
 
 def _all_preview_media(page, plan, selectors, images):
     scope = _one(page, selectors["preview_scope"], "VK_BROWSER_MEDIA_SCOPE_AMBIGUOUS")
+    if plan.get("image_contract"):
+        from .vk_media import upload_filename
+        expected = sum(len(image["representations"]) for image in images)
+        if scope.locator("img,svg image").count() != expected:
+            raise AgentError("VK_BROWSER_UNAPPROVED_MEDIA")
+        if scope.locator("video,audio,iframe,object,embed,canvas,a[download],[data-testid=chip-attachment]").count():
+            raise AgentError("VK_BROWSER_UNAPPROVED_MEDIA")
+        files = scope.locator('input[type="file"]').evaluate_all(
+            "nodes=>nodes.flatMap(e=>[...e.files].map(f=>({name:f.name,bytes:f.size,type:f.type})))")
+        expected_file = {"name": upload_filename(plan["media"][0]), "bytes": plan["source_image"]["bytes"],
+                         "type": plan["media"][0]["mime"]}
+        if files and (not images or files != [expected_file]):
+            raise AgentError("VK_BROWSER_UNAPPROVED_MEDIA")
+        return {"all_image_count": expected, "selected_files": len(files)}
     if scope.locator("svg image").count() or scope.locator("img").count() != len(images):
         raise AgentError("VK_BROWSER_UNAPPROVED_MEDIA")
     if images != _images(scope, "img"):
@@ -457,11 +555,199 @@ def _image_proof(page, images, media, *, origin):
     return hashes
 
 
-def _editor_check(page, plan, selectors):
+def _native_images(scope, plan, selectors, stage, *, origin):
+    """Atomic image/asset containment; preview proves URL lineage, never an ID."""
+    from .vk_media import allowed_cdn, native_asset_id, validate_transform
+    key = {"uploaded": "uploaded_images", "preview": "preview_images", "post": "post_images"}[stage]
+    root = scope if stage == "post" else scope.locator("html")
+    captured = root.evaluate(r"""(root,a)=>{
+      const visible=e=>{const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;
+        for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n),b=n.getBoundingClientRect();
+          if(s.display==='none'||s.visibility!=='visible'||Number(s.opacity)===0)return false;
+          if(['hidden','clip'].includes(s.overflowX)&&(r.left<b.left-1||r.right>b.right+1))return false;
+          if(['hidden','clip'].includes(s.overflowY)&&(r.top<b.top-1||r.bottom>b.bottom+1))return false;
+        }return true;};
+      const assets=[...root.querySelectorAll(a.asset)],nodes=[...root.querySelectorAll(a.images)];
+      const asset=assets.length===1?assets[0]:null;
+      const grids=a.grid?[...root.querySelectorAll(a.grid)]:[];
+      const transforms=a.transform?[...root.querySelectorAll(a.transform)]:[];
+      let semanticAnchor=false;
+      if(a.post&&asset&&asset.tagName==='A'&&asset.getAttribute('data-testid')==='primary-attachment-interactive-wrapper'
+         &&asset.getAttribute('aria-label')==='Фотография'&&nodes.length===1&&nodes[0].parentElement===asset
+         &&asset.children.length===1&&asset.firstElementChild===nodes[0]
+         &&[...asset.childNodes].every(n=>n===nodes[0]||n.nodeType===Node.TEXT_NODE&&n.textContent==='')){
+        const s=getComputedStyle(asset),r=asset.getBoundingClientRect();
+        semanticAnchor=s.display==='inline'&&r.width===0&&r.height===0&&s.overflowX==='visible'&&s.overflowY==='visible'
+          &&s.clip==='auto'&&s.clipPath==='none'&&s.transform==='none'&&s.visibility==='visible'&&Number(s.opacity)===1
+          &&visible(nodes[0]);
+      }
+      let transform=null;
+      if(transforms.length===1){const s=getComputedStyle(transforms[0]);
+        transform=Object.fromEntries(Object.entries({ratio:'--photo-primary-ratio',width:'--photo-width',
+          height:'--photo-height',scale:'--photo-scale',x:'--photo-translate-x',y:'--photo-translate-y',
+          container_width:'--photo-container-width',container_height:'--photo-container-height'})
+          .map(([key,value])=>{const raw=s.getPropertyValue(value).trim(),unit=['ratio','scale'].includes(key)?'':'px';
+            const pattern=unit?/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?px$/i:
+              /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
+            return[key,pattern.test(raw)?Number(unit?raw.slice(0,-2):raw):null];}));}
+      return {asset_count:assets.length,asset_visible:!!asset&&(visible(asset)||semanticAnchor),semantic_anchor:semanticAnchor,
+        asset_value:asset&&a.attribute?asset.getAttribute(a.attribute):null,
+        asset_image_count:asset?asset.querySelectorAll('img').length:0,
+        unsupported:!!asset&&asset.querySelectorAll('video,audio,iframe,object,embed,canvas,svg image').length>0,
+        grid_ok:!a.grid||(grids.length===1&&!!asset&&grids[0].contains(asset)),transform,
+        images:nodes.map(n=>{const r=n.getBoundingClientRect();return{url:n.currentSrc||n.src||'',
+          complete:n.complete===true,width:n.naturalWidth,height:n.naturalHeight,
+          visible:visible(n),contained:!!asset&&asset.contains(n),box_width:r.width,box_height:r.height};})};
+    }""", {"asset": selectors[stage + "_asset"], "images": selectors[key], "post": stage == "post",
+            "attribute": selectors.get(stage + "_asset_id_attribute") if stage != "preview" else None,
+            "transform": selectors.get(stage + "_transform") if stage != "post" else None,
+            "grid": selectors.get("preview_grid") if stage == "preview" else None})
+    count = 2 if stage == "preview" else 1
+    images = captured["images"]
+    if (captured["asset_count"] != 1 or not captured["asset_visible"] or captured["unsupported"]
+            or not captured["grid_ok"] or captured["asset_image_count"] != count or len(images) != count
+            or any(not image["contained"] for image in images)):
+        raise AgentError("VK_BROWSER_PHOTO_ASSET_AMBIGUOUS")
+    if (any(not image["complete"] or min(image["width"], image["height"]) <= 0
+            or not allowed_cdn(image["url"], origin=origin) for image in images)
+            or len({(image["url"], image["width"], image["height"]) for image in images}) != 1):
+        raise AgentError("VK_BROWSER_IMAGE_NOT_READY")
+    if stage != "post" and [images[0]["width"], images[0]["height"]] != plan["source_image"]["dimensions"]:
+        raise AgentError("VK_BROWSER_PHOTO_TRANSFORM_UNAPPROVED")
+    transform = None
+    if stage != "post":
+        transform = validate_transform(captured["transform"], plan["source_image"]["dimensions"])
+        if not any(image["visible"] and abs(image["box_width"] - transform["width"]) <= 1
+                   and abs(image["box_height"] - transform["height"]) <= 1 for image in images):
+            raise AgentError("VK_BROWSER_IMAGE_NOT_VISIBLE")
+    elif not images[0]["visible"]:
+        raise AgentError("VK_BROWSER_IMAGE_NOT_VISIBLE")
+    result = {key: images[0][key] for key in ("url", "complete", "width", "height")}
+    result.update(representations=images, transform=transform)
+    if stage == "preview":
+        result["binding"] = "uploaded-cdn-url-v1"
+    else:
+        result.update(binding="native-photo-id-v1", asset_id=native_asset_id(captured["asset_value"],
+            plan["owner"], selectors[stage + "_asset_id_attribute"], origin=origin))
+    return [result]
+
+
+def _photo_context(page, plan, selectors, expected_asset, *, origin):
+    from .vk_media import asset_id
+    _origin(page, origin)
+    _blocked(page, selectors)
+    account = _one(page, selectors["account"], "VK_BROWSER_ACCOUNT_AMBIGUOUS")
+    if not account.is_visible() or _link_path(account.get_attribute("href"), origin) != "/id" + plan["owner"]:
+        raise AgentError("VK_BROWSER_ACCOUNT_MISMATCH")
+    parsed = urlsplit(page.url)
+    direct = parsed.path == "/photo" + expected_asset and not parsed.query
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    album = "/album" + plan["owner"] + "_00"
+    redirected = parsed.path == album and query == {"z": ["photo" + expected_asset + album]}
+    if parsed.fragment or not (direct or redirected) or asset_id(expected_asset, plan["owner"]) != expected_asset:
+        raise AgentError("VK_BROWSER_PHOTO_VIEWER_ID_MISMATCH")
+
+
+def _photo_original(page, plan, selectors, expected_asset, *, origin, media_review=None):
+    """Read only the known photo viewer's Original link, never edit/crop/delete."""
+    from .vk_media import allowed_cdn, derivative_proof
+    viewer = page.context.new_page()
+    try:
+        viewer.set_default_timeout(10000)
+        _navigate(viewer, origin + "/photo" + expected_asset)
+        viewer.locator(selectors["account"]).wait_for(state="visible", timeout=10000)
+        viewer.wait_for_function("""selector=>{const e=document.querySelector(selector);
+          return e&&e.getAttribute('href')&&e.getAttribute('href')!=='#';}""", arg=selectors["account"], timeout=10000)
+        _photo_context(viewer, plan, selectors, expected_asset, origin=origin)
+        viewer.locator(selectors["photo_viewer"]).wait_for(state="visible", timeout=10000)
+        container = _one(viewer, selectors["photo_viewer"], "VK_BROWSER_PHOTO_VIEWER_AMBIGUOUS")
+        more = container.get_by_role("button", name=re.compile(r"^Ещё\s*$"))
+        more.wait_for(state="visible", timeout=10000)
+        if more.count() != 1 or not more.is_visible() or not more.is_enabled():
+            raise AgentError("VK_BROWSER_PHOTO_ORIGINAL_UNAVAILABLE")
+        _photo_context(viewer, plan, selectors, expected_asset, origin=origin)
+        more.click(timeout=1000, no_wait_after=True)
+        viewer.locator(selectors["photo_original"]).wait_for(state="visible", timeout=10000)
+        original = _one(viewer, selectors["photo_original"], "VK_BROWSER_PHOTO_ORIGINAL_AMBIGUOUS")
+        viewer.locator(selectors["photo_viewer_image"]).wait_for(state="visible", timeout=10000)
+        image = _one(viewer, selectors["photo_viewer_image"], "VK_BROWSER_PHOTO_VIEWER_AMBIGUOUS")
+        def capture():
+            _photo_context(viewer, plan, selectors, expected_asset, origin=origin)
+            current = original.evaluate("e=>({url:e.href,label:e.innerText,visible:!!e.getClientRects().length})")
+            if (not current["visible"] or current["label"].strip() != "Открыть оригинал"
+                    or not allowed_cdn(current["url"], origin=origin)):
+                raise AgentError("VK_BROWSER_PHOTO_ORIGINAL_UNAVAILABLE")
+            main = image.evaluate("e=>({url:e.currentSrc||e.src,complete:e.complete,width:e.naturalWidth,height:e.naturalHeight})")
+            if not main["complete"] or min(main["width"], main["height"]) <= 0 or not allowed_cdn(main["url"], origin=origin):
+                raise AgentError("VK_BROWSER_IMAGE_NOT_READY")
+            if media_review:
+                from .vk_media_review import reviewed_preview_matches
+                if not reviewed_preview_matches(main, current["url"], media_review, origin=origin):
+                    raise AgentError("VK_BROWSER_ACTUAL_MEDIA_ACCEPTANCE_INVALID")
+            return {"url": viewer.url, "original": current["url"], "main": main, "asset_id": expected_asset}
+        before = capture()
+        response = viewer.request.get(before["original"], fail_on_status_code=False, max_redirects=0)
+        if response.status in {401, 403, 429}:
+            raise AgentError("VK_BROWSER_ACCESS_BLOCKED")
+        if response.status != 200:
+            raise AgentError("VK_BROWSER_IMAGE_READ_UNAVAILABLE")
+        if media_review:
+            from .vk_media_review import accepted_proof
+            proof = accepted_proof(response.body(), plan["source_image"], plan["image_contract"], expected_asset,
+                                   media_review, before["original"], origin=origin)
+        else:
+            proof = derivative_proof(response.body(), plan["source_image"], expected_asset, plan["image_contract"])
+        after = capture()
+        if before != after:
+            raise AgentError("VK_BROWSER_PHOTO_VIEWER_CHANGED_DURING_READ")
+        proof.update(original_url=before["original"], viewer_sha256=fingerprint(after))
+        return proof
+    finally:
+        viewer.close()
+
+
+def _native_image_proof(page, images, plan, selectors, upload, request_id, *, origin, media_review=None):
+    from .vk_media import validate_upload
+    if (not validate_upload(upload, plan, request_id, origin=origin) or len(images) != 1
+            or images[0].get("asset_id") != upload["asset_id"]):
+        raise AgentError("VK_BROWSER_PHOTO_UPLOAD_BINDING_INVALID")
+    if media_review and upload["asset_id"] != media_review["details"]["asset_id"]:
+        raise AgentError("VK_BROWSER_ACTUAL_MEDIA_ACCEPTANCE_INVALID")
+    return [_photo_original(page, plan, selectors, upload["asset_id"], origin=origin, media_review=media_review)]
+
+
+def _cdn_bytes(page, url, *, origin):
+    from .vk_media import MAX_BYTES, allowed_cdn
+    if not allowed_cdn(url, origin=origin):
+        raise AgentError("VK_BROWSER_IMAGE_ORIGIN_INVALID")
+    response = page.request.get(url, fail_on_status_code=False, max_redirects=0)
+    if response.status in {401, 403, 429}:
+        raise AgentError("VK_BROWSER_ACCESS_BLOCKED")
+    if response.status != 200:
+        raise AgentError("VK_BROWSER_IMAGE_READ_UNAVAILABLE")
+    raw = response.body()
+    if not 0 < len(raw) <= MAX_BYTES:
+        raise AgentError("VK_BROWSER_PHOTO_SIZE_INVALID")
+    return raw
+
+
+def _native_preview_proof(page, images, plan, upload, request_id, *, origin):
+    from .vk_media import derivative_proof, validate_upload
+    if (not validate_upload(upload, plan, request_id, origin=origin) or len(images) != 1
+            or images[0].get("binding") != "uploaded-cdn-url-v1"
+            or images[0]["url"] != upload["uploaded_url"]):
+        raise AgentError("VK_BROWSER_PHOTO_UPLOAD_BINDING_INVALID")
+    raw = _cdn_bytes(page, images[0]["url"], origin=origin)
+    if hashlib.sha256(raw).hexdigest() != upload["uploaded_derivative_sha256"]:
+        raise AgentError("VK_BROWSER_PHOTO_PREVIEW_CHANGED")
+    return derivative_proof(raw, plan["source_image"], upload["asset_id"], plan["image_contract"])
+
+
+def _editor_check(page, plan, selectors, *, origin=ORIGIN):
     editor = _one(page, selectors["editor"], "VK_BROWSER_EDITOR_AMBIGUOUS")
     if not editor.is_visible() or _text(editor) != plan["text"]:
         raise AgentError("VK_BROWSER_EDITOR_TEXT_MISMATCH")
-    images = _images(page, selectors["uploaded_images"])
+    images = _native_images(page, plan, selectors, "uploaded", origin=origin) if plan.get("image_contract") else _images(page, selectors["uploaded_images"])
     if len(images) != len(plan["media"]):
         raise AgentError("VK_BROWSER_IMAGE_COUNT_MISMATCH")
     return images
@@ -477,7 +763,7 @@ def _final_snapshot(page, plan, selectors, *, origin):
         _recipient(page, plan, selectors, origin=origin)
         author = _author(page, selectors["preview_author"], plan, selectors, origin=origin)
     preview = _one(page, selectors["preview_text"], "VK_BROWSER_PREVIEW_AMBIGUOUS")
-    if not preview.is_visible() or _rendered_text(preview, selectors) != plan["text"]:
+    if not preview.is_visible() or _caption_text(preview, plan, selectors) != plan["text"]:
         raise AgentError("VK_BROWSER_PREVIEW_TEXT_MISMATCH")
     text_links = _text_links(preview, plan)
     for key in ("forbidden_settings", "extra_attachments"):
@@ -490,11 +776,14 @@ def _final_snapshot(page, plan, selectors, *, origin):
     if (not button.is_visible() or not button.is_enabled()
             or button.inner_text().strip() != selectors["publish_label"]):
         raise AgentError("VK_BROWSER_PUBLISH_UNAVAILABLE")
-    images = _images(page, selectors["preview_images"])
+    images = _native_images(page, plan, selectors, "preview", origin=origin) if plan.get("image_contract") else _images(page, selectors["preview_images"])
     if len(images) != len(plan["media"]):
         raise AgentError("VK_BROWSER_IMAGE_COUNT_MISMATCH")
     all_media = _all_preview_media(page, plan, selectors, images) if personal else None
-    return {"text": _rendered_text(preview, selectors), "images": images, "author": author,
+    caption = _caption_text(preview, plan, selectors)
+    if caption != plan["text"]:
+        raise AgentError("VK_BROWSER_PREVIEW_TEXT_MISMATCH")
+    return {"text": caption, "images": images, "author": author,
             "personal_settings": settings, "all_media": all_media, "text_links": text_links}
 
 
@@ -538,10 +827,12 @@ def _matches(page, plan, selectors, *, origin):
         text = post.locator(selectors["post_text"])
         if text.count() != 1 or not text.is_visible():
             continue
+        candidate = (re.sub(r"https?://[^\s<>\"']+", "", plan["text"])
+                     if plan.get("image_contract") else plan["text"])
         if (selectors.get("text_contract") in {"vk-spacer-div-v1", "vk-native-text-v2"}
-                and not _could_match_text(text, plan["text"])):
+                and not _could_match_text(text, candidate)):
             continue
-        if _rendered_text(text, selectors) == plan["text"]:
+        if _caption_text(text, plan, selectors) == plan["text"]:
             matches.append((post, _post_id(post, plan, selectors, origin=origin)))
     return matches
 
@@ -558,10 +849,19 @@ def _post_snapshot(page, plan, selectors, expected_id, *, origin):
     extras = [node for node in post.locator(selectors["post_extra_attachments"]).all() if node.is_visible()]
     if extras:
         raise AgentError("VK_BROWSER_READBACK_EXTRA_ATTACHMENT")
-    images = _images(post, selectors["post_images"])
+    if plan.get("image_contract"):
+        if post.get_attribute("data-post-id") != expected_id:
+            raise AgentError("VK_BROWSER_POST_RECIPIENT_MISMATCH")
+        if (post.locator('[data-testid="post-content-container"] img').count() != 1
+                or post.locator(selectors["post_extra_attachments"]).count()):
+            raise AgentError("VK_BROWSER_READBACK_EXTRA_ATTACHMENT")
+    images = _native_images(post, plan, selectors, "post", origin=origin) if plan.get("image_contract") else _images(post, selectors["post_images"])
     if len(images) != len(plan["media"]):
         raise AgentError("VK_BROWSER_IMAGE_COUNT_MISMATCH")
-    return {"external_id": ident, "text": _rendered_text(post.locator(selectors["post_text"]), selectors),
+    caption = _caption_text(post.locator(selectors["post_text"]), plan, selectors)
+    if caption != plan["text"]:
+        raise AgentError("VK_BROWSER_READBACK_TEXT_MISMATCH")
+    return {"external_id": ident, "text": caption,
             "images": images, "extra_attachments": len(extras), "wall_url": page.url,
             "text_links": text_links,
             "author": author,
@@ -586,23 +886,33 @@ def _wait_readback_post(page, plan, selectors, expected_id, *, origin, timeout=1
         page.wait_for_timeout(min(100, max(1, int(remaining * 1000))))
 
 
-def _readback(page, plan, selectors, expected_id, *, origin, timeout=10000):
+def _readback(page, plan, selectors, expected_id, *, origin, timeout=10000, upload=None, request_id=None, media_review=None):
+    if media_review and expected_id != media_review["details"]["external_id"]:
+        raise AgentError("VK_BROWSER_ACTUAL_MEDIA_ACCEPTANCE_INVALID")
     proofs = []
     for _ in range(2):
         _navigate(page, plan["wall_url"].replace(ORIGIN, origin, 1))
         _ready(page, selectors)
         _wait_readback_post(page, plan, selectors, expected_id, origin=origin, timeout=timeout)
         before = _post_snapshot(page, plan, selectors, expected_id, origin=origin)
-        hashes = _image_proof(page, before["images"], plan["media"], origin=origin)
+        hashes = (_native_image_proof(page, before["images"], plan, selectors, upload, request_id, origin=origin,
+                                     **({"media_review": media_review} if media_review else {}))
+                  if plan.get("image_contract") else _image_proof(page, before["images"], plan["media"], origin=origin))
         # Rechecking only text would miss an image/attachment/account swap while
         # the old public image bytes were being downloaded.
         if before != _post_snapshot(page, plan, selectors, expected_id, origin=origin):
             raise AgentError("VK_BROWSER_READBACK_CHANGED")
         proofs.append({"external_id": expected_id, "text_sha256": plan["text_sha256"],
-                       "image_sha256": hashes, "author": before["author"], "text_links": before["text_links"]})
-    return {"verification": "independent_wall_reload_exact_text_recipient_author_image_sha256",
+                       "image_proofs" if plan.get("image_contract") else "image_sha256": hashes,
+                       "author": before["author"], "text_links": before["text_links"],
+                       **({"link_contract": plan["link_contract"]} if plan.get("image_contract") else {})})
+    from .vk_media_review import VERIFICATION, reference
+    return {"verification": (VERIFICATION if media_review else "independent_wall_reload_exact_text_recipient_author_native_photo_v1" if plan.get("image_contract")
+                             else "independent_wall_reload_exact_text_recipient_author_image_sha256"),
             "reloads": proofs, "external_id": expected_id,
             "permalink": ORIGIN + "/wall" + expected_id, "title_format": "plain",
+            **({"upload": upload} if plan.get("image_contract") else {}),
+            **({"media_review": reference(media_review), "original_policy_satisfied": False} if media_review else {}),
             "observed_at": time.time()}
 
 
@@ -635,6 +945,10 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
                 or journal.get("options_sha256") != fingerprint(options)
                 or journal.get("fixture") is not fixture):
             raise AgentError("VK_BROWSER_JOURNAL_CONFLICT", 409)
+        from .vk_media_review import VERIFICATION
+        if isinstance(journal.get("proof"), dict) and ("media_review" in journal["proof"]
+                or journal["proof"].get("verification") == VERIFICATION):
+            raise AgentError("VK_BROWSER_ACTUAL_MEDIA_READ_ONLY", 409)
         return _result(journal, fixture=fixture)
     selectors = dom_contract(options, publish=True)
     authorize()
@@ -694,21 +1008,47 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
                 raise AgentError("VK_BROWSER_IMAGE_HASH_CHANGED")
             _save(path, journal, "upload_intent")
             upload_input = _one(page, selectors["upload_input"], "VK_BROWSER_UPLOAD_AMBIGUOUS")
-            def check_upload():
+            def check_upload(upload_input=upload_input, media=media):
                 if not editor.is_visible() or _text(editor) != plan["text"] or _images(page, selectors["uploaded_images"]):
                     raise AgentError("VK_BROWSER_EDITOR_CHANGED_BEFORE_UPLOAD")
+                if plan.get("image_contract"):
+                    state = upload_input.evaluate("e=>({tag:e.tagName,type:e.type,multiple:e.multiple,"
+                                                  "accept:e.accept,files:e.files?e.files.length:-1,disabled:e.disabled})")
+                    accepts = [value.strip() for value in state["accept"].split(",")]
+                    if (state["tag"] != "INPUT" or state["type"] != "file" or state["multiple"] is not True
+                            or state["files"] != 0 or state["disabled"] is not False
+                            or media["mime"] not in accepts and "image/*" not in accepts):
+                        raise AgentError("VK_BROWSER_PHOTO_INPUT_CONTRACT_INVALID")
 
+            if plan.get("image_contract"):
+                from .vk_media import upload_filename
+                filename = upload_filename(media)
+            else:
+                filename = "approved.jpg" if media["mime"] == "image/jpeg" else "approved.png"
             _mutate(page, plan, selectors, authorize, check_upload,
-                    lambda timeout, media=media, raw=raw, upload_input=upload_input: upload_input.set_input_files(
-                        {"name": "approved.jpg" if media["mime"] == "image/jpeg" else "approved.png",
+                    lambda timeout, media=media, raw=raw, upload_input=upload_input, filename=filename: upload_input.set_input_files(
+                        {"name": filename,
                          "mimeType": media["mime"], "buffer": raw}, timeout=timeout), origin=origin)
             page.wait_for_function("""selector => {
               const images=[...document.querySelectorAll(selector)];
               return images.length===1 && images.every(n=>n.complete && n.naturalWidth>0
                 && n.src && !n.src.startsWith('blob:') && !n.src.startsWith('data:'));
             }""", arg=selectors["uploaded_images"])
-            _save(path, journal, "uploaded")
-        _editor_check(page, plan, selectors)
+            if plan.get("image_contract"):
+                from .vk_media import derivative_proof, upload_binding
+                _wait_control_ready(page, selectors["uploaded_asset"], "VK_BROWSER_PHOTO_ASSET_AMBIGUOUS",
+                                    timeout=transition_timeout)
+                uploaded = _native_images(page, plan, selectors, "uploaded", origin=origin)
+                derivative = _cdn_bytes(page, uploaded[0]["url"], origin=origin)
+                derivative_proof(derivative, plan["source_image"], uploaded[0]["asset_id"], plan["image_contract"])
+                if uploaded != _native_images(page, plan, selectors, "uploaded", origin=origin):
+                    raise AgentError("VK_BROWSER_PHOTO_PREVIEW_CHANGED")
+                binding = upload_binding(plan, journal["request_id"], uploaded[0]["asset_id"], uploaded[0]["url"],
+                                         hashlib.sha256(derivative).hexdigest(), origin=origin)
+                _save(path, journal, "uploaded", upload_proof=binding)
+            else:
+                _save(path, journal, "uploaded")
+        _editor_check(page, plan, selectors, origin=origin)
         next_button = page.locator(selectors.get("next", "[data-vk-never-match]"))
         if selectors.get("identity_contract") == "personal-wall-settings-v1":
             next_button = _wait_control_ready(page, selectors["next"], "VK_BROWSER_NEXT_AMBIGUOUS",
@@ -718,7 +1058,7 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
                 raise AgentError("VK_BROWSER_NEXT_AMBIGUOUS")
             authorize()
             _save(path, journal, "next_intent")
-            _mutate(page, plan, selectors, authorize, lambda: _editor_check(page, plan, selectors),
+            _mutate(page, plan, selectors, authorize, lambda: _editor_check(page, plan, selectors, origin=origin),
                     lambda timeout: next_button.click(timeout=timeout), origin=origin)
         page.locator(selectors["preview_text"]).wait_for(state="visible", timeout=10000)
         if selectors.get("identity_contract") == "personal-wall-settings-v1":
@@ -736,7 +1076,10 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
                 _wait_story_disabled(page, selectors, timeout=transition_timeout)
             _personal_settings(page, plan, selectors, origin=origin)
         before = _final_snapshot(page, plan, selectors, origin=origin)
-        _image_proof(page, before["images"], plan["media"], origin=origin)
+        if plan.get("image_contract"):
+            _native_preview_proof(page, before["images"], plan, journal.get("upload_proof"), journal["request_id"], origin=origin)
+        else:
+            _image_proof(page, before["images"], plan["media"], origin=origin)
         if before != _final_snapshot(page, plan, selectors, origin=origin):
             raise AgentError("VK_BROWSER_PREVIEW_CHANGED_DURING_IMAGE_READ")
         authorize()
@@ -760,7 +1103,9 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
         _save(path, journal, "readback_pending", external_id=external_id,
               permalink=ORIGIN + "/wall" + external_id)
         proof = _readback(page, plan, selectors, external_id, origin=origin,
-                          timeout=min(10000, options.get("operation_timeout_seconds", 180) * 1000))
+                          timeout=min(10000, options.get("operation_timeout_seconds", 180) * 1000),
+                          **({"upload": journal.get("upload_proof"), "request_id": journal["request_id"]}
+                             if plan.get("image_contract") else {}))
         _save(path, journal, "confirmed", proof=proof)
     except Exception as exc:
         code = exc.code if isinstance(exc, AgentError) else "VK_BROWSER_OPERATION_UNKNOWN"
@@ -773,26 +1118,111 @@ def run_publish(page, root, options, payload, authorize, *, origin=ORIGIN, fixtu
     return _result(journal, fixture=fixture)
 
 
-def reconcile(page, root, options, destination, request_id, *, origin=ORIGIN, fixture=False):
+def _discover_native_post(page, plan, selectors, upload, request_id, *, origin, timeout=10000):
+    """Locate one previously claimed asset; exact text/author proof is still mandatory."""
+    from .vk_media import native_asset_id, validate_upload
+    if not validate_upload(upload, plan, request_id, origin=origin):
+        raise AgentError("VK_BROWSER_PHOTO_UPLOAD_BINDING_INVALID")
+    _navigate(page, plan["wall_url"].replace(ORIGIN, origin, 1))
+    _ready(page, selectors)
+    deadline = time.monotonic() + min(10000, timeout) / 1000
+    while True:
+        _context(page, plan, selectors, origin=origin)
+        posts = page.locator(selectors["posts"])
+        if posts.count() > 200:
+            raise AgentError("VK_BROWSER_POST_LIST_UNBOUNDED")
+        candidates = []
+        for post in posts.all():
+            for asset in post.locator(selectors["post_asset"]).all():
+                try:
+                    ident = native_asset_id(asset.get_attribute(selectors["post_asset_id_attribute"]),
+                                            plan["owner"], selectors["post_asset_id_attribute"], origin=origin)
+                except AgentError:
+                    continue
+                if ident == upload["asset_id"]:
+                    candidates.append(post)
+        if len(candidates) == 1:
+            break
+        remaining = deadline - time.monotonic()
+        if len(candidates) > 1 or remaining <= 0:
+            raise AgentError("VK_BROWSER_READBACK_NOT_EXACTLY_ONE")
+        page.wait_for_timeout(min(100, max(1, int(remaining * 1000))))
+    expected_id = _post_id(candidates[0], plan, selectors, origin=origin)
+    snapshot = _post_snapshot(page, plan, selectors, expected_id, origin=origin)
+    if len(snapshot["images"]) != 1 or snapshot["images"][0].get("asset_id") != upload["asset_id"]:
+        raise AgentError("VK_BROWSER_PHOTO_UPLOAD_BINDING_INVALID")
+    return expected_id
+
+
+def reconcile(page, root, options, destination, request_id, *, origin=ORIGIN, fixture=False, media_review_loader=None):
     if origin != ORIGIN and not fixture:
         raise AgentError("VK_BROWSER_FIXTURE_ORIGIN_FORBIDDEN")
+    if media_review_loader is not None and not fixture:
+        raise AgentError("VK_BROWSER_FIXTURE_AUTHORITY_FORBIDDEN")
     path, journal = _read(root, request_id)
     if (journal.get("destination") != destination or journal.get("options_sha256") != fingerprint(options)
             or journal.get("fixture") is not fixture):
         raise AgentError("VK_BROWSER_JOURNAL_CONFLICT", 409)
-    if not journal.get("external_id"):
+    discovery = not journal.get("external_id")
+    if discovery and options.get("dom_contract_profile") != "personal-image-v1":
         return _result(journal, fixture=fixture)
     # A completed journal proves the earlier delivery. Reconciliation of an
     # unknown Hub dispatch must independently read today's visible native post;
     # it must never promote cached evidence to a current readback.
     plan = prepare(root, options, destination, journal["snapshot"])
+    save_failure = True
+    guarded_journal = discovery or bool(plan.get("image_contract"))
     try:
-        proof = _readback(page, plan, dom_contract(options, publish=True), journal["external_id"], origin=origin,
-                          timeout=min(10000, options.get("operation_timeout_seconds", 180) * 1000))
-        _save(path, journal, "confirmed", proof=proof, failure_code=None)
+        selectors = dom_contract(options, publish=True)
+        def current_review():
+            if not plan.get("image_contract"):
+                return None
+            if fixture:
+                return media_review_loader() if media_review_loader else None
+            from .vk_media_review import load_review
+            return load_review(root, options, destination, request_id, plan, journal)
+        media_review = current_review()
+        expected_id = journal.get("external_id")
+        if discovery:
+            from .vk_media import receipt_origin, validate_upload
+            if (not plan.get("image_contract") or type(journal.get("clicks")) is not int or journal["clicks"] != 1
+                    or journal.get("dom_contract_sha256") != plan["dom_contract_sha256"]
+                    or receipt_origin(journal.get("upload_proof"), fixture) != origin
+                    or not validate_upload(journal.get("upload_proof"), plan, request_id, origin=origin)):
+                raise AgentError("VK_BROWSER_PHOTO_UPLOAD_BINDING_INVALID")
+            expected_id = _discover_native_post(page, plan, selectors, journal["upload_proof"], request_id, origin=origin,
+                timeout=min(10000, options.get("operation_timeout_seconds", 180) * 1000))
+        if media_review and expected_id != media_review["details"]["external_id"]:
+            raise AgentError("VK_BROWSER_ACTUAL_MEDIA_ACCEPTANCE_INVALID")
+        proof = _readback(page, plan, selectors, expected_id, origin=origin,
+                          timeout=min(10000, options.get("operation_timeout_seconds", 180) * 1000),
+                          **({"upload": journal.get("upload_proof"), "request_id": journal["request_id"]}
+                              if plan.get("image_contract") else {}),
+                          **({"media_review": media_review} if media_review else {}))
+        if media_review and current_review() != media_review:
+            raise AgentError("VK_BROWSER_ACTUAL_MEDIA_ACCEPTANCE_CHANGED")
+        if guarded_journal:
+            _, current = _read(root, request_id)
+            if (current["journal_sha256"] != journal["journal_sha256"]
+                    or prepare(root, options, destination, journal["snapshot"]) != plan):
+                save_failure = False
+                raise AgentError("VK_BROWSER_JOURNAL_CONFLICT", 409)
+        _save(path, journal, "confirmed", proof=proof, failure_code=None,
+              **({"external_id": expected_id, "permalink": ORIGIN + "/wall" + expected_id} if discovery else {}))
     except Exception as exc:
-        _save(path, journal, "unknown", failure_code=exc.code if isinstance(exc, AgentError)
-              else "VK_BROWSER_OPERATION_UNKNOWN")
+        failure_code = exc.code if isinstance(exc, AgentError) else "VK_BROWSER_OPERATION_UNKNOWN"
+        if guarded_journal and save_failure:
+            try:
+                _, current = _read(root, request_id)
+                save_failure = current["journal_sha256"] == journal["journal_sha256"]
+            except AgentError:
+                save_failure = False
+            if not save_failure:
+                failure_code = "VK_BROWSER_JOURNAL_CONFLICT"
+        if save_failure:
+            _save(path, journal, "unknown", failure_code=failure_code)
+        else:
+            journal.update(state="unknown", failure_code=failure_code)
     return _result(journal, fixture=fixture)
 
 

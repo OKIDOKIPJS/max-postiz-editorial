@@ -53,15 +53,21 @@ function main() {
     const fixtureAdapter = path.join(temporary, 'adapter');
     fs.mkdirSync(fixtureAdapter);
     for (const entry of fs.readdirSync(adapter, { withFileTypes: true })) {
-      if (entry.isFile() && path.extname(entry.name) === '.png') {
-        fs.copyFileSync(path.join(adapter, entry.name), path.join(fixtureAdapter, entry.name), fs.constants.COPYFILE_EXCL);
-        continue;
-      }
       if (!entry.isFile() || !(entry.name.startsWith('Dockerfile') ||
           ['.cjs', '.ts', '.tsx', '.json', '.css'].includes(path.extname(entry.name)))) continue;
       fs.writeFileSync(path.join(fixtureAdapter, entry.name),
         fs.readFileSync(path.join(adapter, entry.name), 'utf8').replace(/\r\n/g, '\n'), { flag: 'wx' });
     }
+    // Копируем только явно требуемый публичный fixture, без runtime-каталогов.
+    for (const name of ['fixtures/production-next.config.upstream.cjs']) {
+      const destination = path.join(fixtureAdapter, name);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.writeFileSync(destination,
+        fs.readFileSync(path.join(adapter, name), 'utf8').replace(/\r\n/g, '\n'), { flag: 'wx' });
+    }
+    // Structural mock проверяет COPY этой публичной иконки; её байты не нормализуем.
+    fs.copyFileSync(path.join(adapter, 'max-browser.png'), path.join(fixtureAdapter, 'max-browser.png'),
+      fs.constants.COPYFILE_EXCL);
     const filename = path.join(temporary, 'max-browser.guard.js');
     fs.writeFileSync(filename, output, { flag: 'wx' });
     const suites = [

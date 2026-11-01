@@ -74,9 +74,11 @@ def test_login_wrong_heading_missing_permission_or_ambiguous_header_fail_without
     settings, page, requests = channel
     monkeypatch.setattr(browser_runtime, "_CHANNEL_READY_TIMEOUT_MS", 150)
     route(page, content)
+    # Fixture navigation has its own startup budget; classification still has 150 ms.
+    page.goto("https://web.max.ru/-123", wait_until="domcontentloaded", timeout=5000)
     started = time.monotonic()
     with pytest.raises(AgentError, match="^" + code + "$"):
-        browser_runtime.ensure_channel(page, settings, "-123")
+        browser_runtime.ensure_channel(page, settings, "-123", navigate=False)
     assert time.monotonic() - started < 2
     unchanged(page, requests)
 
@@ -163,8 +165,12 @@ def test_read_identity_still_rejects_login_or_wrong_header(channel, monkeypatch,
     settings, page, requests = channel
     monkeypatch.setattr(browser_runtime, "_CHANNEL_READY_TIMEOUT_MS", 150)
     route(page, content)
+    # Load the fixture separately from the bounded channel classification.
+    page.goto("https://web.max.ru/-123", wait_until="domcontentloaded", timeout=5000)
+    started = time.monotonic()
     with pytest.raises(AgentError, match="^" + code + "$"):
-        browser_runtime.ensure_channel(page, settings, "-123", require_publish=False)
+        browser_runtime.ensure_channel(page, settings, "-123", navigate=False, require_publish=False)
+    assert time.monotonic() - started < 2
     unchanged(page, requests)
 
 

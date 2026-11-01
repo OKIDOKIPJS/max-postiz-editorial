@@ -745,9 +745,10 @@ test('historical fixture badge survives a target changing to live and has no pub
   const ui = routeUi();
   const anchors = node => !node || typeof node !== 'object' ? [] : Array.isArray(node)
     ? node.flatMap(anchors) : [...(node.type === 'a' ? [node] : []), ...anchors(node.props?.children)];
+  const fixturePermalink = new URL('https://vk.ru/wall123456_51');
   const dispatch = { id: 'fixture-history', target_id: 'vk_target', title: 'Local fixture', state: 'published',
     due_at: 1867111200, verified: true, evidence_kind: 'fixture', attempts: 1,
-    snapshot_hash: 'e'.repeat(64), permalink: 'https://vk.ru/wall123456_51' };
+    snapshot_hash: 'e'.repeat(64), permalink: fixturePermalink.href };
   for (const adapter_mode of ['fixture', 'browser', 'live']) {
     const tree = ui.EditorialRoutes({ pending: false,
       inventory: { targets: [{ ...routeTarget, adapter_mode, route: 'vk_browser' }], variants: [], dispatches: [dispatch] },
