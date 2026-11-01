@@ -1,5 +1,103 @@
 # История версий
 
+## 0.11.7 — 2026-11-01: полный Windows pytest четырьмя обязательными частями
+
+- Последовательный Windows job дошёл до 88% и был остановлен по лимиту 45 минут;
+  `CI required` завершился ошибкой и сохранил запрет merge. Linux проверен полностью:
+  4863 passed, 18 ожидаемых PostgreSQL skipped, 1 warning; отдельная PostgreSQL 17:
+  199 passed, 1 warning, без пропусков. Таймаут не выдан за успешный тест.
+- Windows collection разделена на четыре обязательных job по SHA256 nodeid.
+  Ни один тест не удаляется: `CI required` проверяет успех всех matrix jobs и
+  receipts четырёх частей — одинаковый полный collection/hash, точные counts,
+  однократное назначение каждого nodeid, отсутствие пересечений/потерь и exit 0.
+  Отфильтрованный набор и повреждённые/неполные receipts блокируют merge.
+- JUnit и receipts имеют разные имена artifacts; агрегатор получает только чтение
+  Actions. Download action закреплён по SHA. Linux сохраняет полный pytest/coverage,
+  PostgreSQL и Node Windows/Linux остаются обязательными. Hard gates не ослаблены,
+  runtime-пакет, production-сервер, модели, очередь и публикации не менялись.
+- До применения проверено на 28 синтетических тестах: четыре непересекающиеся
+  части полностью покрыли collection; перестановка порядка не меняет назначения;
+  pytest failure/usage/no-tests и неверные параметры сохраняют ненулевые exit codes.
+  Постоянный набор проверки wrapper/receipts: 23 passed; checker работает без
+  site-packages (`python -S`); Ruff, pins и actionlint прошли. Полный GitHub CI
+  повторяется на новой конфигурации перед штатным merge.
+
+## 0.11.7 — 2026-11-01: исправления по первому полному GitHub CI
+
+- Первый полный Ubuntu pytest обнаружил шесть ошибок: 4857 passed, 6 failed,
+  18 PostgreSQL skipped, 1 warning. Существующий benchmark subclass обходил
+  родительский конструктор и не имел `segment_chars`/`config_hash`; три маршрута
+  завершались AttributeError до HTTP. Добавлена инициализация прежнего лимита
+  1400 и hash фактической конфигурации маршрута. Критерии, raw, запрет повтора
+  неизвестного исхода и production adapter не ослаблялись.
+- Native CAS test теперь использует полный актуальный DRAFT/group/integration
+  snapshot. Добавлены три проверки отказа для изменённых state/group/integration;
+  рабочий TypeScript guard и его pinned hashes не менялись. Локально весь CAS
+  модуль: 20 passed, 1 deprecation warning; benchmark: 34 passed, без пропусков.
+- В PostgreSQL job добавлены test_article_reserve_store и test_reserve_preclick_recovery:
+  это ещё четыре проверки гонок/истории, которые в общем наборе требуют отдельной
+  БД. Ruff дополнительно охватывает исправленный benchmark. Полный CI повторяется
+  на исправленном commit; защита main остаётся активной, failing PR не объединён.
+- Полный pytest остаётся обязательным на обеих ОС; coverage собирается на Linux,
+  чтобы Windows не повторяла ту же инструментированную проверку. Каждый новый
+  commit PR проверяется через pull_request/synchronize, main — через push;
+  устранены два одинаковых CI запуска на каждое изменение PR.
+- Исправления выполнялись в отдельном worktree. Работающий сервер, модели,
+  production-БД, публикации и исходный checkout не затронуты.
+
+## 0.11.7 — 2026-11-01: проверка pins Dependabot и фактическое включение защиты
+
+- Ruleset `Protect main` №26308277 включён и прочитан обратно через GitHub API:
+  PR, обязательный актуальный `CI required` от app 15368, CodeQL errors/high,
+  запрет удаления/force push и пустой bypass. Пока проверки PR не завершены,
+  GitHub показывает `BLOCKED`. Настройки безопасности прочитаны обратно:
+  Dependabot security updates, Secret scanning и Push protection включены;
+  открытых Secret scanning alerts на момент проверки нет.
+- Dependabot не разбирает нестандартные `requirements*.lock`. Добавлен поддерживаемый
+  `requirements-ci.txt` с 55 точными pins из runtime/dev/browser locks и обязательный
+  stdlib-checker их равенства. PR обновления требует синхронной правки соответствующих
+  locks; изменение одного лишь манифеста не пройдёт CI. Старые locks не мигрировали.
+  TypeScript/tslib исключены из обычных автообновлений: их версии закреплены CAS
+  contract и меняются вместе с доказательствами компиляции.
+- Явно разрешена выгрузка только выбранных скрытых JUnit/coverage-файлов;
+  для `.yml` закреплён LF. Дополнительные проверки: actionlint 1.7.12 прошёл,
+  checker pins прошёл positive-case и семь независимых negative-cases,
+  локальный целевой pytest — 671 passed, 5 expected skipped, 1 warning.
+  Первые GitHub Ruff/build, PostgreSQL, Node Windows/Linux и CodeQL jobs прошли;
+  итог полного CI проверяется на последней версии PR перед объединением.
+- CodeQL baseline и шесть прежних Dependabot alerts (4 high, 1 medium, 1 low)
+  сохранены открытыми для отдельного разбора. Ничего не dismissed/подавлено,
+  защита не ослаблялась ради старых alerts. Работающий сервер не затронут.
+
+## 0.11.7 — 2026-11-01: GitHub CI и защита main
+
+- Добавлены обязательные проверки GitHub Actions: Ruff, совместимость зависимостей,
+  сборка wheel/sdist, полный pytest с Chrome на Windows/Linux, отдельная одноразовая
+  PostgreSQL 17 и пять Node suites Postiz на обеих ОС. Агрегатор `CI required`
+  отклоняет failed/cancelled/skipped jobs; Actions закреплены по точным commit SHA,
+  token имеет только чтение, JUnit/coverage сохраняются на семь дней.
+- Node tooling отделён от OpenCode runtime и закреплён lock-файлом. CAS guard
+  компилируется только во временной копии с проверкой source/compiled SHA;
+  все suites обязательны, пропуски запрещены. Нормализация LF воспроизводит Git
+  blobs на Windows, не переписывая исходники и не обращаясь к Docker/серверу.
+- Добавлены Dependabot для Python, npm и Actions, а также декларативный ruleset:
+  PR, успешный `CI required` именно от GitHub Actions, актуальная база, CodeQL,
+  запрет force push/удаления main и обязательное закрытие обсуждений. Для одного
+  владельца не требуется чужой approving review; bypass не предусмотрен.
+- В GitHub включены Dependabot alerts/security updates, Secret scanning,
+  Push protection и CodeQL Python/JavaScript/TypeScript. Первый CodeQL baseline
+  завершился успешно и сохранил 45 открытых alerts (2 critical, 42 high, 1 medium).
+  Они не подавлялись и требуют отдельного разбора; успешный scan не означает
+  отсутствие уязвимостей. CodeQL merge protection оценивает находки PR diff.
+- Исправлены 55 нарушений существующего Ruff без ослабления правил: многооператорные
+  строки тестов, регистрация pytest fixtures, явная строгость zip и имя неиспользуемого
+  значения при сохранении обязательного чтения `payload["chat_id"]`.
+- Локально: зависимости установлены в отдельную .venv; pip check и wheel/sdist
+  прошли; Node 89 passed, 0 failed/skipped; CAS 81 mocked checks; npm audit tooling
+  не нашёл уязвимостей. Полные GitHub jobs и применение ruleset проверяются отдельно.
+  Версия runtime-пакета не менялась; работающая VM, её БД, очереди, публикации,
+  модели и существующие локальные checkout не изменялись.
+
 ## 0.11.7 — 2026-10-30: установка, закрытие старого unknown и фактическая доставка
 
 - Итоговый код прошёл изолированную Linux/PostgreSQL qa-v25: 745 passed в 23

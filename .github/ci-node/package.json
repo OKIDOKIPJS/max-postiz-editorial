@@ -1,0 +1,17 @@
+{
+  "name": "max-postiz-ci-contract-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated compiler dependencies for offline Postiz contract checks",
+  "scripts": {
+    "test": "node ../../scripts/ci_node_tests.cjs"
+  },
+  "devDependencies": {
+    "@types/node": "18.16.9",
+    "@types/react": "19.1.8",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "tslib": "2.8.1",
+    "typescript": "5.5.4"
+  }
+}

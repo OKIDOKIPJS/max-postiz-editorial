@@ -672,7 +672,7 @@ def reconcile(settings, chat_id, request_id):
 
 # Выполняем отправку и возвращаем подтверждённый либо неопределённый результат.
 def publish(settings, payload, *, authorize_before_click=None):
-    request_id, chat_id, text = payload["request_id"], payload["chat_id"], payload["text"]
+    request_id, _chat_id, text = payload["request_id"], payload["chat_id"], payload["text"]
     # Обрабатываем ветвь при условии: not isinstance(text, str) or not text.strip() or len(text) > 4000.
     if not isinstance(text, str) or not text.strip() or len(text) > 4000:
         raise AgentError("BROWSER_TEXT_INVALID")
