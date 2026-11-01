@@ -1,5 +1,27 @@
 # История версий
 
+## 0.11.7 — 2026-11-01: полный Windows pytest четырьмя обязательными частями
+
+- Последовательный Windows job дошёл до 88% и был остановлен по лимиту 45 минут;
+  `CI required` завершился ошибкой и сохранил запрет merge. Linux проверен полностью:
+  4863 passed, 18 ожидаемых PostgreSQL skipped, 1 warning; отдельная PostgreSQL 17:
+  199 passed, 1 warning, без пропусков. Таймаут не выдан за успешный тест.
+- Windows collection разделена на четыре обязательных job по SHA256 nodeid.
+  Ни один тест не удаляется: `CI required` проверяет успех всех matrix jobs и
+  receipts четырёх частей — одинаковый полный collection/hash, точные counts,
+  однократное назначение каждого nodeid, отсутствие пересечений/потерь и exit 0.
+  Отфильтрованный набор и повреждённые/неполные receipts блокируют merge.
+- JUnit и receipts имеют разные имена artifacts; агрегатор получает только чтение
+  Actions. Download action закреплён по SHA. Linux сохраняет полный pytest/coverage,
+  PostgreSQL и Node Windows/Linux остаются обязательными. Hard gates не ослаблены,
+  runtime-пакет, production-сервер, модели, очередь и публикации не менялись.
+- До применения проверено на 28 синтетических тестах: четыре непересекающиеся
+  части полностью покрыли collection; перестановка порядка не меняет назначения;
+  pytest failure/usage/no-tests и неверные параметры сохраняют ненулевые exit codes.
+  Постоянный набор проверки wrapper/receipts: 23 passed; checker работает без
+  site-packages (`python -S`); Ruff, pins и actionlint прошли. Полный GitHub CI
+  повторяется на новой конфигурации перед штатным merge.
+
 ## 0.11.7 — 2026-11-01: исправления по первому полному GitHub CI
 
 - Первый полный Ubuntu pytest обнаружил шесть ошибок: 4857 passed, 6 failed,
