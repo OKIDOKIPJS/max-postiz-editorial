@@ -1,5 +1,28 @@
 # История версий
 
+## 0.11.7 — 2026-11-01: исправления по первому полному GitHub CI
+
+- Первый полный Ubuntu pytest обнаружил шесть ошибок: 4857 passed, 6 failed,
+  18 PostgreSQL skipped, 1 warning. Существующий benchmark subclass обходил
+  родительский конструктор и не имел `segment_chars`/`config_hash`; три маршрута
+  завершались AttributeError до HTTP. Добавлена инициализация прежнего лимита
+  1400 и hash фактической конфигурации маршрута. Критерии, raw, запрет повтора
+  неизвестного исхода и production adapter не ослаблялись.
+- Native CAS test теперь использует полный актуальный DRAFT/group/integration
+  snapshot. Добавлены три проверки отказа для изменённых state/group/integration;
+  рабочий TypeScript guard и его pinned hashes не менялись. Локально весь CAS
+  модуль: 20 passed, 1 deprecation warning; benchmark: 34 passed, без пропусков.
+- В PostgreSQL job добавлены test_article_reserve_store и test_reserve_preclick_recovery:
+  это ещё четыре проверки гонок/истории, которые в общем наборе требуют отдельной
+  БД. Ruff дополнительно охватывает исправленный benchmark. Полный CI повторяется
+  на исправленном commit; защита main остаётся активной, failing PR не объединён.
+- Полный pytest остаётся обязательным на обеих ОС; coverage собирается на Linux,
+  чтобы Windows не повторяла ту же инструментированную проверку. Каждый новый
+  commit PR проверяется через pull_request/synchronize, main — через push;
+  устранены два одинаковых CI запуска на каждое изменение PR.
+- Исправления выполнялись в отдельном worktree. Работающий сервер, модели,
+  production-БД, публикации и исходный checkout не затронуты.
+
 ## 0.11.7 — 2026-11-01: проверка pins Dependabot и фактическое включение защиты
 
 - Ruleset `Protect main` №26308277 включён и прочитан обратно через GitHub API:

@@ -242,6 +242,9 @@ class BenchmarkGatewayTranslator(DedicatedTranslator):
 
     def __init__(self, route, transport):
         self.model, self.url = route["model"], route["base_url"].rstrip("/")
+        # Сохраняем production preflight и привязку доказательств к точному маршруту.
+        self.segment_chars = 1400
+        self.config_hash = fingerprint({"model": route["model"], "base_url": route["base_url"]})
         self.client = httpx.Client(timeout=600, trust_env=False, transport=transport, follow_redirects=False)
         self._cached_source = self._cached_result = None
 
