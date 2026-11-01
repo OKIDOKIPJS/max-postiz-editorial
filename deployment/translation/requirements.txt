@@ -4,7 +4,7 @@ transformers==5.17.0
 torch==2.14.1+cpu
 sentencepiece==0.2.2
 huggingface-hub==1.33.0
-sacremoses==0.1.1
+sacremoses==0.2.0
 httpx==0.28.1
 sacrebleu==2.6.0
 # Обновляет хранилище доверия и в уже созданном изолированном окружении.
