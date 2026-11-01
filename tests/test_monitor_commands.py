@@ -24,7 +24,10 @@ STAMP = 1804000000.0
 
 
 @pytest.fixture
-def gateway(service):
+def gateway(service, monkeypatch):
+    # Этот fixture использует собственную SQLite, а не PG соседних тестов.
+    # Явный небезопасный URL, выставленный самим тестом позже, guard отклоняет.
+    monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
     mark_isolated(service.settings.root, service.settings.root.parent / "untouched-source")
     state = ServerState(service)
     state.initialize()
@@ -79,6 +82,13 @@ def test_arbitrary_execution_source_secrets_and_oversized_requests_denied(text):
 def test_unauthorized_events_never_create_claim(gateway, change):
     with pytest.raises(AgentError, match="MONITOR_COMMAND_ACCESS_DENIED"):
         gateway.handle(event(**change), now_at=STAMP)
+    assert count_jobs(gateway) == 0
+
+
+def test_explicit_database_override_after_sqlite_fixture_is_still_rejected(gateway, monkeypatch):
+    monkeypatch.setenv("TEST_DATABASE_URL", "postgresql+psycopg://fixture:synthetic@127.0.0.1:55450/editorial_hub_tests")
+    with pytest.raises(AgentError, match="ISOLATED_DATABASE_REQUIRED"):
+        gateway.handle(event(), now_at=STAMP)
     assert count_jobs(gateway) == 0
 
 

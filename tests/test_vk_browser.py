@@ -236,6 +236,9 @@ def local_vk(sample):
                 if state.drop_reply:
                     self.close_connection = True
                     return
+                delay = getattr(state, "publish_response_delay_seconds", 0)
+                if delay:
+                    time.sleep(delay)
                 result = {"html": post_html(state, text, 51)}
             else:
                 self.send_error(404)
@@ -317,6 +320,9 @@ def test_background_create_changes_are_ignored_only_inside_visible_composer(samp
 
 def test_native_background_draft_update_does_not_block_exact_guarded_form(
         sample, local_vk, page, monkeypatch):
+    # This positive DOM contract is not a one-second HTTP performance test.
+    # The worker's separate fresh-authorization fence remains unchanged.
+    sample.options["operation_timeout_seconds"] = 5
     personal_wall(sample, local_vk)
     original, changed = worker._all_preview_media, False
 
@@ -329,9 +335,13 @@ def test_native_background_draft_update_does_not_block_exact_guarded_form(
 
     monkeypatch.setattr(worker, '_all_preview_media', background_update)
     result = run(page, sample, local_vk)
-    assert result['state'] == 'confirmed', result
-    assert changed and local_vk.publishes == 1 and local_vk.stories == local_vk.uploads == 0
     _, journal = worker._read(sample.root, sample.payload['request_id'])
+    diagnostic = {"failure_code": journal.get("failure_code"),
+        "error_type": journal.get("private_error", {}).get("type"),
+        "last_action_intent": journal.get("last_action_intent"),
+        "clicks": journal.get("clicks", 0), "publishes": local_vk.publishes}
+    assert result['state'] == 'confirmed', diagnostic
+    assert changed and local_vk.publishes == 1 and local_vk.stories == local_vk.uploads == 0
     assert journal['worker_code_sha256'] == worker.WORKER_SOURCE_SHA256
     assert journal['last_action_intent'] == 'click_intent' and journal['clicks'] == 1
 
@@ -347,6 +357,36 @@ def test_personal_settings_exact_native_spacing_and_story_disabled_before_one_po
         "basis": "own_wall_account_fresh_composer"}
     assert local_vk.publishes == 1 and local_vk.uploads == local_vk.stories == 0
     assert local_vk.posts[0][0] == prepare(sample.root, sample.options, OWNER, sample.snapshot)["text"]
+    before = list(local_vk.gets)
+    assert run(page, sample, local_vk) == result
+    assert local_vk.gets == before and local_vk.publishes == 1
+
+
+@pytest.mark.parametrize("budget,expected", [(1, "unknown"), (5, "confirmed")])
+def test_persisted_publish_with_delayed_response_respects_result_budget_without_resending(
+        sample, local_vk, page, budget, expected):
+    personal_wall(sample, local_vk)
+    sample.options["operation_timeout_seconds"] = budget
+    local_vk.publish_response_delay_seconds = 1.5
+    result = run(page, sample, local_vk)
+    _, journal = worker._read(sample.root, sample.payload["request_id"])
+    diagnostic = {"failure_code": journal.get("failure_code"),
+        "error_type": journal.get("private_error", {}).get("type"),
+        "last_action_intent": journal.get("last_action_intent"),
+        "clicks": journal.get("clicks", 0), "publishes": local_vk.publishes}
+    assert result["state"] == expected, diagnostic
+    assert local_vk.publishes == len(local_vk.posts) == 1
+    assert local_vk.stories == local_vk.uploads == 0
+    assert journal["clicks"] == 1 and journal["last_action_intent"] == "click_intent"
+    if budget == 1:
+        assert result["evidence"]["failure_code"] == "VK_BROWSER_PUBLISH_RESULT_UNKNOWN"
+        assert journal["state"] == "unknown" and result["evidence"]["proof"] is None
+        # Even after the original response becomes visible, the unknown journal
+        # remains authoritative until a separate read-only reconciliation.
+        page.wait_for_function("document.querySelectorAll('[data-testid=post]').length===1", timeout=5000)
+    else:
+        assert len(result["evidence"]["proof"]["reloads"]) == 2
+        assert journal["state"] == "confirmed"
     before = list(local_vk.gets)
     assert run(page, sample, local_vk) == result
     assert local_vk.gets == before and local_vk.publishes == 1

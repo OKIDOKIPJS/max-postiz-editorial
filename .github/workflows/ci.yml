@@ -121,7 +121,7 @@ jobs:
   postgres-tests:
     name: PostgreSQL integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:17
@@ -163,38 +163,52 @@ jobs:
           cache-dependency-path: |
             requirements.lock
             requirements-dev.lock
+            requirements-browser.lock
             requirements-deployment.lock
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Create checkout-owned virtual environment
+        run: |
+          python -m venv .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Install pinned dependencies
         run: |
-          python -m pip install -r requirements.lock -r requirements-dev.lock -r requirements-deployment.lock
+          python -m pip install -r requirements.lock -r requirements-dev.lock -r requirements-browser.lock -r requirements-deployment.lock
           python -m pip install --no-deps --no-build-isolation -e .
-      - name: Create test directory
-        run: python -c "from pathlib import Path; Path('.test-state').mkdir(exist_ok=True)"
+      - name: Install Chrome and browser dependencies
+        run: python -m playwright install --with-deps chrome
       - name: Verify the two owned PostgreSQL identities without mutation
         run: python scripts/check_ci_postgres.py
-      - name: Run PostgreSQL migrations, locking and reserve tests
-        run: >-
-          python -m pytest
-          tests/test_hub_postgres.py
-          tests/test_server_postgres.py
-          tests/test_automatic_repair_postgres.py
-          tests/test_article_reserve_preparation.py
-          tests/test_article_reserve_store.py
-          tests/test_hourly_reserve_controller.py
-          tests/test_reserve_preclick_recovery.py
-          tests/test_route_dispatch_postgres.py
-          tests/test_monitor_configuration_postgres.py
-          --basetemp=.test-state/pytest-postgres
-          --junitxml=.test-state/postgres.xml -q
+      - name: Run canonical full checks with PostgreSQL
+        run: python scripts/check.py --postgres
       - name: Require route and monitor PostgreSQL cases with zero skips
-        run: python scripts/check_ci_postgres.py --junit .test-state/postgres.xml
+        if: always()
+        run: |
+          python - <<'PY'
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          reports = list(Path("data/check-runs").glob("*/tests.xml"))
+          if len(reports) != 1:
+              raise SystemExit("Expected exactly one canonical pytest report")
+          subprocess.run(
+              [sys.executable, "scripts/check_ci_postgres.py", "--junit", str(reports[0])],
+              check=True,
+          )
+          PY
       - name: Save PostgreSQL test report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: postgres-report
-          path: .test-state/postgres.xml
-          if-no-files-found: warn
+          # Только канонический run, без его временных pytest-данных.
+          path: |
+            data/check-runs/*/report.json
+            data/check-runs/*/tests.xml
+            data/check-runs/*/*.log
+          if-no-files-found: error
           include-hidden-files: true
           retention-days: 7
 

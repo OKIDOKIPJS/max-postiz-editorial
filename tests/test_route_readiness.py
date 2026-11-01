@@ -17,6 +17,8 @@ from max_postiz_agent.route_readiness import _linux_support as real_linux_suppor
 
 @pytest.fixture
 def local_routes(project, monkeypatch):
+    # Read-only SQLite fixtures must not inherit the full run's separate PG endpoint.
+    monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
     monkeypatch.setattr("max_postiz_agent.route_readiness._linux_support", lambda: {
         "supported": True, "writable": True, "cgroup_kill": True, "delegation_exercised": False})
     source = project.parent / (project.name + "-original")
@@ -150,9 +152,10 @@ def test_malformed_config_reports_safe_code_and_duplicate_targets_fail(local_rou
     assert "PRIVATE" not in json.dumps(result)
 
 
-def test_readiness_rejects_unsafe_environment_before_any_local_report(local_routes, monkeypatch):
+@pytest.mark.parametrize("name", ["DATABASE_URL", "TEST_DATABASE_URL"])
+def test_readiness_rejects_unsafe_environment_before_any_local_report(local_routes, monkeypatch, name):
     project, _ = local_routes
-    monkeypatch.setenv("DATABASE_URL", "postgresql://user:secret@otherhost:5432/editorial_hub")
+    monkeypatch.setenv(name, "postgresql://user:secret@otherhost:5432/editorial_hub")
     with pytest.raises(AgentError, match="ISOLATED_DATABASE_REQUIRED"):
         readiness(project)
 

@@ -2,6 +2,9 @@
 
 import importlib.util
 import json
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
@@ -128,7 +131,7 @@ def test_local_cluster_links_are_rejected_before_connecting(tmp_path, monkeypatc
         helper().check(tmp_path, environment=env, engine_factory=lambda *_a, **_k: pytest.fail("peer cluster link connected"))
 
 
-def test_workflow_matches_both_strict_fixture_contracts_and_installs_deployment_lock():
+def test_workflow_matches_strict_fixture_contracts_and_runs_canonical_full_checks():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
     jobs = workflow["jobs"]
     job = jobs["postgres-tests"]
@@ -140,13 +143,75 @@ def test_workflow_matches_both_strict_fixture_contracts_and_installs_deployment_
         assert declared["ports"] == [f"127.0.0.1:{port}:5432"]
         assert declared["env"]["POSTGRES_DB"] == spec["database"]
         assert declared["env"]["POSTGRES_INITDB_ARGS"] == "--set=cluster_name=" + spec["cluster_name"]
-    commands = "\n".join(step.get("run", "") for step in job["steps"])
-    assert "python scripts/check_ci_postgres.py\n" in commands
-    assert "tests/test_route_dispatch_postgres.py" in commands and "tests/test_monitor_configuration_postgres.py" in commands
-    assert "python scripts/check_ci_postgres.py --junit .test-state/postgres.xml" in commands
+    assert job["timeout-minutes"] == 45
+    steps = job["steps"]
+    named = {step["name"]: step for step in steps if "name" in step}
+    locks = ["requirements.lock", "requirements-dev.lock", "requirements-browser.lock", "requirements-deployment.lock"]
+    python = next(step for step in steps if step.get("uses", "").startswith("actions/setup-python@"))
+    assert python["with"]["python-version"] == "3.12"
+    assert python["with"]["cache-dependency-path"].splitlines() == locks
+    node = next(step for step in steps if step.get("uses", "").startswith("actions/setup-node@"))
+    assert node["with"]["node-version"] == "24"
+    venv = named["Create checkout-owned virtual environment"]["run"]
+    assert "python -m venv .venv" in venv
+    assert 'echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"' in venv
+    install = named["Install pinned dependencies"]["run"]
+    tokens = shlex.split(install.splitlines()[0])
+    assert [tokens[index + 1] for index, token in enumerate(tokens) if token == "-r"] == locks
+    assert "python -m pip install --no-deps --no-build-isolation -e ." in install
+    assert named["Install Chrome and browser dependencies"]["run"] == "python -m playwright install --with-deps chrome"
+    assert named["Verify the two owned PostgreSQL identities without mutation"]["run"] == "python scripts/check_ci_postgres.py"
+    assert named["Run canonical full checks with PostgreSQL"]["run"] == "python scripts/check.py --postgres"
+    assert not any("python -m pytest" in step.get("run", "") for step in steps)
+    gate = named["Require route and monitor PostgreSQL cases with zero skips"]
+    assert gate["if"] == "always()"
+    ordered = [step.get("name") for step in steps]
+    required_order = ["Create checkout-owned virtual environment", "Install pinned dependencies",
+        "Install Chrome and browser dependencies", "Verify the two owned PostgreSQL identities without mutation",
+        "Run canonical full checks with PostgreSQL", "Require route and monitor PostgreSQL cases with zero skips",
+        "Save PostgreSQL test report"]
+    assert [ordered.index(name) for name in required_order] == sorted(ordered.index(name) for name in required_order)
+    assert steps.index(python) < ordered.index(required_order[0]) and steps.index(node) < ordered.index(required_order[0])
+    upload = named["Save PostgreSQL test report"]
+    assert upload["if"] == "always()"
+    assert upload["with"]["path"].splitlines() == ["data/check-runs/*/report.json", "data/check-runs/*/tests.xml", "data/check-runs/*/*.log"]
+    assert upload["with"]["if-no-files-found"] == "error"
     for name in ("quality", "python-tests", "postgres-tests"):
         install = next(step["run"] for step in jobs[name]["steps"] if step.get("name") == "Install pinned dependencies")
         assert "-r requirements-deployment.lock" in install
+
+
+@pytest.mark.parametrize("report_count", [0, 1, 2])
+def test_full_postgres_job_requires_one_owned_report_and_ignores_nested_fixtures(tmp_path, report_count):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    step = next(step for step in workflow["jobs"]["postgres-tests"]["steps"]
+                if step.get("name") == "Require route and monitor PostgreSQL cases with zero skips")
+    code = step["run"].split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    for index in range(report_count):
+        report = tmp_path / f"data/check-runs/run-{index}/tests.xml"
+        report.parent.mkdir(parents=True)
+        report.write_text("<testsuite/>", encoding="utf-8")
+    nested = tmp_path / "data/check-runs/fixture/pytest/nested/tests.xml"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("<testsuite/>", encoding="utf-8")
+    recorder = tmp_path / "scripts/check_ci_postgres.py"
+    recorder.parent.mkdir()
+    recorder.write_text(
+        "import json, sys\nfrom pathlib import Path\n"
+        "Path('invocation.json').write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run([sys.executable, "-B", "-c", code], cwd=tmp_path,
+                            capture_output=True, text=True, check=False, timeout=10)
+    invocation = tmp_path / "invocation.json"
+    if report_count != 1:
+        assert result.returncode != 0
+        assert "Expected exactly one canonical pytest report" in result.stderr
+        assert not invocation.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(invocation.read_text(encoding="utf-8")) == [
+            "--junit", str(Path("data/check-runs/run-0/tests.xml"))]
 
 
 @pytest.mark.parametrize("skipped", [False, True])
