@@ -1,5 +1,20 @@
 # История версий
 
+## 0.13.3 — 2026-11-01: импорт scripts в Windows CI shards
+
+- Реальный GitHub CI выявил collection error: запуск Python-файла wrapper
+  не добавлял корень checkout для импорта scripts.probe_pikabu_offline.
+  Перед pytest.main добавляется только доверенный parent wrapper, не текущая
+  произвольная папка. Pikabu-тест и полный состав collection не исключаются.
+- Subprocess regression воспроизвёл исходный exit 2 без PYTHONPATH, затем прошёл
+  с исправлением, сохранив receipt/exit/hash guards. Проверки shards: 24 passed,
+  Ruff и diff check прошли. Предыдущие локальные полные прогоны продолжаются;
+  новый полный GitHub CI проверяет итоговый SHA после этой отдельной CI-правки.
+- На предыдущем SHA GitHub подтвердил CodeQL всех трёх языков, сборку/Ruff,
+  Node на Linux/Windows и PostgreSQL 247 passed (включая новые route/monitor cases).
+  Эти результаты не подменяют обязательный новый полный CI. Рабочий сервер,
+  модели, MAX-профили и редакционные очереди не затрагиваются.
+
 ## 0.13.3 — 2026-11-01: CI и отдельные PostgreSQL-контракты
 
 - Node CI включает шестой production-build suite, сохраняя CAS hashes и требование

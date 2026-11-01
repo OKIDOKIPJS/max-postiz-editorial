@@ -152,3 +152,30 @@ def test_wrapper_propagates_actual_pytest_exit_status(tmp_path, outcome, expecte
     assert result.returncode == saved["exit_code"] == expected
     assert saved["collection_completed"] and saved["selected_count"] == (outcome != "empty")
     assert saved["full_collection_hash"] == collection_hash(saved["full_nodeids"])
+
+
+def test_wrapper_imports_checkout_scripts_without_pythonpath_from_another_cwd(tmp_path):
+    repository = tmp_path / "synthetic-checkout"
+    scripts, tests = repository / "scripts", repository / "tests"
+    scripts.mkdir(parents=True)
+    tests.mkdir()
+    wrapper = scripts / "ci_pytest_shard.py"
+    wrapper.write_bytes(WRAPPER.read_bytes())
+    (scripts / "helper.py").write_text("VALUE = 'trusted-checkout-helper'\n", encoding="utf-8")
+    fixture = tests / "test_import.py"
+    fixture.write_text("from scripts.helper import VALUE\n\ndef test_import_from_checkout():\n"
+                       "    assert VALUE == 'trusted-checkout-helper'\n", encoding="utf-8")
+    receipt = repository / ".test-state/receipt.json"
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONUTF8="1")
+    result = subprocess.run([sys.executable, str(wrapper), "--shard-index", "0", "--shard-count", "1",
+        "--shard-receipt", str(receipt), "--rootdir", str(repository), "--confcutdir", str(repository),
+        str(fixture), "-q"], cwd=tmp_path, env=environment, capture_output=True,
+        text=True, encoding="utf-8", timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    saved = json.loads(receipt.read_text(encoding="utf-8"))
+    assert saved["exit_code"] == saved["tests_failed"] == 0 and saved["collection_completed"] is True
+    assert saved["total_count"] == saved["selected_count"] == 1
+    assert saved["full_nodeids"] == saved["selected_nodeids"] == ["tests/test_import.py::test_import_from_checkout"]
+    assert saved["full_collection_hash"] == collection_hash(saved["full_nodeids"])

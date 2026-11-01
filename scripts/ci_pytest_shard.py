@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -90,6 +91,8 @@ def main(argv=None):
     receipt = ShardReceipt(args.shard_index, args.shard_count, path, pytest_args)
     receipt.write()
     # Failed tests, collection errors, interrupts and no-tests exit codes remain failures.
+    # Embedded pytest needs the wrapper's trusted checkout root, independent of cwd/PYTHONPATH.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     result = int(pytest.main(pytest_args, plugins=[receipt]))
     # Usage errors can happen before pytest_sessionfinish is called.
     receipt.receipt["exit_code"] = result
