@@ -39,6 +39,11 @@ ENGINE_FAILURE_STAGES = frozenset({
     "CLEANUP_CONTAINERS", "CLEANUP_DAEMON_STOP", "CLEANUP_ANCHOR_STOP", "CLEANUP_CGROUP",
     "CLEANUP_SLICE_STOP", "CLEANUP_SLICE_REVERT",
 })
+SCENARIO_ARTIFACTS = frozenset({"bootstrap-owner.json", "bootstrap-owner-failed.json", "exercise.json",
+    "exercise-failed.json", "snapshot.json", "snapshot-failed.json", "verify-restored.json",
+    "verify-restored-failed.json", "portal.json", "default-cmd.json", "editorial-synthetic.png"})
+SCENARIO_FILE_LIMIT = 8 * 1024 * 1024
+SCENARIO_TOTAL_LIMIT = 16 * 1024 * 1024
 BASE = "ghcr.io/gitroomhq/postiz-app@sha256:d2b37802e96757729fdea2d3d71287f841c2b619faa1cb4c21dac07df657fde1"
 PINS = {
     "postgres": "postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
@@ -86,6 +91,79 @@ def proxy_configuration(outer):
         "proxy_set_header Host $http_host;proxy_set_header X-Forwarded-Proto $scheme;}"
         "location / {proxy_pass http://127.0.0.1:4200;proxy_set_header Host $http_host;"
         "proxy_set_header X-Forwarded-Proto $scheme;}}}")
+
+
+def validate_scenario_entry(name, info, owner_uid):
+    if (name not in SCENARIO_ARTIFACTS or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1 or info.st_uid != owner_uid or info.st_mode & 0o022
+            or not 0 <= info.st_size <= SCENARIO_FILE_LIMIT):
+        raise ReadinessError("SCENARIO_EVIDENCE_ENTRY_INVALID")
+
+
+def collect_scenario_evidence(project, staging, owner_uid):
+    """Copy only finished child evidence through held directory/file descriptors."""
+    project, staging = Path(project), Path(staging)
+    if (not project.is_absolute() or not staging.is_absolute() or ".." in project.parts
+            or ".." in staging.parts or staging.is_relative_to(project)
+            or any(path.is_symlink() for base in (project, staging) for path in (base, *base.parents))):
+        raise ReadinessError("SCENARIO_EVIDENCE_PATH_INVALID")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    project_fd = os.open(project, directory_flags)
+    descriptors = [project_fd]
+    try:
+        data_fd = os.open("data", directory_flags, dir_fd=project_fd)
+        descriptors.append(data_fd)
+        source_fd = os.open("ci-public", directory_flags, dir_fd=data_fd)
+        descriptors.append(source_fd)
+        for descriptor in (data_fd, source_fd):
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner_uid or info.st_mode & 0o077:
+                raise ReadinessError("SCENARIO_EVIDENCE_OWNER_INVALID")
+        names = sorted(os.listdir(source_fd))
+        if len(names) > len(SCENARIO_ARTIFACTS):
+            raise ReadinessError("SCENARIO_EVIDENCE_ENTRY_INVALID")
+        content, total = {}, 0
+        for name in names:
+            if name not in SCENARIO_ARTIFACTS:
+                raise ReadinessError("SCENARIO_EVIDENCE_ENTRY_INVALID")
+            # O_NONBLOCK ensures a substituted FIFO cannot block root collection.
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source_fd)
+            try:
+                before = os.fstat(descriptor)
+                validate_scenario_entry(name, before, owner_uid)
+                raw = bytearray()
+                while chunk := os.read(descriptor, min(1024 * 1024, SCENARIO_FILE_LIMIT + 1 - len(raw))):
+                    raw.extend(chunk)
+                    if len(raw) > SCENARIO_FILE_LIMIT:
+                        raise ReadinessError("SCENARIO_EVIDENCE_SIZE_INVALID")
+                after = os.fstat(descriptor)
+                if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or len(raw) != before.st_size):
+                    raise ReadinessError("SCENARIO_EVIDENCE_CHANGED")
+                total += len(raw)
+                if total > SCENARIO_TOTAL_LIMIT:
+                    raise ReadinessError("SCENARIO_EVIDENCE_SIZE_INVALID")
+                content[name] = bytes(raw)
+            finally:
+                os.close(descriptor)
+        if sorted(os.listdir(source_fd)) != names:
+            raise ReadinessError("SCENARIO_EVIDENCE_CHANGED")
+        destination_fd = os.open(staging, directory_flags)
+        descriptors.append(destination_fd)
+        target = os.fstat(destination_fd)
+        if not stat.S_ISDIR(target.st_mode) or target.st_uid != os.geteuid():
+            raise ReadinessError("SCENARIO_EVIDENCE_STAGING_INVALID")
+        for name, raw in content.items():
+            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=destination_fd)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(raw)
+                output.flush()
+                os.fsync(output.fileno())
+        return {"file_count": len(content), "bytes": total, "owner_verified": True,
+                "files": {name: digest(raw) for name, raw in content.items()}, "privacy_scan_still_required": True}
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def bounded_diagnostic_output(command, environment, *, limit=65536, timeout=10):
@@ -621,18 +699,36 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
         self.report["checks"]["real_databases_redis_temporal"] = {"postgres_instances": 3, "initially_empty": True,
             "temporal_ready": True, "elasticsearch_ready": True, "network": "loopback_namespace_only"}
 
-    def nonroot(self):
-        return ["/usr/sbin/runuser", "--user", "editorial", "--", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
+    def user_environment(self):
+        return ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
                 "HOME=" + str(self.project / "data/ci-home"), "PYTHONUTF8=1",
                 "LD_LIBRARY_PATH=" + str(Path(sys.base_prefix) / "lib"),
                 "GITHUB_ACTIONS=true", "RUNNER_ENVIRONMENT=github-hosted",
                 "PLAYWRIGHT_BROWSERS_PATH=" + str(self.browsers)]
 
+    def nonroot(self):
+        return ["/usr/sbin/runuser", "--user", "editorial", "--", *self.user_environment()]
+
+    def user_run(self, command, *, name, timeout):
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,60}", name) or type(timeout) is not int or not 1 <= timeout <= 1800:
+            raise ReadinessError("SCENARIO_OWNED_UNIT_INVALID")
+        unit = "mp-native-" + name + "-" + self.engine.label_value[:12] + ".service"
+        self.unit_names.append(unit)
+        argv = ["systemd-run", "--wait", "--pipe", "--collect", "--unit=" + unit, "--uid=editorial",
+            "--service-type=exec", "--slice=" + self.engine.slice, "--property=Delegate=yes",
+            "--property=NoNewPrivileges=yes", "--property=KillMode=control-group",
+            "--property=RuntimeMaxSec=" + str(timeout), "--property=TimeoutStopSec=15",
+            "--property=MemoryMax=1G", "--property=MemorySwapMax=2G", "--property=TasksMax=1024",
+            "--property=WorkingDirectory=" + str(self.project),
+            "--property=NetworkNamespacePath=/proc/" + str(self.anchor_pid) + "/ns/net",
+            *self.user_environment(), *command]
+        return self.run(argv, name=name, timeout=timeout + 25)
+
     def scenario(self, mode):
         self.namespace_proof()
-        result = self.run(self.namespace([*self.nonroot(), str(self.python),
+        result = self.user_run([str(self.python),
             str(self.project / "deployment/linux/readiness_scenario.py"), "--root", str(self.project),
-            "--state", str(self.state_path), "--evidence", str(self.public), "--mode", mode]),
+            "--state", str(self.state_path), "--evidence", str(self.scenario_public), "--mode", mode],
             name="scenario-" + mode, timeout=600)
         self.namespace_proof()
         return result
@@ -664,7 +760,9 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
             path = self.project / name
             path.mkdir(mode=0o700, exist_ok=True)
             os.chown(path, self.user.pw_uid, self.user.pw_gid)
-        os.chown(self.public, self.user.pw_uid, self.user.pw_gid)
+        self.scenario_public = self.project / "data/ci-public"
+        self.scenario_public.mkdir(mode=0o700)
+        os.chown(self.scenario_public, self.user.pw_uid, self.user.pw_gid)
         self.state_path = self.project / "data/ci-private/state.json"
         state = {"contract": "three-platform-native-readiness-v1",
             "scope": "ephemeral_github_hosted_no_external_publications", "new_empty_runtime": True,
@@ -791,8 +889,8 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
         self.phase("production_editorial_entrypoint")
         state = json.loads(self.state_path.read_text())
         self.editorial_environment(state)
-        self.run(self.namespace([*self.nonroot(), str(self.python), "-m", "max_postiz_agent.server_cli", "--root",
-            str(self.project), "migrate"]), name="explicit-agent-migrate", timeout=120)
+        self.user_run([str(self.python), "-m", "max_postiz_agent.server_cli", "--root",
+            str(self.project), "migrate"], name="explicit-agent-migrate", timeout=120)
         unit = "max-postiz-editorial.service"
         destination = Path("/etc/systemd/system") / unit
         if destination.exists() or destination.is_symlink():
@@ -922,7 +1020,7 @@ finally:s.client.close()
 '''
         script.write_text(code)
         os.chown(script, self.user.pw_uid, self.user.pw_gid)
-        self.run(self.namespace([*self.nonroot(), str(self.python), str(script), str(self.project), str(self.state_path), str(self.public)]),
+        self.user_run([str(self.python), str(script), str(self.project), str(self.state_path), str(self.scenario_public)],
                  name="native-owner-portal", timeout=780)
         self.report["checks"]["owner_portal"] = {"max_and_vk_native_mechanism": True, "vnc_owner_cookie_guard": True,
             "account_authenticated": False, "external_delivery_verified": False, "selection_expiry_seconds": 600}
@@ -1016,7 +1114,7 @@ finally:s.client.close()
         os.chown(script, self.user.pw_uid, self.user.pw_gid)
         state["postiz_dsn"] = database
         private_write(self.state_path, state, exclusive=False)
-        self.run(self.namespace([*self.nonroot(), str(self.python), str(script), str(self.project), str(self.state_path), str(self.public)]),
+        self.user_run([str(self.python), str(script), str(self.project), str(self.state_path), str(self.scenario_public)],
                  name="default-container-owner", timeout=90)
         logs = self.engine.docker("logs", "--since", since, self.pg["postiz"][0])
         pglog = logs.stdout + logs.stderr
@@ -1123,6 +1221,16 @@ finally:s.client.close()
         self.report["accepted"] = True
 
     def final_report(self, error=None):
+        if hasattr(self, "scenario_public"):
+            try:
+                closed = json.loads((self.private / "engine.json").read_text())
+                if (closed.get("state") != "closed" or closed.get("cgroup_empty") is not True or closed.get("cleanup_errors")):
+                    raise ReadinessError("SCENARIO_PRODUCER_CLEANUP_UNCONFIRMED")
+                self.report["checks"]["scenario_artifact_collection"] = collect_scenario_evidence(
+                    self.project, self.public, self.user.pw_uid)
+            except (OSError, ValueError, ReadinessError):
+                self.report["scenario_artifact_collection_failed"] = True
+                error = error or ReadinessError("SCENARIO_EVIDENCE_COLLECTION_FAILED")
         self.report["finished_at_utc_ns"] = time.time_ns()
         if error is not None:
             message = str(error)

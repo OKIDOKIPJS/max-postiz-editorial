@@ -1,5 +1,29 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: пути native evidence и стоимость свежего VK snapshot
+
+- R6 run 41360104726 подтвердил ранний nginx probe, полную Docker/Next сборку,
+  строгие лимиты/lo-only сеть и готовность зависимостей. До owner HTTP сценарий
+  остановился на EACCES родительского каталога RUNNER_TEMP. Вывод User-сценариев
+  перенесён в собственный project/data/ci-public 0700 без изменения общих прав.
+- Сценарии, portal/default checks и явная миграция запускаются в отслеживаемых
+  transient units пользователя editorial внутри собственного slice/netns с
+  RuntimeMaxSec/KillMode. Сбор отчётов допускается после closed/empty cleanup;
+  root читает только 11 разрешённых имён через held FD, NOFOLLOW, regular/singlelink,
+  owner и size/mtime checks. Полный privacy gate и карантин сохраняются.
+- R6 полный Linux CI: 6603 passed, 26 skipped, 1 failure до Next click VK —
+  VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED, 0 publish clicks. Для сокращения
+  повторных DOM reads состояние одного элемента кешируется только внутри одного
+  атомарного evaluate. Следующий snapshot всегда новый; структура/hash, свежая
+  SQL-проверка и жёсткий лимит 1 секунды не изменены.
+- Проверки: native pure/mock 47 passed, 5 Windows FD/symlink skips; VK с coverage
+  31 passed, 218 deselected. На фиксированном DOM прежний exact hash сохранён,
+  style/rect reads сокращены с 21 до 6 для шести элементов; изменение checkbox
+  между evaluate меняет hash. Slow-authorization/pause и 16 readback races прошли.
+  Ruff/diff check и независимый review прошли. Полный новый CI и native acceptance
+  обязательны; R6 не принят целиком, portable image из него не экспортирован.
+- Рабочий сервер, аккаунты/публикации и Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: полный порядок переноса host-сервиса и proxy
 
 - В handoff явно разделены Postiz image и Python host runtime. Добавлены порядок

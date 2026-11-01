@@ -302,3 +302,111 @@ def test_diagnostic_client_is_reaped_and_pipe_closed_when_thread_start_or_cleanu
     assert calls[0] == "terminate" and "wait" in calls and process.stdout.closed
     if failure == "wait":
         assert calls == ["terminate", "wait", "kill", "wait"]
+
+
+@pytest.mark.parametrize("changed", ["name", "directory", "symlink", "fifo", "hardlink", "owner", "size", "writable"])
+def test_scenario_collector_entry_rejects_wrong_name_owner_type_links_and_bounds(native, changed):
+    import stat
+    name = "exercise.json"
+    info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_nlink=1, st_uid=123, st_size=20)
+    if changed == "name":
+        name = "../private.env"
+    elif changed in {"directory", "symlink", "fifo"}:
+        info.st_mode = {"directory": stat.S_IFDIR, "symlink": stat.S_IFLNK, "fifo": stat.S_IFIFO}[changed] | 0o600
+    elif changed == "hardlink":
+        info.st_nlink = 2
+    elif changed == "owner":
+        info.st_uid = 456
+    elif changed == "size":
+        info.st_size = native.SCENARIO_FILE_LIMIT + 1
+    else:
+        info.st_mode |= 0o020
+    with pytest.raises(native.ReadinessError, match="SCENARIO_EVIDENCE_ENTRY_INVALID"):
+        native.validate_scenario_entry(name, info, 123)
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="Held directory descriptor API is a Linux collector prerequisite")
+def test_scenario_collector_copies_only_owned_bounded_regular_files_before_privacy(native, tmp_path):
+    import os
+    project, staging = tmp_path / "project", tmp_path / "root-staging"
+    source = project / "data/ci-public"
+    source.mkdir(parents=True, mode=0o700)
+    source.parent.chmod(0o700)
+    staging.mkdir()
+    raw = b'{"fixture":"requires later privacy scan"}'
+    (source / "exercise.json").write_bytes(raw)
+    result = native.collect_scenario_evidence(project, staging, os.getuid())
+    assert result["owner_verified"] is True and result["privacy_scan_still_required"] is True
+    assert result["files"] == {"exercise.json": native.digest(raw)}
+    assert (staging / "exercise.json").read_bytes() == raw
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="No-follow/FIFO descriptor guard is Linux only")
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "nested"])
+def test_scenario_collector_never_follows_links_opens_blocking_fifo_or_copies_nested_content(native, tmp_path, kind):
+    import os
+    project, staging = tmp_path / "project", tmp_path / "root-staging"
+    source = project / "data/ci-public"
+    source.mkdir(parents=True, mode=0o700)
+    source.parent.chmod(0o700)
+    staging.mkdir()
+    if kind == "symlink":
+        unrelated = tmp_path / "unrelated.json"
+        unrelated.write_text('{"private":"outside fixture"}')
+        (source / "exercise.json").symlink_to(unrelated)
+    elif kind == "fifo":
+        os.mkfifo(source / "exercise.json")
+    else:
+        (source / "exercise.json").mkdir()
+    with pytest.raises((native.ReadinessError, OSError)):
+        native.collect_scenario_evidence(project, staging, os.getuid())
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.parametrize("timeout_failure", [False, True])
+def test_private_user_producers_are_owned_units_even_when_parent_wait_times_out(native, tmp_path, timeout_failure):
+    acceptance = native.Acceptance.__new__(native.Acceptance)
+    acceptance.project, acceptance.browsers = tmp_path / "project", tmp_path / "browsers"
+    acceptance.engine = SimpleNamespace(label_value="a" * 32, slice="editorial_readiness_fixture.slice")
+    acceptance.anchor_pid, acceptance.unit_names = 123, []
+    calls = []
+    def run(command, **options):
+        calls.append((command, options))
+        if timeout_failure:
+            raise native.subprocess.TimeoutExpired("owned-systemd-client", options["timeout"])
+        return SimpleNamespace(returncode=0)
+    acceptance.run = run
+    command = ["/owned/python", "/owned/readiness_scenario.py"]
+    if timeout_failure:
+        with pytest.raises(native.subprocess.TimeoutExpired):
+            acceptance.user_run(command, name="scenario-exercise", timeout=60)
+    else:
+        acceptance.user_run(command, name="scenario-exercise", timeout=60)
+    argv, options = calls[0]
+    assert "--uid=editorial" in argv and "--slice=editorial_readiness_fixture.slice" in argv
+    assert "--property=NetworkNamespacePath=/proc/123/ns/net" in argv
+    assert "--property=KillMode=control-group" in argv and "--property=RuntimeMaxSec=60" in argv
+    assert "--property=NoNewPrivileges=yes" in argv and "--property=Delegate=yes" in argv
+    assert argv[-2:] == command and "/usr/sbin/runuser" not in argv and options["timeout"] == 85
+    assert acceptance.unit_names == ["mp-native-scenario-exercise-aaaaaaaaaaaa.service"]
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_scenario_artifacts_are_read_only_after_kernel_cleanup_confirmation(native, tmp_path, monkeypatch, closed):
+    acceptance = failed_acceptance(native, tmp_path)
+    acceptance.report = {"accepted": True, "checks": {}}
+    acceptance.project = tmp_path / "project"
+    acceptance.scenario_public = acceptance.project / "data/ci-public"
+    acceptance.user = SimpleNamespace(pw_uid=123)
+    (acceptance.private / "engine.json").write_text(json.dumps({"state": "closed", "cgroup_empty": closed,
+                                                                "cleanup_errors": []}))
+    copied = []
+    def collect(project, staging, owner):
+        assert closed, "Never inspect child output while producers may still run"
+        copied.append((project, staging, owner))
+        return {"file_count": 0, "owner_verified": True, "privacy_scan_still_required": True}
+    monkeypatch.setattr(native, "collect_scenario_evidence", collect)
+    report, _ = acceptance.final_report()
+    assert bool(copied) is closed and report["accepted"] is closed
+    if not closed:
+        assert report["scenario_artifact_collection_failed"] is True
