@@ -158,8 +158,8 @@ imports переведены на pytest_plugins, лишнее имя сдела
 
 На исходном срезе 31 октября в этой ветке ещё не было CI workflows. После
 интеграции с main 1 ноября сохранён `.github/workflows/ci.yml`: качество и сборка,
-полный Linux pytest, четыре Windows shard, PostgreSQL и пять Node/Postiz contract
-наборов. `CI required` требует успеха всех jobs и проверяет полный Windows partition
+полный Linux pytest, четыре Windows shard, PostgreSQL и Node/Postiz contract
+наборы. `CI required` требует успеха всех jobs и проверяет полный Windows partition
 по сохранённым receipts. CodeQL выполняется отдельно; правила main не обходятся.
 Каждый результат относится к точному HEAD и его workflow, прежний локальный или
 удалённый прогон не заменяет проверку новых исходников и locks. Локальные

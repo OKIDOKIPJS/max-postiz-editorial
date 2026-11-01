@@ -58,6 +58,16 @@ function main() {
       fs.writeFileSync(path.join(fixtureAdapter, entry.name),
         fs.readFileSync(path.join(adapter, entry.name), 'utf8').replace(/\r\n/g, '\n'), { flag: 'wx' });
     }
+    // Копируем только явно требуемый публичный fixture, без runtime-каталогов.
+    for (const name of ['fixtures/production-next.config.upstream.cjs']) {
+      const destination = path.join(fixtureAdapter, name);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.writeFileSync(destination,
+        fs.readFileSync(path.join(adapter, name), 'utf8').replace(/\r\n/g, '\n'), { flag: 'wx' });
+    }
+    // Structural mock проверяет COPY этой публичной иконки; её байты не нормализуем.
+    fs.copyFileSync(path.join(adapter, 'max-browser.png'), path.join(fixtureAdapter, 'max-browser.png'),
+      fs.constants.COPYFILE_EXCL);
     const filename = path.join(temporary, 'max-browser.guard.js');
     fs.writeFileSync(filename, output, { flag: 'wx' });
     const suites = [
@@ -66,6 +76,7 @@ function main() {
       'test-editorial-contract.cjs',
       'test-provider-reliability-build.cjs',
       'test-provider-unavailable.cjs',
+      'test-production-build.cjs',
     ];
     assert.deepEqual(fs.readdirSync(adapter).filter(name => /^test-.*\.cjs$/.test(name)).sort(),
       [...suites].sort(), 'Update the CI runner when adding a Node contract suite');

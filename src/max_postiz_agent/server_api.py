@@ -103,6 +103,9 @@ def editorial_app(core, store=None):
             raise AgentError("EDITORIAL_ACCESS_DENIED", 403)
         return "postiz:" + expected[1]
 
+    from .routes_api import attach_route_api
+    attach_route_api(app, core, owner)
+
     @app.get("/health")
     def health():
         return {"status": "ready", "version": __version__, "interface": "postiz_only",

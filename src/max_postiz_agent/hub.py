@@ -22,6 +22,42 @@ ACTIVE = {"pending", "sending", "unknown", "scheduled", "awaiting_manual", "retr
 FINAL = {"published", "owner_attested", "cancelled", "failed"}
 
 
+def _route_env_digest(root):
+    """Private credential-generation fence; neither bytes nor digest are reported."""
+    path = root / ".env.local"
+    try:
+        if path.is_symlink() or path.is_junction():
+            raise OSError
+        if not path.exists():
+            return None
+        with path.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise OSError
+        return hashlib.sha256(raw).digest()
+    except OSError:
+        raise AgentError("ROUTE_RUNTIME_RESTART_REQUIRED", 409) from None
+
+
+def _route_runtime_identity(settings, publishing, env_digest):
+    return fingerprint({"settings_hash": settings.hash, "app": settings.app, "publishing": publishing,
+                        "env_generation": env_digest.hex() if env_digest is not None else None})
+
+
+def route_runtime_generation(root):
+    """Opaque private IPC fence; read config only, never connect to DB or sync."""
+    from .config import Settings
+
+    try:
+        root = root.resolve()
+        settings = Settings.load(root)
+        publishing = parse_json((root / "config/publishing.json").read_text(encoding="utf-8"))
+        validate_schema(root, "publishing.schema.json", publishing)
+        return _route_runtime_identity(settings, publishing, _route_env_digest(root))
+    except (AgentError, OSError, ValueError, TypeError, UnicodeError):
+        raise AgentError("ROUTE_RUNTIME_RESTART_REQUIRED", 409) from None
+
+
 def _machine_exception_notes(value):
     if not isinstance(value, str):
         raise AgentError("ARTICLE_MACHINE_EXCEPTION_NOTES_REQUIRED", 409)
@@ -33,13 +69,17 @@ def _machine_exception_notes(value):
 
 
 class HubService(Service):
-    def __init__(self, settings, db, editor=None, publisher=None, http=None, postiz=None, bootstrap_targets=True):
+    def __init__(self, settings, db, editor=None, publisher=None, http=None, postiz=None, bootstrap_targets=True,
+                 route_publishers=None):
+        self._route_env_baseline = _route_env_digest(settings.root)
         super().__init__(settings, db, editor, publisher, http)
         path = settings.root / "config/publishing.json"
         self.publishing = parse_json(path.read_text(encoding="utf-8")) if path.exists() else {
             "schema_version": "1.0", "postiz": {}, "targets": [], "tasks": []}
         validate_schema(settings.root, "publishing.schema.json", self.publishing)
         self.postiz = postiz or PostizClient(self.publishing["postiz"])
+        from .platform_routes import PlatformRoutes
+        self.routes = PlatformRoutes(self, route_publishers)
         from .max_bridge import MaxBridge
         self.bridge = MaxBridge(self)
         from .reddit_intake import RedditIntake
@@ -73,8 +113,8 @@ class HubService(Service):
             for value in self.publishing["targets"]:
                 if value["id"] in ids:
                     raise AgentError("DUPLICATE_TARGET_ID")
-                if value["route"].startswith("max_") and value["platform"] != "max":
-                    raise AgentError("TARGET_ROUTE_INVALID")
+                from .platform_routes import validate_route
+                validate_route(value)
                 if value["enabled"] and (not value["destination"] or value["route"] == "disabled"):
                     raise AgentError("TARGET_DESTINATION_REQUIRED")
                 self.settings.channel(value["profile_id"])
@@ -272,6 +312,10 @@ class HubService(Service):
         result.update(body=v.body, title=v.title)
         policy = json.loads(json.dumps(profile))
         policy["publication"]["max_chars"] = t.options.get("max_chars", 3500)
+        owner_original = v.metadata_json.get("origin") == "owner_original"
+        if owner_original:
+            from .owner_original import require_attestation
+            require_attestation(self, s, v, t)
         original = v.metadata_json.get("origin") == "postiz_max_bridge" and not v.sources
         attested = v.metadata_json.get("original_attested_hash") == fingerprint({"body": v.body, "media": v.media})
         if original and not attested:
@@ -286,7 +330,8 @@ class HubService(Service):
                 # Проверка обязательной лицензии действует и при отсутствии чисел.
                 licensed_content = {**result, "body": candidate_body(v, source)
                                     + "\n\nИсточник: " + source["url"]}
-        checks = validate_draft(result, materials, policy, model_verified=False, allow_original=original and attested)
+        checks = validate_draft(result, materials, policy, model_verified=False,
+                                allow_original=(original and attested) or owner_original)
         if "UNSUPPORTED_NUMBER" in checks and licensed_content is not None:
             # Версия CC BY 4.0 — фиксированная атрибуция, не числовой факт
             # статьи. Убираем только точный проверенный footer; числа самого
@@ -303,6 +348,7 @@ class HubService(Service):
         if t.platform == "pikabu":
             from .pikabu_metadata import metadata
             metadata(v.title, v.metadata_json)
+        self.routes.validate(t, self.snapshot(v, t))
 
     def hourly_review_details(self, variant_id):
         from .human_review import details
@@ -507,7 +553,9 @@ class HubService(Service):
         t = self._target(s, v.target_id)
         a = s.get(TargetApproval, d.approval_id)
         current = fingerprint({"content": self.snapshot(v, t), "due_at": d.due_at})
-        if not a or a.revoked or a.snapshot_hash != current or d.snapshot_hash != current:
+        frozen = fingerprint({"content": d.snapshot, "due_at": d.due_at})
+        if (not a or a.revoked or a.snapshot_hash != current or d.snapshot_hash != current
+                or frozen != current or d.revision != v.revision or a.revision != v.revision):
             raise AgentError("APPROVAL_STALE", 409)
         if hourly(v):
             automatic = v.metadata_json.get("approval_mode") == "automatic"
@@ -541,6 +589,82 @@ class HubService(Service):
         self._quality(s, v, t)
         return v, t
 
+    def route_runtime_generation(self):
+        """Captured in memory for parent→worker IPC; never return in public state."""
+        return _route_runtime_identity(self.settings, self.publishing, self._route_env_baseline)
+
+    def _assert_current_route_runtime(self):
+        """Старый worker не отменяет новую работу и не подхватывает новые secrets."""
+        from .config import Settings
+
+        try:
+            configured = Settings.load(self.settings.root)
+            publishing = parse_json((self.settings.root / "config/publishing.json").read_text(encoding="utf-8"))
+            validate_schema(self.settings.root, "publishing.schema.json", publishing)
+            if (configured.hash != self.settings.hash
+                    or fingerprint(configured.app) != fingerprint(self.settings.app)
+                    or fingerprint(publishing) != fingerprint(self.publishing)
+                    or _route_env_digest(self.settings.root) != self._route_env_baseline):
+                raise ValueError
+        except (AgentError, OSError, ValueError, TypeError, UnicodeError):
+            raise AgentError("ROUTE_RUNTIME_RESTART_REQUIRED", 409) from None
+        return configured, publishing
+
+    def authorize_dispatch_fence(self, dispatch_id, *, expected_owner, expected_snapshot_hash,
+                                 min_lease_seconds=3):
+        """Последний свежий fence после quality; без media, моделей и активации config."""
+        from .server_state import require_running
+
+        if (not isinstance(expected_owner, str) or not expected_owner
+                or not isinstance(expected_snapshot_hash, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", expected_snapshot_hash)
+                or isinstance(min_lease_seconds, bool) or not isinstance(min_lease_seconds, (int, float))
+                or not math.isfinite(min_lease_seconds) or min_lease_seconds < 1):
+            raise AgentError("ROUTE_DISPATCH_FENCE_INVALID", 409)
+        configured, publishing = self._assert_current_route_runtime()
+        # Отдельный session исключает старые paused/revoked/owner из identity map
+        # транзакции, в которой только что выполнялись длительные quality checks.
+        with self.db.session() as session:
+            found = session.execute(select(Dispatch, Variant, Target, TargetApproval, Draft)
+                .join(Variant, Dispatch.variant_id == Variant.id)
+                .join(Target, Variant.target_id == Target.id)
+                .join(TargetApproval, Dispatch.approval_id == TargetApproval.id)
+                .join(Draft, Variant.draft_id == Draft.id)
+                .where(Dispatch.id == dispatch_id)).one_or_none()
+            if found is None:
+                raise AgentError("ROUTE_DISPATCH_LEASE_LOST", 409)
+            dispatch, variant, target, approval, draft = found
+            values = [value for value in publishing["targets"] if value["id"] == target.id]
+            if (len(values) != 1 or target.binding_hash != fingerprint(
+                    {"target": values[0], "editorial_config": configured.hash})
+                    or variant.binding_hash != target.binding_hash or variant.config_hash != configured.hash):
+                raise AgentError("ROUTE_CONFIGURATION_CHANGED", 409)
+            if target.paused:
+                raise AgentError("TARGET_PAUSED", 409)
+            if not target.enabled:
+                raise AgentError("TARGET_DISABLED", 409)
+            profile = configured.channel(target.profile_id)
+            if not profile["enabled"] or profile["publication"]["mode"] == "dry_run":
+                raise AgentError("PROFILE_NOT_PUBLISHABLE", 409)
+            current = fingerprint({"content": self.snapshot(variant, target), "due_at": dispatch.due_at})
+            frozen = fingerprint({"content": dispatch.snapshot, "due_at": dispatch.due_at})
+            if (approval.revoked or approval.variant_id != variant.id
+                    or approval.revision != variant.revision or dispatch.revision != variant.revision
+                    or approval.scheduled_at != dispatch.due_at
+                    or draft.revision != variant.source_revision or draft.config_id != variant.config_hash
+                    or dispatch.snapshot_hash != expected_snapshot_hash
+                    or approval.snapshot_hash != expected_snapshot_hash
+                    or current != expected_snapshot_hash or frozen != expected_snapshot_hash):
+                raise AgentError("APPROVAL_STALE", 409)
+            self.bridge.check_approval(session, variant, dispatch.due_at)
+            require_running(self, session)
+            stamp = now()
+            if (dispatch.state != "sending" or dispatch.owner != expected_owner
+                    or not math.isfinite(dispatch.lease_until) or dispatch.lease_until <= stamp + min_lease_seconds
+                    or not math.isfinite(dispatch.due_at) or dispatch.due_at > stamp):
+                raise AgentError("ROUTE_DISPATCH_LEASE_LOST", 409)
+            return dispatch.owner
+
     def export_manual(self, d, target):
         root = inside(self.settings.root, "data/exports/" + d.id)
         root.mkdir(parents=True, exist_ok=True)
@@ -563,6 +687,9 @@ class HubService(Service):
         require_running(self)
         self.bridge.guard_send(d, t)
         snap = d.snapshot
+        from .platform_routes import DIRECT_ROUTES
+        if t.route in DIRECT_ROUTES:
+            return self.routes.publish(d, t)
         if t.route == "manual":
             return self.export_manual(d, t)
         if t.route in {"max_browser", "max_api"}:
@@ -588,7 +715,41 @@ class HubService(Service):
             return Delivery("scheduled", ident)
         raise AgentError("TARGET_ROUTE_UNSUPPORTED")
 
-    def publish_due(self, *, human_hourly_only=False, hourly_only=False):
+    def _expire_send_lease(self, session, row, *, actor="dispatch_worker", stamp=None):
+        stamp = now() if stamp is None else stamp
+        if (not math.isfinite(row.lease_until) or row.lease_until > stamp
+                or not (row.state == "sending" or row.state == "unknown"
+                        and row.error == "SEND_LEASE_EXPIRED" and row.owner is not None)):
+            return False
+        previous_owner, previous_lease, previous_state = row.owner, row.lease_until, row.state
+        row.state, row.error, row.owner, row.lease_until = "unknown", "SEND_LEASE_EXPIRED", None, 0
+        variant = self._variant(session, row.variant_id)
+        if variant.revision == row.revision:
+            variant.state = "unknown"
+        self.db.audit(session, actor, "dispatch_send_lease_expired", row.id,
+                      snapshot_hash=row.snapshot_hash, previous_owner=previous_owner,
+                      previous_lease_until=previous_lease, previous_state=previous_state,
+                      external_mutations=0)
+        return True
+
+    def _expire_send_leases(self, *, scope=None, dispatch_id=None, actor="dispatch_worker"):
+        """Фехтуем только истёкшего отправителя; unknown никогда не становится retry."""
+        stamp, expired = now(), 0
+        with self.db.session.begin() as session:
+            query = select(Dispatch).join(Variant).where(
+                Dispatch.lease_until <= stamp,
+                or_(Dispatch.state == "sending",
+                    (Dispatch.state == "unknown") & (Dispatch.error == "SEND_LEASE_EXPIRED")
+                    & Dispatch.owner.is_not(None)))
+            if scope is not None:
+                query = query.where(Dispatch.id.in_(scope))
+            if dispatch_id is not None:
+                query = query.where(Dispatch.id == dispatch_id)
+            for row in session.scalars(query.with_for_update(skip_locked=True, of=(Variant, Dispatch))):
+                expired += self._expire_send_lease(session, row, actor=actor, stamp=stamp)
+        return expired
+
+    def publish_due(self, *, human_hourly_only=False, hourly_only=False, platform_routes_only=False):
         from .server_state import require_running
         try:
             require_running(self)
@@ -598,6 +759,12 @@ class HubService(Service):
             raise
         completed = 0
         scope = None
+        if platform_routes_only:
+            from .platform_routes import DIRECT_ROUTES
+            if human_hourly_only or hourly_only:
+                raise AgentError("DISPATCH_SCOPE_INVALID")
+            scope = (select(Dispatch.id).join(Variant).join(Target)
+                     .where(Target.route.in_(DIRECT_ROUTES)))
         if human_hourly_only or hourly_only:
             from .article_cycle import HourlyArticleCycle
             from .human_review import HUMAN_ACTORS
@@ -619,11 +786,7 @@ class HubService(Service):
                              [fingerprint(value) for value in article_cycle._policies()]),
                          TargetApproval.actor.in_(actors), TargetApproval.revoked.is_(False)))
         # Expired send leases are uncertain; never select them for a second send.
-        with self.db.session.begin() as s:
-            expired = update(Dispatch).where(Dispatch.state == "sending", Dispatch.lease_until < now())
-            if scope is not None:
-                expired = expired.where(Dispatch.id.in_(scope))
-            s.execute(expired.values(state="unknown", error="SEND_LEASE_EXPIRED"))
+        self._expire_send_leases(scope=scope)
         for _ in range(50):
             with self.db.session.begin() as s:
                 try:
@@ -642,6 +805,12 @@ class HubService(Service):
                 d = s.scalar(query.with_for_update(skip_locked=True, of=(Variant, Dispatch, Target)))
                 if not d:
                     break
+                from .platform_routes import DIRECT_ROUTES
+                selected_target = self._target(s, self._variant(s, d.variant_id).target_id)
+                if selected_target.route in DIRECT_ROUTES:
+                    # Проверяем ДО quality/cancel/claim: новый корректный approval
+                    # не должен быть отменён процессом со старыми settings/secrets.
+                    self._assert_current_route_runtime()
                 try:
                     _, t = self._valid_dispatch(s, d)
                 except AgentError as exc:
@@ -657,20 +826,44 @@ class HubService(Service):
             error = None
             try:
                 delivery = self._send(d, t)
+                if delivery.state == "unknown" and delivery.evidence:
+                    candidate = delivery.evidence.get("failure_code")
+                    if isinstance(candidate, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", candidate):
+                        error = candidate
             except AgentError as exc:
                 error = exc.code
-                uncertain = {"POSTIZ_UNKNOWN", "BROWSER_OPERATION_UNCONFIRMED"}
+                uncertain = {"POSTIZ_UNKNOWN", "BROWSER_OPERATION_UNCONFIRMED",
+                             "TELEGRAM_UNKNOWN", "VK_UNKNOWN", "PIKABU_BROWSER_UNKNOWN",
+                             "PIKABU_OPERATION_UNCONFIRMED", "PIKABU_BROWSER_OPERATION_UNKNOWN",
+                             "VK_BROWSER_OPERATION_UNKNOWN"}
                 delivery = Delivery("unknown" if exc.code in uncertain else "failed")
             except Exception:
                 error, delivery = "DISPATCH_UNCONFIRMED", Delivery("unknown")
+            self._expire_send_leases(dispatch_id=ident)
             with self.db.session.begin() as s:
-                row = s.get(Dispatch, ident)
-                if row.owner != self.worker_id:
+                locked_variant = self._variant(s, d.variant_id, lock=True)
+                s.scalar(select(Target).where(Target.id == locked_variant.target_id).with_for_update())
+                row = s.scalar(select(Dispatch).where(Dispatch.id == ident).with_for_update())
+                self._expire_send_lease(s, row)
+                if row.owner != self.worker_id or row.state != "sending":
+                    # Старый процесс может вернуть уже известную квитанцию после
+                    # expiry. Сохраняем только след для read-only сверки, без
+                    # published/verified и без восстановления права отправителя.
+                    if (row.state == "unknown" and row.error == "SEND_LEASE_EXPIRED"
+                            and row.owner is None and row.snapshot_hash == d.snapshot_hash):
+                        if row.external_id is None and delivery.external_id:
+                            row.external_id = delivery.external_id
+                            row.permalink = delivery.permalink
+                        self.db.audit(s, "platform_transport", "late_delivery_evidence", row.id,
+                                      snapshot_hash=row.snapshot_hash, result=delivery.state,
+                                      external_id=delivery.external_id, evidence=delivery.evidence or {},
+                                      promoted=False)
                     continue
                 row.state, row.external_id, row.permalink = delivery.state, delivery.external_id, delivery.permalink
                 if row.state == "confirmed":
                     row.state = "published"
-                    row.verified = getattr(self.publisher, "mode", "fake") != "fake"
+                    row.verified = (delivery.verified if delivery.verified is not None else
+                                    getattr(self.publisher, "mode", "fake") != "fake")
                     completed += 1
                 if row.state == "retry_wait":
                     if row.attempts >= 3:
@@ -682,6 +875,10 @@ class HubService(Service):
                 self._variant(s, row.variant_id).state = row.state
                 attempt = DispatchAttempt(dispatch_id=row.id, result=row.state, error=error, created_at=now())
                 s.add(attempt)
+                if delivery.evidence is not None:
+                    self.db.audit(s, "platform_transport", "delivery_evidence", row.id,
+                                  evidence=delivery.evidence, verified=row.verified,
+                                  snapshot_hash=row.snapshot_hash)
                 from .human_review import hourly
                 if row.state == "published" and row.verified and hourly(self._variant(s, row.variant_id)):
                     self._target(s, self._variant(s, row.variant_id).target_id).paused = True
@@ -1061,5 +1258,6 @@ class HubService(Service):
         return self.publish_due(hourly_only=True)
 
     def close(self):
+        self.routes.close()
         self.postiz.close()
         super().close()
