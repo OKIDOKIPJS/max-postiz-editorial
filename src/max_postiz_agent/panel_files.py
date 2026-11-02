@@ -45,6 +45,8 @@ def project_path(service, value):
 def private_roots(root, app, purpose="file"):
     # Стандартный каталог остаётся приватным и после переноса активного профиля.
     paths = ["data/max-browser", app.get("max", {}).get("browser", {}).get("profile_dir"),
+             "data/route-admin-private", "data/owner-browser-selection.json", "data/owner-browser-result.json",
+             "data/editorial-restart-request.json", "data/editorial-restart-claims",
              "data/monitor", "data/monitor-browser", "data/vk-browser", "data/pikabu-browser",
              "config/monitor.json"]
     if purpose != "private":
@@ -107,7 +109,13 @@ def browse(service, value="", purpose="file"):
     allowed = extensions(purpose)
     root = service.settings.root.resolve()
     roots = private_roots(root, service.settings.app, purpose)
-    path = project_path(service, value)
+    # Canonical containment is explicit before the first filesystem query.
+    # Include the separator so a sibling named like the project is not accepted.
+    checked = os.path.normcase(str(project_path(service, value)))
+    root_text = os.path.normcase(str(root))
+    if checked != root_text and not checked.startswith(root_text.rstrip(os.sep) + os.sep):
+        raise AgentError("PATH_OUTSIDE_PROJECT", 403)
+    path = Path(checked)
     while not path.is_dir() and path != root:
         path = path.parent
     if not browsable(service, path, purpose, roots=roots):

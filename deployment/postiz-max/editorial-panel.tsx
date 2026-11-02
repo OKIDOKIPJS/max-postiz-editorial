@@ -1,7 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { EditorialForm, EditorialSettings, formFromSettings, safeSourceUrl, settingsFromForm } from './editorial-form';
+import { ChannelForm, EditorialForm, EditorialSettings, ManagedPlatform, OriginalMedia, RouteSetup, SetupTarget,
+  channelForm, channelTarget, formFromSettings, imageSha256, originalInput, originalMedia,
+  safeSourceUrl, settingsFromForm } from './editorial-form';
 import styles from './editorial.module.css';
 
 // noVNC строит WebSocket URL от корня origin; префикс закрытого прокси задаём явно.
@@ -38,7 +40,7 @@ export type RouteInventory = { targets: RouteTarget[]; variants: RouteVariant[];
 export type RouteDetails = { variant_id: string; target_id: string; title: string; body: string; revision: number;
   content_hash: string; destination: string; platform: string; route: string; binding_hash: string;
   metadata: Record<string, unknown>; media: Record<string, unknown>[]; sources: Record<string, unknown>[];
-  read_only: true; manual_approval_allowed: boolean };
+  read_only: true; manual_approval_allowed: boolean; media_policy?: { id: string; label: string; description: string } | null };
 export type RouteAction = { action: 'inspect' | 'details' | 'preflight' | 'preview' | 'approve' | 'pause' | 'resume' | 'reconcile'; id: string;
   revision?: number; content_hash?: string; due_at?: number };
 type RouteActionHandler = (action: RouteAction) => Promise<boolean>;
@@ -102,6 +104,56 @@ const errors: Record<string, string> = {
   ROUTE_LIST_SIZE_INVALID: 'Список превышает допустимый размер ответа. Материалы и история сохранены.',
   EDITORIAL_ROUTE_LIST_INVALID: 'Неверная страница списка. Обновите статус.',
   ROUTE_LIST_INVALID: 'Неверная страница списка. Обновите статус.',
+  EDITORIAL_ROUTE_ADMIN_INVALID: 'Проверьте поля подключения или материала. Настройки не сохранены.',
+  EDITORIAL_CHANNEL_INVALID: 'Проверьте идентификатор, профиль, адрес канала и параметры подключения.',
+  EDITORIAL_ORIGINAL_INVALID: 'Укажите заголовок до 300 знаков, текст до 40 000 знаков и не более одного изображения.',
+  EDITORIAL_ORIGINAL_MEDIA_INVALID: 'Изображение не прошло проверку. Выберите исходный PNG или JPEG заново.',
+  EDITORIAL_UPLOAD_INVALID: 'Выберите PNG или JPEG размером не более 10 МБ.',
+  ROUTE_ADMIN_BUSY: 'Канал занят отправкой или сверкой. Настройки и материал не изменены.',
+  ROUTE_ADMIN_CONFLICT: 'Данные уже изменились. Обновите подключения перед сохранением.',
+  ROUTE_ADMIN_RECOVERY_REQUIRED: 'Предыдущее сохранение требует сверки. Каналы остаются на паузе. После восстановления доступности БД повторите действие. Несовпадающие данные автоматически не заменяются.',
+  ROUTE_ADMIN_PAUSE_REQUIRED: 'Сначала приостановите канал. Сохранение не включает отправку.',
+  ROUTE_RUNTIME_RESTART_REQUIRED: 'Настройки сохранены. Перезапустите редакционный сервис перед проверкой подключения.',
+  OWNER_ORIGINAL_ATTESTATION_REQUIRED: 'Подтвердите авторство текста и права на выбранное изображение.',
+  OWNER_ORIGINAL_ALREADY_EXISTS: 'Такой авторский материал уже сохранён. Найдите его в списке черновиков.',
+  OWNER_ORIGINAL_RUSSIAN_REQUIRED: 'Материал должен быть на русском языке.',
+  OWNER_ORIGINAL_ATTESTATION_STALE: 'Изменённый материал требует нового подтверждения авторства.',
+  BROWSER_LOGIN_REQUIRED: 'Выполните вход в выбранный аккаунт, затем отдельно проверьте доступ.',
+  BROWSER_SERVER_SESSION_REQUIRED: 'Для этого подключения ещё требуется вход владельца на сервере.',
+  TARGET_BINDING_CONFLICT: 'Подключение уже изменилось. Выберите канал заново и проверьте актуальные параметры.',
+  ROUTE_CONFIG_CONFLICT: 'Подключения изменились. Обновите список и выберите канал заново.',
+  ROUTE_CONFIGURATION_CHANGED: 'Сохранённые параметры не совпадают с действующим подключением. Требуется обновление состояния.',
+  TARGET_PAUSE_REQUIRED: 'Перед этим действием поставьте выбранный канал на паузу.',
+  ROUTE_ADMIN_OPTIONS_INVALID: 'Параметры не подходят выбранной площадке.',
+  ROUTE_ADMIN_TARGET_UNSUPPORTED: 'Это подключение настраивается отдельно. Выберите MAX, Telegram или личную страницу VK.',
+  LOGIN_SELECTION_ACTIVE: 'Окно входа уже открыто. Завершите вход и дождитесь закрытия сеанса перед изменениями.',
+  LOGIN_SELECTION_STALE: 'Подготовленный вход устарел. Обновите подключение и подготовьте новое окно.',
+  LOGIN_SELECTION_INVALID: 'Не удалось подтвердить выбранное окно входа. Подготовьте вход заново.',
+  CREDENTIAL_FORMAT_INVALID: 'Проверьте токен Telegram-бота. Значение не сохранено.',
+  CREDENTIAL_ENV_NOT_DEDICATED: 'Для этого канала ещё не настроено отдельное хранение токена.',
+  CREDENTIAL_TARGET_INVALID: 'Токен можно сохранить только для выбранного Telegram-канала.',
+  MEDIA_CONTENT_INVALID: 'Изображение повреждено или его формат не поддерживается. Выберите PNG или JPEG.',
+  MEDIA_HASH_CHANGED: 'Байты изображения не совпали с выбранным файлом. Загрузите исходный файл заново.',
+  MEDIA_TYPE_MISMATCH: 'Содержимое изображения не совпало с форматом PNG или JPEG.',
+  ORIGINAL_DISPATCH_HISTORY_IMMUTABLE: 'Этот материал уже участвовал в отправке. Сохранённую историю нельзя редактировать.',
+  OWNER_ORIGINAL_REQUIRED: 'Здесь редактируются только собственные авторские материалы.',
+  REVISION_CONFLICT: 'Версия материала уже изменилась. Откройте актуальный материал перед правкой.',
+  SOURCE_REVISION_STALE: 'Исходная версия материала изменилась. Обновите полный материал.',
+  BROWSER_PROFILE_MISSING: 'Для аккаунта ещё не сохранён браузерный профиль. Выполните вход владельца.',
+  BROWSER_CHANNEL_NOT_ALLOWED: 'Канал MAX не включён в разрешённый список. Выберите сохранённый разрешённый канал.',
+  BROWSER_DEPENDENCY_MISSING: 'На сервере ещё не установлены необходимые компоненты браузера.',
+  BROWSER_CGROUP_DELEGATION_REQUIRED: 'Для браузера на сервере ещё не настроено безопасное завершение процесса.',
+  CREDENTIAL_MISSING: 'Токен ещё не сохранён. Введите его в форме подключения.',
+  DOM_CONTRACT_NOT_VERIFIED: 'Публикация через этот редактор ещё не подтверждена проверкой.',
+  VK_BROWSER_DOM_CONTRACT_INCOMPLETE: 'Редактор VK требует проверки совместимости перед отправкой.',
+  VK_BROWSER_MEDIA_EVIDENCE_UNVERIFIED: 'Публикация изображений VK ещё не прошла необходимую проверку.',
+  TARGET_DISABLED: 'Подключение выключено. Включите его в настройках; канал останется на паузе.',
+  PROFILE_DISABLED: 'Редакционный профиль выключен. Выберите включённый профиль.',
+  PROFILE_DRY_RUN: 'Этот редакционный профиль работает без отправки. Выберите другой профиль.',
+  EDITORIAL_MAINTENANCE_BUSY: 'Есть незавершённая подготовка или отправка. Применение настроек пока недоступно; дождитесь завершения или сверки.',
+  POSTIZ_NEAR_QUEUE_RESTART_BLOCKED: 'В ближайшие пять минут запланирована публикация. Примените настройки после неё.',
+  RESTART_ALREADY_REQUESTED: 'Запрос применения настроек уже принят. Дождитесь перезапуска и обновите подключения.',
+  RESTART_SELECTION_INVALID: 'Не удалось подтвердить запрос применения настроек. Обновите подключения.',
 };
 export function errorText(code: string) { return errors[code] || `Действие остановлено. Код: ${code}`; }
 export function readableTime(value?: string | number) {
@@ -187,6 +239,14 @@ export function routeDetailsResult(value: unknown, variant: RouteVariant, target
       !record(result.metadata) || !Array.isArray(result.media) || !result.media.every(record) ||
       result.media.length !== variant.media_count || !Array.isArray(result.sources) || !result.sources.every(record) ||
       result.sources.length !== variant.source_count) throw new Error('EDITORIAL_ROUTE_DETAILS_INVALID');
+  if (result.media_policy !== undefined && result.media_policy !== null) {
+    const policy = result.media_policy;
+    if (target.platform !== 'vk' || target.route !== 'vk_browser' || variant.media_count !== 1 || !record(policy) ||
+        Object.keys(policy).sort().join(',') !== 'description,id,label' ||
+        !['exact-bytes-v1', 'exact-pixels-v1', 'native-asset-lineage-v1', 'native-uniform-edge-lineage-v1'].includes(policy.id) ||
+        typeof policy.label !== 'string' || !policy.label || policy.label.length > 200 ||
+        typeof policy.description !== 'string' || !policy.description || policy.description.length > 2000) throw new Error('EDITORIAL_ROUTE_DETAILS_INVALID');
+  }
   return result;
 }
 export function routeListPath(pages: RoutePages): string {
@@ -245,9 +305,214 @@ export function NasaRatingField({ mixed = false }: { mixed?: boolean } = {}) {
   </label>;
 }
 
-export function RouteDraft({ variant, target, pending, onAction, onPreview, details, onDetails }: {
+type AdminHandler = (body: Record<string, unknown>) => Promise<any>;
+export const adminErrorCode = (reason: unknown, fallback = 'EDITORIAL_REQUEST_FAILED') => reason instanceof Error &&
+  Object.prototype.hasOwnProperty.call(errors, reason.message) ? reason.message : fallback;
+export function ChannelSetup({ setup, pending, onAdmin }: { setup: RouteSetup; pending: boolean; onAdmin: AdminHandler }) {
+  const [selected, setSelected] = useState('');
+  const [form, setForm] = useState<ChannelForm>(channelForm());
+  const [configHash, setConfigHash] = useState(setup.config_hash);
+  const [bindingHash, setBindingHash] = useState<string | null>(null);
+  const [token, setToken] = useState('');
+  const [error, setError] = useState('');
+  const [login, setLogin] = useState<{ target_id: string; login_url: string; expires_at: number } | null>(null);
+  const current = setup.targets.find(target => target.id === selected);
+  const change = (key: keyof ChannelForm, value: string | boolean) => setForm(previous => ({ ...previous, [key]: value }));
+  const select = (id: string) => { const target = setup.targets.find(item => item.id === id);
+    setSelected(id); setForm(channelForm(target)); setConfigHash(setup.config_hash); setBindingHash(target?.binding_hash ?? null);
+    setToken(''); setLogin(null); setError(''); };
+  const stale = configHash !== setup.config_hash || Boolean(current && current.binding_hash !== bindingHash);
+  const configure = async () => {
+    setError(''); setLogin(null);
+    try { const target = channelTarget(form);
+      if (!setup.profiles.some(profile => profile.id === target.profile_id && profile.enabled && profile.publication_mode !== 'dry_run')) throw new Error('EDITORIAL_CHANNEL_INVALID');
+      if (target.platform === 'max' && !setup.max_channels.some(channel => channel.id === target.destination)) throw new Error('BROWSER_CHANNEL_NOT_ALLOWED');
+      if (stale) throw new Error('ROUTE_ADMIN_CONFLICT');
+      const result = await onAdmin({ action: 'configure_target', id: form.id, expected_config_hash: configHash,
+        expected_binding_hash: bindingHash, target });
+      setSelected(form.id); setConfigHash(result.config_hash); setBindingHash(result.binding_hash); setToken('');
+    } catch (reason) { setError(adminErrorCode(reason, 'EDITORIAL_CHANNEL_INVALID')); }
+  };
+  return <div className={styles.workspace}>
+    <h3>Подключить или изменить канал</h3>
+    <label className={styles.field}><span>Подключение</span><select value={selected} disabled={pending} onChange={event => select(event.target.value)}>
+      <option value="">Новый канал</option>{setup.targets.map(target => <option value={target.id} key={target.id}>
+        {routePlatform(target.platform)} · {target.destination} ({target.id})</option>)}</select></label>
+    {current && <div className={styles.connectionStatus}>
+      <p>{current.paused ? 'Канал на паузе' : 'Канал работает'} · {current.enabled ? 'Подключение включено' : 'Подключение выключено'}</p>
+      <p className={styles.muted}>{current.diagnostics.local_prerequisites === true ? 'Локальные проверки подключения пройдены. Доставку проверяют отдельно.' : 'Подключение требует настройки или проверки.'}</p>
+      {current.diagnostics.blocked_reasons?.map(code => <p key={code} className={styles.muted}>{errorText(code)}</p>)}
+    </div>}
+    {error && <div role="alert" className={styles.notice}>{errorText(error)}</div>}
+    {stale && <p className={styles.notice}>Подключения изменились. Выберите канал заново, чтобы загрузить актуальные настройки перед сохранением.</p>}
+    <form onSubmit={event => { event.preventDefault(); void configure(); }}>
+      <div className={styles.grid}>
+        <label className={styles.field}><span>Площадка</span><select value={form.platform} disabled={pending || Boolean(current)}
+          onChange={event => { setForm(previous => ({ ...channelForm(), id: previous.id, profile_id: previous.profile_id,
+            platform: event.target.value as ManagedPlatform })); setToken(''); }}>
+          <option value="max">MAX</option><option value="telegram">Telegram</option><option value="vk">ВКонтакте</option></select></label>
+        <label className={styles.field}><span>Идентификатор канала</span><input value={form.id} disabled={pending || Boolean(current)} maxLength={64}
+          placeholder="science_telegram" onChange={event => change('id', event.target.value)} required />
+          <span className={styles.muted}>Латинские строчные буквы, цифры, дефис или подчёркивание; начинается с буквы.</span></label>
+        <label className={styles.field}><span>Редакционный профиль</span><select value={form.profile_id} disabled={pending} required onChange={event => change('profile_id', event.target.value)}>
+          <option value="">Выберите профиль</option>{setup.profiles.map(profile => <option value={profile.id} key={profile.id}
+            disabled={!profile.enabled || profile.publication_mode === 'dry_run'}>{profile.name || profile.id}{!profile.enabled ? ' · выключен' : profile.publication_mode === 'dry_run' ? ' · без отправки' : ''}</option>)}</select></label>
+        <label className={styles.field}><span>{form.platform === 'vk' ? 'ID личной страницы получателя' : form.platform === 'telegram' ? 'ID или @имя Telegram-канала' : 'Числовой ID канала MAX'}</span>
+          {form.platform === 'max' ? <select value={form.destination} disabled={pending} required onChange={event => change('destination', event.target.value)}>
+            <option value="">Выберите разрешённый канал</option>{setup.max_channels.map(channel => <option key={channel.id} value={channel.id}>{channel.name} · {channel.id}</option>)}</select>
+            : <input value={form.destination} disabled={pending} maxLength={200} onChange={event => change('destination', event.target.value)} required />}
+          {form.platform === 'max' && <span className={styles.muted}>В списке только ранее разрешённые каналы MAX. Другой канал подключается отдельной настройкой владельца.</span>}</label>
+        {form.platform === 'vk' && <label className={styles.field}><span>ID владельца VK</span><input inputMode="numeric" value={form.owner} disabled={pending}
+          onChange={event => change('owner', event.target.value)} required /><span className={styles.muted}>Должен совпадать с владельцем выбранной личной страницы.</span></label>}
+        <label className={styles.field}><span>Лимит знаков (необязательно)</span><input type="number" min={1} max={40000} step={1} value={form.max_chars}
+          disabled={pending} onChange={event => change('max_chars', event.target.value)} /></label>
+        {form.platform === 'telegram' && <label className={styles.field}><span>Изображение и длинный текст</span><select value={form.media_layout} disabled={pending}
+          onChange={event => change('media_layout', event.target.value)}><option value="auto">Подпись, а при превышении лимита — отдельный текст</option>
+          <option value="atomic">Только одно сообщение с подписью</option><option value="photo_then_text">Изображение, затем текст</option></select></label>}
+      </div>
+      <details className={styles.advanced}><summary>Дополнительные параметры</summary><div className={styles.grid}>
+        {form.platform === 'telegram' && <label className={styles.field}><span>Ожидание ответа Telegram, секунд</span><input type="number" min={1} max={120} step={1}
+          value={form.request_timeout_seconds} disabled={pending} onChange={event => change('request_timeout_seconds', event.target.value)} /></label>}
+        {form.platform === 'vk' && <label className={styles.field}><span>Время операции VK, секунд</span><input type="number" min={30} max={600} step={1}
+          value={form.operation_timeout_seconds} disabled={pending} onChange={event => change('operation_timeout_seconds', event.target.value)} /></label>}
+        <label className={styles.consent}><input type="checkbox" checked={form.enabled} disabled={pending} onChange={event => change('enabled', event.target.checked)} />Подключение включено</label>
+      </div></details>
+      <div className={styles.actions}><button type="submit" className={styles.button} disabled={pending || stale || Boolean(current && !current.capabilities.can_configure)}>Сохранить подключение на паузе</button>
+        <span className={styles.muted}>После изменения потребуется перезапуск редакционного сервиса и новая проверка доступа.</span></div>
+    </form>
+    {current?.platform === 'telegram' && <form className={styles.secretForm} autoComplete="off" onSubmit={async event => {
+      event.preventDefault(); setError(''); const value = token; setToken('');
+      try { if (stale || !bindingHash) throw new Error('ROUTE_ADMIN_CONFLICT');
+        await onAdmin({ action: 'set_secret', id: current.id, expected_binding_hash: bindingHash, value }); }
+      catch (reason) { setError(adminErrorCode(reason)); }
+      finally { setToken(''); }
+    }}><label className={styles.field}><span>Токен Telegram-бота</span><input type="password" value={token} disabled={pending || !current.capabilities.can_set_secret}
+        autoComplete="new-password" spellCheck={false} onChange={event => setToken(event.target.value)} />
+        <span className={styles.muted}>{current.diagnostics.credentials_configured === true ? 'Токен уже сохранён. Можно заменить его новым.' : 'Введите токен бота с правом публикации в выбранном канале.'} Значение не показывается после сохранения.</span></label>
+      <button type="submit" className={styles.button} disabled={pending || stale || !current.capabilities.can_set_secret || !token}>Сохранить токен</button></form>}
+    {current?.capabilities.can_login && <div className={styles.actions}>
+      <button type="button" className={styles.button} disabled={pending || stale} onClick={async () => { setError(''); setLogin(null);
+        try { if (stale || !bindingHash) throw new Error('ROUTE_ADMIN_CONFLICT');
+          const value = await onAdmin({ action: 'prepare_login', id: current.id, expected_binding_hash: bindingHash });
+          if (value?.target_id !== current.id || value?.login_url !== '/owner-browser/' || value?.live_verified !== false) throw new Error('EDITORIAL_RESPONSE_INVALID'); setLogin(value);
+        } catch (reason) { setError(adminErrorCode(reason)); }
+      }}>Подготовить вход в {routePlatform(current.platform)}</button>
+      {login?.target_id === current.id && login.expires_at > Date.now() / 1000 && <a href={login.login_url} className={styles.button}>Открыть вход владельца</a>}
+      <span className={styles.muted}>Окно предназначено только для входа в выбранный аккаунт. Затем закройте его и отдельно проверьте доступ.</span>
+    </div>}
+  </div>;
+}
+
+export function OriginalComposer({ setup, pending, editing, onAdmin, onCancel }: { setup: RouteSetup; pending: boolean;
+  editing: RouteDetails | null; onAdmin: AdminHandler; onCancel: () => void }) {
+  const [targetId, setTargetId] = useState(editing?.target_id || '');
+  const [title, setTitle] = useState(editing?.title || ''), [body, setBody] = useState(editing?.body || '');
+  const [media, setMedia] = useState<OriginalMedia[]>((editing?.media || []).map(originalMedia));
+  const [attested, setAttested] = useState(false), [uploading, setUploading] = useState(false), [error, setError] = useState('');
+  const [preview, setPreview] = useState('');
+  const target = setup.targets.find(item => item.id === targetId), busy = pending || uploading;
+  const allowed = Boolean(target?.enabled && target.capabilities.can_create_original && (!editing || editing.binding_hash === target.binding_hash));
+  useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
+  useEffect(() => { setAttested(false); }, [targetId, target?.binding_hash, editing?.content_hash]);
+  const selectImage = async (file?: File) => {
+    setAttested(false); setError(''); if (!file || !target) return;
+    setUploading(true);
+    try {
+      if (!['image/png', 'image/jpeg'].includes(file.type) || file.size < 1 || file.size > 10485760) throw new Error('EDITORIAL_UPLOAD_INVALID');
+      const bytes = new Uint8Array(await file.arrayBuffer()), sha256 = imageSha256(bytes);
+      let binary = ''; for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+      const value = await onAdmin({ action: 'upload_media', id: target.id, expected_binding_hash: target.binding_hash,
+        mime: file.type, sha256, data_base64: btoa(binary) });
+      const saved = originalMedia(value?.media);
+      if (saved.sha256 !== sha256 || saved.mime !== file.type || value?.external_mutations !== 0) throw new Error('EDITORIAL_ORIGINAL_MEDIA_INVALID');
+      // Просмотр использует проверенные байты с явным растровым MIME.
+      const image = saved.mime === 'image/png'
+        ? new Blob([bytes], { type: 'image/png' })
+        : new Blob([bytes], { type: 'image/jpeg' });
+      setMedia([saved]); setPreview(URL.createObjectURL(image));
+    } catch (reason) { setError(adminErrorCode(reason, 'EDITORIAL_UPLOAD_INVALID')); }
+    finally { setUploading(false); }
+  };
+  return <div className={styles.workspace}><h3>{editing ? `Редактировать материал · версия ${editing.revision}` : 'Новый авторский материал'}</h3>
+    <p className={styles.muted}>Сохранение создаёт черновик для проверки. Дату и согласование вы зададите отдельно для сохранённой версии.</p>
+    {editing && <p className={styles.notice}>Изменение текста или изображения сбросит прежнюю проверку и согласование. История версий сохраняется.</p>}
+    {error && <div role="alert" className={styles.notice}>{errorText(error)}</div>}
+    <form onSubmit={async event => { event.preventDefault(); setError('');
+      try {
+        if (!target || !allowed || !attested) throw new Error('OWNER_ORIGINAL_ATTESTATION_REQUIRED');
+        const metadata = Object.fromEntries(Object.entries(editing?.metadata || {}).filter(([key]) => ['tags', 'community', 'ai_generated'].includes(key)));
+        const original = originalInput(title, body, media, metadata);
+        await onAdmin({ action: editing ? 'revise_original' : 'create_original', id: editing?.variant_id || target.id,
+          expected_binding_hash: target.binding_hash, original, attest_original: true,
+          ...(editing ? { revision: editing.revision, content_hash: editing.content_hash } : {}) });
+        setAttested(false); setTitle(''); setBody(''); setMedia([]); setPreview(''); onCancel();
+      } catch (reason) { setAttested(false); setError(adminErrorCode(reason, 'EDITORIAL_ORIGINAL_INVALID')); }
+    }}>
+      <label className={styles.field}><span>Канал материала</span><select value={targetId} disabled={busy || Boolean(editing)} required onChange={event => {
+        setTargetId(event.target.value); setAttested(false); setMedia([]); setPreview('');
+      }}><option value="">Выберите канал</option>{setup.targets.map(item => <option key={item.id} value={item.id}
+          disabled={!item.enabled || !item.capabilities.can_create_original}>{routePlatform(item.platform)} · {item.destination}</option>)}</select></label>
+      <label className={styles.field}><span>Заголовок</span><input value={title} disabled={busy} maxLength={300} required onChange={event => { setTitle(event.target.value); setAttested(false); }} /></label>
+      <label className={styles.field}><span>Текст на русском</span><textarea className={styles.originalBody} value={body} disabled={busy} maxLength={40000} required onChange={event => { setBody(event.target.value); setAttested(false); }} /></label>
+      <label className={styles.field}><span>Изображение PNG или JPEG, до 10 МБ</span><input type="file" accept="image/png,image/jpeg" disabled={busy || !target?.capabilities.can_upload_media}
+        onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; void selectImage(file); }} /></label>
+      {uploading && <p role="status">Сохраняем исходное изображение…</p>}
+      {media.length > 0 && <div>{preview && <figure className={styles.imagePreview}><img src={preview} alt="Выбранное изображение для нового черновика" /></figure>}
+        <p className={styles.muted}>К материалу прикреплено одно исходное изображение. Перед согласованием просмотрите серверную версию.</p>
+        <button type="button" className={styles.button} disabled={busy} onClick={() => { setMedia([]); setPreview(''); setAttested(false); }}>Убрать изображение</button></div>}
+      <label className={styles.consent}><input type="checkbox" checked={attested} disabled={busy || !allowed}
+        onChange={event => setAttested(event.target.checked)} /><span>Это мой авторский текст; у меня есть права на выбранное изображение и его публикацию. Это подтверждение не назначает отправку.</span></label>
+      <div className={styles.actions}><button type="submit" className={`${styles.button} ${styles.primary}`} disabled={busy || !allowed || !attested}>Сохранить черновик для проверки</button>
+        {editing && <button type="button" className={styles.button} disabled={busy} onClick={onCancel}>Отменить редактирование</button>}</div>
+    </form>
+  </div>;
+}
+
+export function EditorialWorkspace({ pending, editing, onChanged, onCancel }: { pending: boolean; editing: RouteDetails | null;
+  onChanged: () => Promise<void>; onCancel: () => void }) {
+  const [setup, setSetup] = useState<RouteSetup | null>(null), [busy, setBusy] = useState(false);
+  const [error, setError] = useState(''), [notice, setNotice] = useState('');
+  const mounted = useRef(true);
+  const reload = useCallback(async () => { const result = await api('route-setup', 'GET');
+    if (mounted.current) setSetup(result); }, []);
+  useEffect(() => { mounted.current = true; void reload().catch(reason => { if (mounted.current) setError(adminErrorCode(reason)); });
+    return () => { mounted.current = false; }; }, [reload]);
+  const admin: AdminHandler = async body => {
+    setBusy(true); setError(''); setNotice('');
+    try { const result = await api('route-admin', 'POST', body);
+      if (body.action !== 'upload_media') {
+        await reload(); await onChanged();
+        setNotice(['configure_target', 'set_secret'].includes(String(body.action))
+          ? 'Настройки сохранены, канал оставлен на паузе. Нажмите «Применить изменения», затем проверьте доступ.'
+          : body.action === 'prepare_login' ? 'Окно входа подготовлено для выбранного канала. Публикация не выполнялась.'
+          : 'Черновик сохранён. Откройте его полную версию, выполните проверку и отдельно согласуйте дату.');
+      }
+      return result;
+    } catch (reason) { setError(adminErrorCode(reason)); throw new Error(adminErrorCode(reason)); }
+    finally { if (mounted.current) setBusy(false); }
+  };
+  return <section className={styles.card} aria-labelledby="workspace-heading"><h2 id="workspace-heading">Подключения и свои материалы</h2>
+    <p className={styles.muted}>MAX, Telegram и ВКонтакте. Подключите канал, подготовьте материал и согласуйте точную версию перед отправкой.</p>
+    {error && <div role="alert" className={styles.notice}>{errorText(error)}</div>}{notice && <p role="status" className={styles.notice}>{notice}</p>}
+    <button type="button" className={styles.button} disabled={pending || busy} onClick={() => { setError(''); void reload().catch(reason => setError(adminErrorCode(reason))); }}>Обновить подключения</button>
+    {setup ? <>{setup.restart.required && <div className={styles.notice}><p>Настройки сохранены и ожидают применения. Каналы останутся на паузе.</p>
+      {setup.restart.blocked_reasons.map(code => <p key={code}>{errorText(code)}</p>)}
+      <button type="button" className={styles.button} disabled={pending || busy || Boolean(editing) || !setup.restart.can_request} onClick={async () => {
+        setBusy(true); setError(''); setNotice('');
+        try { await api('route-admin', 'POST', { action: 'request_restart', id: 'server', expected_binding_hash: null, expected_config_hash: setup.config_hash });
+          setSetup(previous => previous && ({ ...previous, restart: { ...previous.restart, can_request: false } }));
+          setNotice('Запрос принят. Дождитесь перезапуска и нажмите «Обновить подключения». Отправка не включается.');
+        } catch (reason) { setError(adminErrorCode(reason)); } finally { setBusy(false); }
+      }}>Применить изменения</button><p className={styles.muted}>Редакционный сервис кратко перезапустится. История и черновики сохранятся.</p></div>}
+      <ChannelSetup setup={setup} pending={pending || busy || Boolean(editing)} onAdmin={admin} />
+      <OriginalComposer key={editing ? `${editing.variant_id}:${editing.revision}:${editing.content_hash}` : 'new'} setup={setup} pending={pending || busy}
+        editing={editing} onAdmin={admin} onCancel={onCancel} /></> : <p className={styles.muted}>Загрузка подключений…</p>}
+  </section>;
+}
+
+export function RouteDraft({ variant, target, pending, onAction, onPreview, details, onDetails, onEdit, editing = false }: {
   variant: RouteVariant; target: RouteTarget; pending: boolean; onAction: RouteActionHandler; onPreview?: RoutePreviewHandler;
-  details?: RouteDetails; onDetails?: RouteDetailsHandler;
+  details?: RouteDetails; onDetails?: RouteDetailsHandler; onEdit?: (details: RouteDetails) => void; editing?: boolean;
 }) {
   const [schedule, setSchedule] = useState('');
   const [consent, setConsent] = useState(false);
@@ -257,11 +522,13 @@ export function RouteDraft({ variant, target, pending, onAction, onPreview, deta
   const dueAt = moscowSchedule(schedule);
   useEffect(() => { setConsent(false); setCheckedHash(null); setPreview(null); setPreviewError(''); },
     [variant.id, variant.revision, variant.content_hash, target.id, target.destination,
-      target.binding_hash, target.paused, target.enabled, details?.content_hash]);
+      target.binding_hash, target.paused, target.enabled, details?.content_hash, editing,
+      details?.media_policy?.id, details?.media_policy?.label, details?.media_policy?.description]);
   let exact: RouteDetails | null = null;
   try { if (details) exact = routeDetailsResult(details, variant, target); } catch { /* Старая версия не открывает согласование. */ }
   const checked = exact !== null && checkedHash === variant.content_hash;
   const imageReviewed = variant.media_count === 0 || preview !== null;
+  const policyReviewed = target.route !== 'vk_browser' || variant.media_count === 0 || Boolean(exact?.media_policy);
   return <article className={styles.routeDraft} aria-label={`Черновик: ${variant.title}`}>
     <div className={styles.routeHeading}><h3>{variant.title || 'Без заголовка'}</h3>
       <span className={styles.badge}>{routePlatform(target.platform)} · Версия {variant.revision}</span></div>
@@ -285,6 +552,13 @@ export function RouteDraft({ variant, target, pending, onAction, onPreview, deta
       {!imageReviewed && <p className={styles.muted}>Перед согласованием покажите изображение этой версии.</p>}
     </div>}
     <div className={styles.fullBody}>{exact.body}</div>
+    {exact.media_policy && <div className={styles.connectionStatus}><h4>Изображение: {exact.media_policy.label}</h4>
+      <p className={styles.muted}>{exact.media_policy.description}</p></div>}
+    {!policyReviewed && <p role="alert" className={styles.notice}>Условия проверки изображения для этой версии не подтверждены. Согласование недоступно.</p>}
+    {variant.origin === 'owner_original' && ['max', 'telegram', 'vk'].includes(target.platform) && onEdit &&
+      <button type="button" className={styles.button} disabled={pending || editing} onClick={() => {
+        setConsent(false); setCheckedHash(null); setPreview(null); if (exact) onEdit(exact);
+      }}>Редактировать авторский материал</button>}
     <h4>Параметры публикации</h4><pre className={styles.fullBody}>{JSON.stringify(exact.metadata, null, 2)}</pre>
     <h4>Вложения этой версии</h4><pre className={styles.fullBody}>{JSON.stringify(exact.media, null, 2)}</pre>
     <h4>Источники этой версии</h4><pre className={styles.fullBody}>{JSON.stringify(exact.sources, null, 2)}</pre>
@@ -299,15 +573,15 @@ export function RouteDraft({ variant, target, pending, onAction, onPreview, deta
       {schedule && dueAt === null && <span role="status" className={styles.muted}>Укажите корректную будущую дату по Москве.</span>}
     </label>
     <label className={styles.consent}><input type="checkbox" checked={consent}
-      disabled={pending || !checked || !imageReviewed || dueAt === null || !target.enabled || target.paused}
+      disabled={pending || !checked || !imageReviewed || !policyReviewed || dueAt === null || !target.enabled || target.paused}
       onChange={event => setConsent(event.target.checked)} />
       <span>Я проверил материал и согласую версию {variant.revision} для канала {target.destination}
         {dueAt !== null ? ` на ${readableTime(dueAt)} (МСК)` : ' на выбранную дату'}.</span></label>
     <div className={styles.actions}><button type="button" className={`${styles.button} ${styles.primary}`}
-      disabled={pending || !target.enabled || target.paused || !checked || !imageReviewed || !consent || dueAt === null}
+      disabled={pending || !target.enabled || target.paused || !checked || !imageReviewed || !policyReviewed || !consent || dueAt === null}
       onClick={async () => {
         const exactDate = moscowSchedule(schedule);
-        if (pending || !target.enabled || target.paused || !consent || !checked || !imageReviewed || exactDate === null) return;
+        if (pending || !target.enabled || target.paused || !consent || !checked || !imageReviewed || !policyReviewed || exactDate === null) return;
         setConsent(false);
         await onAction({ action: 'approve', id: variant.id, revision: variant.revision,
           content_hash: variant.content_hash, due_at: exactDate });
@@ -317,9 +591,10 @@ export function RouteDraft({ variant, target, pending, onAction, onPreview, deta
   </article>;
 }
 
-export function EditorialRoutes({ inventory, pending, error, onAction, onPreview, detailsById = {}, onDetails, onPage }: {
+export function EditorialRoutes({ inventory, pending, error, onAction, onPreview, detailsById = {}, onDetails, onPage, onEdit, editingId }: {
   inventory: RouteInventory | null; pending: boolean; error?: string; onAction: RouteActionHandler; onPreview?: RoutePreviewHandler;
   detailsById?: Record<string, RouteDetails>; onDetails?: RouteDetailsHandler; onPage?: RoutePageHandler;
+  onEdit?: (details: RouteDetails) => void; editingId?: string;
 }) {
   const targets = (inventory?.targets || []).filter(target => managedRoutes.has(target.route));
   const variants = (inventory?.variants || []).filter(variant => variant.manual_approval_allowed !== false &&
@@ -356,7 +631,7 @@ export function EditorialRoutes({ inventory, pending, error, onAction, onPreview
       {variants.map(variant => { const target = targets.find(item => item.id === variant.target_id);
         return target ? <RouteDraft key={`${variant.id}:${variant.revision}:${variant.content_hash}:${target.binding_hash}`}
           variant={variant} target={target} pending={pending} onAction={onAction} onPreview={onPreview}
-          details={detailsById[variant.id]} onDetails={onDetails} /> : null; })}
+          details={detailsById[variant.id]} onDetails={onDetails} onEdit={onEdit} editing={editingId === variant.id} /> : null; })}
       {!variants.length && <p className={styles.muted}>На этой странице нет черновиков для ручного согласования.</p>}
       <h3 className={styles.subheading}>История отправок</h3>
       {pagination && <div className={styles.actions}><span className={styles.muted}>
@@ -544,6 +819,7 @@ export function EditorialPanel() {
   const routePages = useRef<RoutePages>({ variant_page: 0, dispatch_page: 0, dispatch_filter: 'all' });
   const [routeError, setRouteError] = useState('');
   const [routeNotice, setRouteNotice] = useState('');
+  const [editingOriginal, setEditingOriginal] = useState<RouteDetails | null>(null);
   const mounted = useRef(true);
   const refresh = useCallback(async (loadSettings: boolean, signal?: AbortSignal) => {
     const [current, channels, saved] = await Promise.allSettled([
@@ -623,6 +899,16 @@ export function EditorialPanel() {
     setRouteDetails({});
     return perform(() => Promise.resolve());
   };
+  const editOriginal = (details: RouteDetails) => {
+    try {
+      const variant = routes?.variants.find(item => item.id === details.variant_id);
+      const target = routes?.targets.find(item => item.id === details.target_id);
+      if (!variant || !target || variant.origin !== 'owner_original' || !['max', 'telegram', 'vk'].includes(target.platform)) throw new Error('APPROVAL_STALE');
+      const exact = routeDetailsResult(details, variant, target);
+      exact.media.map(originalMedia);
+      setEditingOriginal(exact); setRouteNotice('Редактируется авторский материал. Прежнее согласование нельзя использовать для изменённой версии.');
+    } catch { setError('EDITORIAL_ROUTE_DETAILS_INVALID'); }
+  };
   const control = (action: 'start' | 'pause') => perform(() => api('control', 'POST', { action, revision: state?.revision }), !dirty);
   const field = (label: string, key: keyof EditorialForm, kind = 'text', help?: string) => <label className={styles.field}>
     <span>{label}</span>{kind === 'textarea'
@@ -650,7 +936,6 @@ export function EditorialPanel() {
         <button className={`${styles.button} ${styles.primary}`} disabled={pending || !state || !state.paused || dirty} onClick={() => control('start')}>Запустить цикл</button>
         <button className={`${styles.button} ${styles.danger}`} disabled={pending || !state || state.paused} onClick={() => control('pause')}>Поставить на паузу</button>
         <button className={styles.button} disabled={pending} onClick={() => perform(() => Promise.resolve())}>Обновить статус</button>
-        <a className={styles.button} href={OWNER_BROWSER_URL}>Вход в MAX</a>
       </div><p className={styles.muted}>Пауза сохраняет черновики и историю. Отправка с неизвестным исходом требует сверки и не повторяется автоматически.</p>
     </section>
     <section className={styles.card} aria-labelledby="settings-heading"><h2 id="settings-heading">Источники и отбор</h2>
@@ -687,9 +972,12 @@ export function EditorialPanel() {
         </div>
       </form> : <p className={styles.muted}>Загрузка настроек…</p>}
     </section>
+    <EditorialWorkspace pending={pending} editing={editingOriginal} onCancel={() => setEditingOriginal(null)} onChanged={async () => {
+      setRouteDetails({}); await refresh(false);
+    }} />
     {routeNotice && <div role="status" className={styles.notice}>{routeNotice}</div>}
-    <EditorialRoutes inventory={routes} pending={pending || Boolean(routeError)} error={routeError} onAction={routeAction} onPreview={routePreview}
-      detailsById={routeDetails} onDetails={loadRouteDetails} onPage={changeRoutePage} />
+    <EditorialRoutes inventory={routes} pending={pending || Boolean(routeError) || Boolean(editingOriginal)} error={routeError} onAction={routeAction} onPreview={routePreview}
+      detailsById={routeDetails} onDetails={loadRouteDetails} onPage={changeRoutePage} onEdit={editOriginal} editingId={editingOriginal?.variant_id} />
     <Monitoring />
     <section className={styles.card}><h2>Последние материалы</h2><EditorialRecords records={state?.recent || []} /></section>
   </main>;

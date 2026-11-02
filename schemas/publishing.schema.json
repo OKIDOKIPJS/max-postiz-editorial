@@ -16,6 +16,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "maintenance_offline_fixture": {"type": "boolean", "default": false},
         "base_url_env": {
           "type": "string"
         },
@@ -108,7 +109,7 @@
               "dom_contract_verified": {"type": "boolean"},
               "dom_contract_profile": {"enum": ["personal-text-v1", "personal-image-v1"]},
               "media_contract_verified": {"type": "boolean"},
-              "media_proof_policy": {"enum": ["exact-bytes-v1", "exact-pixels-v1", "native-asset-lineage-v1"]},
+              "media_proof_policy": {"enum": ["exact-bytes-v1", "exact-pixels-v1", "native-asset-lineage-v1", "native-uniform-edge-lineage-v1"]},
               "media_contract_evidence": {"type": "string", "pattern": "^data/vk-media-[A-Za-z0-9_-]+\\.json$"},
               "media_contract_evidence_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
               "dom_contract": {"type": "object", "additionalProperties": {"type": "string", "maxLength": 1000}},

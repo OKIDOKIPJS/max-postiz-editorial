@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { argumentsFor, structuralCheck, main } = require('./build-production-image.cjs');
 const frontend = require('./patch-production-frontend.cjs');
+const backend = require('./patch-production-backend.cjs');
 const originSecurity = require('./production-origin.cjs');
 
 const args = ['--build', '--origin', 'http://127.0.0.1:14007', '--tag', 'max-postiz-linux:0.12.1-production-test'];
@@ -30,6 +31,7 @@ test('fresh recipe checks exact pinned source sets and rebuilds all native targe
   const checked = structuralCheck(__dirname);
   assert.equal(checked.upstream_source_pin_count, 11); assert.equal(checked.editorial_source_pin_count, 2);
   assert.equal(checked.frontend_config_source_pin_count, 1);
+  assert.equal(checked.backend_bootstrap_source_pin_count, 1);
   assert.equal(checked.compiled_artifact_reused, false); assert.equal(checked.full_native_rebuild_required, true);
   const upstream = JSON.parse(fs.readFileSync(path.join(__dirname, 'source-manifest.json')));
   const editorial = JSON.parse(fs.readFileSync(path.join(__dirname, 'editorial-manifest.json')));
@@ -45,6 +47,35 @@ test('fresh recipe checks exact pinned source sets and rebuilds all native targe
   assert.ok(!/^RUN .*prisma (?:db push|migrate)/m.test(recipe));
   assert.ok(recipe.indexOf('pnpm --filter ./apps/orchestrator build') < recipe.indexOf('node /adapter/patch-production-frontend.cjs'));
   assert.ok(recipe.indexOf('node /adapter/patch-production-frontend.cjs') < recipe.indexOf('pnpm --filter ./apps/frontend exec next build --webpack'));
+  assert.ok(recipe.indexOf('pnpm --filter ./apps/frontend exec next build --webpack') < recipe.indexOf('node /adapter/production-startup.cjs --check /app'));
+  assert.ok(recipe.endsWith('ENTRYPOINT []\nCMD ["/bin/sh", "/adapter/start-production.sh"]\n'));
+});
+
+test('only the exact upstream backend gains a bounded editorial admin parser before full Nest builds', () => {
+  const raw = fs.readFileSync(path.join(__dirname, 'fixtures/production-backend-main.upstream.ts'));
+  assert.equal(crypto.createHash('sha256').update(raw).digest('hex'), backend.UPSTREAM_BACKEND_MAIN_SHA256);
+  const planned = backend.planBackendMain(raw);
+  assert.equal(planned.replace(backend.ADDITION, ''), raw.toString('utf8'));
+  assert.equal(planned.split("req.method === 'POST' && req.path === '/editorial/route-admin'").length, 2);
+  assert.equal(planned.split("return json({ limit: '15mb' })(req, res, next);").length, 2);
+  assert.ok(!planned.includes('bodyParser: false'));
+  const recipe = fs.readFileSync(path.join(__dirname, 'Dockerfile.production'), 'utf8');
+  assert.ok(recipe.indexOf('node /adapter/patch-production-backend.cjs') < recipe.indexOf('pnpm --filter ./apps/backend build'));
+  assert.throws(() => backend.planBackendMain(Buffer.from(planned)), /PRODUCTION_BACKEND_SOURCE_MISMATCH/);
+  assert.throws(() => backend.planBackendMain(Buffer.concat([raw, Buffer.from('\n')])), /PRODUCTION_BACKEND_SOURCE_MISMATCH/);
+});
+
+test('backend parser patch changes one pinned bootstrap file and refuses reentry', () => {
+  const raw = fs.readFileSync(path.join(__dirname, 'fixtures/production-backend-main.upstream.ts'));
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'postiz-backend-native-'));
+  try {
+    const target = path.join(folder, backend.UPSTREAM_BACKEND_MAIN);
+    fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, raw);
+    assert.deepEqual(backend.main(folder), { route: '/editorial/route-admin', json_limit: '15mb',
+      ordinary_route_limits_changed: false, owner_authorization_required: true });
+    assert.equal(fs.readFileSync(target, 'utf8'), backend.planBackendMain(raw));
+    assert.throws(() => backend.main(folder), /PRODUCTION_BACKEND_SOURCE_MISMATCH/);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
 });
 
 test('native server sanitizer is externalized with one additive line against the exact pinned official Next config', () => {
@@ -114,6 +145,58 @@ test('public HTTP, ambiguous origins and truthy false or omitted cookie modes fa
   assert.throws(() => originSecurity.validateBuildSecurity('http://127.0.0.1:14007', ''), /PRODUCTION_COOKIE_MODE_INVALID/);
 });
 
+test('legacy private LAN mode requires an explicit profile and exactly the owner retained origin', () => {
+  const { LEGACY_ORIGIN_PROFILE: profile, LEGACY_PRIVATE_ORIGIN: origin } = originSecurity;
+  assert.equal(origin, 'http://10.20.30.45:4007');
+  assert.throws(() => originSecurity.securityForOrigin(origin), /PRODUCTION_BUILD_ORIGIN_INVALID/);
+  assert.deepEqual(originSecurity.validateBuildSecurity(origin, 'true', profile), {
+    origin, not_secured: 'true', origin_profile: profile,
+  });
+  for (const value of [origin + '/', origin + '/editorial', origin + '?a=1', origin + '#x',
+    'http://10.20.30.45:4008', 'http://10.20.30.46:4007', 'https://10.20.30.45:4007',
+    'http://127.0.0.1:4007', 'http://postiz.example:4007']) {
+    assert.throws(() => originSecurity.securityForOrigin(value, profile), /PRODUCTION_BUILD_ORIGIN_INVALID/);
+  }
+  for (const selected of ['', 'false', undefined, '__UNSET__']) {
+    assert.throws(() => originSecurity.validateBuildSecurity(origin, selected, profile), /PRODUCTION_COOKIE_MODE_INVALID/);
+  }
+  for (const profile of ['', 'legacy-private-lan-http', true, null, {}]) {
+    assert.throws(() => originSecurity.securityForOrigin(origin, profile), /PRODUCTION_ORIGIN_PROFILE_INVALID/);
+  }
+});
+
+test('direct Docker origin validator refuses implicit legacy HTTP and accepts only its exact explicit profile', () => {
+  const helper = path.join(__dirname, 'production-origin.cjs');
+  const origin = originSecurity.LEGACY_PRIVATE_ORIGIN, profile = originSecurity.LEGACY_ORIGIN_PROFILE;
+  for (const [values, passed] of [
+    [[origin, 'true'], false], [[origin, 'true', profile], true], [[origin, '', profile], false],
+    [[origin.replace('4007', '4008'), 'true', profile], false],
+    [[origin, 'true', 'unknown-profile'], false], [[origin, 'true', profile, 'extra'], false],
+  ]) {
+    const result = spawnSync(process.execPath, [helper, ...values], { encoding: 'utf8' });
+    assert.equal(result.status === 0, passed);
+    if (passed) assert.equal(JSON.parse(result.stdout).origin_profile, profile);
+    else assert.match(result.stderr, /^PRODUCTION_[A-Z_]+\r?\n$/);
+  }
+});
+
+test('legacy runner profile is explicit, bound to the build and rejects environment contradictions before Docker', () => {
+  const profile = originSecurity.LEGACY_ORIGIN_PROFILE;
+  const selected = args.map(value => value === 'http://127.0.0.1:14007' ? originSecurity.LEGACY_PRIVATE_ORIGIN : value);
+  assert.throws(() => argumentsFor(selected), /PRODUCTION_BUILD_ORIGIN_INVALID/);
+  const explicit = [...selected, '--origin-profile', profile];
+  const { run, calls } = docker();
+  const result = main(explicit, run, __dirname, Object.freeze({ PRODUCTION_ORIGIN_PROFILE: profile }));
+  const built = calls.find(call => call.includes('build'));
+  assert.ok(built.includes('PRODUCTION_ORIGIN_PROFILE=' + profile));
+  assert.ok(built.includes('PRODUCTION_NOT_SECURED=true'));
+  assert.equal(result.origin_profile, profile);
+  for (const environment of [{ PRODUCTION_ORIGIN_PROFILE: 'https-or-loopback-v1' }, { production_origin_profile: 'unknown' }]) {
+    assert.throws(() => main(explicit, () => assert.fail('No Docker for contradictory profile'), __dirname, environment), /PRODUCTION_ORIGIN_PROFILE_INVALID/);
+  }
+  assert.throws(() => argumentsFor(['--check', '--origin-profile', profile]), /PRODUCTION_BUILD_ARGUMENTS_INVALID/);
+});
+
 test('direct Docker validator accepts an explicit empty HTTPS argument and refuses omitted or contradictory modes', () => {
   const helper = path.join(__dirname, 'production-origin.cjs');
   for (const [values, passed] of [
@@ -147,10 +230,11 @@ test('runner passes the explicit derived HTTPS empty build argument and rejects 
 test('security validator and final ENV follow full Next so the native build cache remains reusable', () => {
   const recipe = fs.readFileSync(path.join(__dirname, 'Dockerfile.production'), 'utf8');
   const fullNext = recipe.indexOf('RUN pnpm --filter ./apps/frontend exec next build --webpack');
-  const guard = recipe.indexOf('RUN node /adapter/production-origin.cjs "$PUBLIC_ORIGIN" "$PRODUCTION_NOT_SECURED"');
+  const guard = recipe.indexOf('RUN node /adapter/production-origin.cjs "$PUBLIC_ORIGIN" "$PRODUCTION_NOT_SECURED" "$PRODUCTION_ORIGIN_PROFILE"');
   const finalEnv = recipe.indexOf('ENV NOT_SECURED=$PRODUCTION_NOT_SECURED');
   assert.ok(fullNext < guard && guard < finalEnv);
   assert.ok(recipe.includes('ARG PRODUCTION_NOT_SECURED=__UNSET__'));
+  assert.ok(recipe.includes('ARG PRODUCTION_ORIGIN_PROFILE=https-or-loopback-v1'));
   assert.ok(!recipe.slice(finalEnv).includes('NOT_SECURED=true'));
   assert.equal(recipe.slice(fullNext, guard).match(/\bRUN\b/g).length, 1);
 });
@@ -166,6 +250,7 @@ test('fresh build invokes only local-context probes and one Docker build, no ser
   assert.equal(result.image_built, true); assert.equal(result.runtime_verified, false);
   const builds = calls.filter(call => call.includes('build')); assert.equal(builds.length, 1);
   assert.equal(builds[0][builds[0].indexOf('--builder') + 1], 'default');
+  assert.equal(builds[0][builds[0].indexOf('--network') + 1], 'none');
   assert.ok(builds[0].includes(path.join(__dirname, 'Dockerfile.production')));
   assert.ok(builds[0].includes('PUBLIC_ORIGIN=http://127.0.0.1:14007'));
   assert.ok(builds[0].includes('PRODUCTION_NOT_SECURED=true'));

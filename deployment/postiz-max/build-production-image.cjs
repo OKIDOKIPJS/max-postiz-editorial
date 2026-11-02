@@ -3,13 +3,14 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { UPSTREAM_NEXT_CONFIG, UPSTREAM_NEXT_CONFIG_SHA256 } = require('./patch-production-frontend.cjs');
-const { securityForOrigin } = require('./production-origin.cjs');
+const { UPSTREAM_BACKEND_MAIN, UPSTREAM_BACKEND_MAIN_SHA256 } = require('./patch-production-backend.cjs');
+const { DEFAULT_ORIGIN_PROFILE, securityForOrigin } = require('./production-origin.cjs');
 
 function argumentsFor(args) {
   const options = {};
   for (let index = 0; index < args.length; index++) {
     const key = args[index];
-    if (!['--check', '--build', '--origin', '--tag', '--source-root'].includes(key) || key in options) throw Error('PRODUCTION_BUILD_ARGUMENTS_INVALID');
+    if (!['--check', '--build', '--origin', '--origin-profile', '--tag', '--source-root'].includes(key) || key in options) throw Error('PRODUCTION_BUILD_ARGUMENTS_INVALID');
     if (key === '--check' || key === '--build') options[key] = true;
     else {
       const value = args[++index];
@@ -19,8 +20,9 @@ function argumentsFor(args) {
   }
   if (Boolean(options['--check']) === Boolean(options['--build'])) throw Error('PRODUCTION_BUILD_ARGUMENTS_INVALID');
   if (options['--build'] && (!options['--origin'] || !options['--tag'])) throw Error('PRODUCTION_BUILD_ARGUMENTS_INVALID');
+  if (options['--origin-profile'] && !options['--origin']) throw Error('PRODUCTION_BUILD_ARGUMENTS_INVALID');
   if (options['--origin']) {
-    securityForOrigin(options['--origin']);
+    securityForOrigin(options['--origin'], options['--origin-profile']);
   }
   if (options['--tag'] && (!/^max-postiz-linux:[A-Za-z0-9][A-Za-z0-9_.-]{0,100}$/.test(options['--tag']) ||
       ['max-postiz-linux:0.5.1', 'max-postiz-linux:0.10.0-editorial', 'max-postiz-linux:0.10.8-reliability', 'max-postiz-linux:0.11.2-illustrated-cas'].includes(options['--tag']))) {
@@ -43,15 +45,19 @@ function structuralCheck(adapter, sourceRoot) {
     if (name in upstream.sha256 || maxPatch.includes(name)) throw Error('PRODUCTION_BUILD_OVERLAYS_CONFLICT');
   }
   const stages = ['node /adapter/patch-image.cjs', "planPatch('/app','/adapter',{...m,compiled:{}})",
+    'node /adapter/patch-production-backend.cjs',
     'pnpm exec prisma generate --schema', 'pnpm --filter ./apps/backend build',
     'pnpm --filter ./apps/orchestrator build', 'node /adapter/patch-production-frontend.cjs',
     'pnpm --filter ./apps/frontend exec next build --webpack',
-    'node /adapter/production-origin.cjs "$PUBLIC_ORIGIN" "$PRODUCTION_NOT_SECURED"',
-    'ENV NOT_SECURED=$PRODUCTION_NOT_SECURED'];
+    'node /adapter/production-origin.cjs "$PUBLIC_ORIGIN" "$PRODUCTION_NOT_SECURED" "$PRODUCTION_ORIGIN_PROFILE"',
+    'ENV NOT_SECURED=$PRODUCTION_NOT_SECURED',
+    'node /adapter/production-startup.cjs --check /app',
+    'ENTRYPOINT []', 'CMD ["/bin/sh", "/adapter/start-production.sh"]'];
   let previous = -1;
   for (const stage of stages) { const position = dockerfile.indexOf(stage); if (position <= previous) throw Error('PRODUCTION_BUILD_ORDER_INVALID'); previous = position; }
   if (!dockerfile.includes('planPatch') || /FROM max-postiz|prisma (?:db push|migrate)|COPY \. /.test(dockerfile)) throw Error('PRODUCTION_BUILD_RECIPE_INVALID');
-  const pins = { ...upstream.sha256, ...editorial.sources, [UPSTREAM_NEXT_CONFIG]: UPSTREAM_NEXT_CONFIG_SHA256 };
+  const pins = { ...upstream.sha256, ...editorial.sources, [UPSTREAM_NEXT_CONFIG]: UPSTREAM_NEXT_CONFIG_SHA256,
+    [UPSTREAM_BACKEND_MAIN]: UPSTREAM_BACKEND_MAIN_SHA256 };
   if (Object.values(pins).some(value => !/^[a-f0-9]{64}$/.test(value))) throw Error('PRODUCTION_BUILD_PINS_INVALID');
   // Every copied adapter file must exist; COPY uses an explicit list, never private runtime.
   for (const line of dockerfile.split('\n').filter(line => line.startsWith('COPY '))) {
@@ -69,6 +75,7 @@ function structuralCheck(adapter, sourceRoot) {
   return { recipe: 'fresh-pinned-upstream-v1', upstream_source_pin_count: Object.keys(upstream.sha256).length,
     editorial_source_pin_count: Object.keys(editorial.sources).length, upstream_source_checked: Boolean(sourceRoot),
     frontend_config_source_pin_count: 1,
+    backend_bootstrap_source_pin_count: 1,
     compiled_artifact_reused: false, full_native_rebuild_required: true, image_built: false,
     build_status: 'NOT_BUILT', runtime_verified: false };
 }
@@ -76,11 +83,16 @@ function structuralCheck(adapter, sourceRoot) {
 function main(args, run = spawnSync, adapter = __dirname, environment = process.env) {
   const options = argumentsFor(args), checked = structuralCheck(adapter, options['--source-root']);
   if (options['--check']) return checked; // No Docker, network, files or services are changed.
-  const cookieMode = securityForOrigin(options['--origin']).not_secured;
+  const originProfile = options['--origin-profile'] || DEFAULT_ORIGIN_PROFILE;
+  const cookieMode = securityForOrigin(options['--origin'], originProfile).not_secured;
   const overrides = new Set(['DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS', 'DOCKER_TLS_VERIFY',
     'DOCKER_CERT_PATH', 'BUILDX_BUILDER', 'BUILDKIT_HOST']);
   const childEnv = { ...environment };
   for (const [name, value] of Object.entries(childEnv)) {
+    if (name.toUpperCase() === 'PRODUCTION_ORIGIN_PROFILE') {
+      if (value !== undefined && value !== originProfile) throw Error('PRODUCTION_ORIGIN_PROFILE_INVALID');
+      delete childEnv[name];
+    }
     if (['NOT_SECURED', 'PRODUCTION_NOT_SECURED'].includes(name.toUpperCase())) {
       if (value !== undefined && value !== cookieMode) throw Error('PRODUCTION_COOKIE_MODE_INVALID');
       delete childEnv[name];
@@ -106,11 +118,12 @@ function main(args, run = spawnSync, adapter = __dirname, environment = process.
   const absent = docker(['image', 'ls', '--quiet', '--no-trunc', '--filter', `reference=${tag}`]);
   if (absent.status !== 0) throw Error('PRODUCTION_DOCKER_UNAVAILABLE');
   if (absent.stdout.trim()) throw Error('PRODUCTION_TAG_ALREADY_EXISTS');
-  const built = run(binary, ['--context', context, 'build', '--builder', 'default', '--file', path.join(adapter, 'Dockerfile.production'),
+  const built = run(binary, ['--context', context, 'build', '--builder', 'default', '--network', 'none', '--file', path.join(adapter, 'Dockerfile.production'),
     '--build-arg', `PUBLIC_ORIGIN=${options['--origin']}`, '--build-arg', `PRODUCTION_NOT_SECURED=${cookieMode}`,
+    '--build-arg', `PRODUCTION_ORIGIN_PROFILE=${originProfile}`,
     '--tag', tag, adapter], { stdio: 'inherit', env: childEnv });
   if (built.status !== 0) throw Error('PRODUCTION_BUILD_FAILED');
-  return { ...checked, image_built: true, build_status: 'BUILT', tag, runtime_verified: false };
+  return { ...checked, image_built: true, build_status: 'BUILT', tag, origin_profile: originProfile, runtime_verified: false };
 }
 module.exports = { argumentsFor, structuralCheck, main };
 if (require.main === module) {

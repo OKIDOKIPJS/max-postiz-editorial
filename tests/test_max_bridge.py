@@ -21,6 +21,8 @@ pytest_plugins = ["test_hub"]
 def bridge(hub, monkeypatch):
     hub.bridge.key = "fixture-bridge-key"
     hub.publishing["postiz"]["browser_bridge_enabled"] = True
+    # Model a configured bridge, not a worker whose in-memory config drifted.
+    (hub.settings.root / "config/publishing.json").write_text(json.dumps(hub.publishing), encoding="utf-8")
     with hub.db.session.begin() as s:
         target = s.get(Target, "max")
         target.route = "max_browser"

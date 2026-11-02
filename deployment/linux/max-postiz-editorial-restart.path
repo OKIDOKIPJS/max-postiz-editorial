@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch exact authenticated editorial restart requests
+
+[Path]
+PathChanged=/opt/max-postiz/data/editorial-restart-request.json
+Unit=max-postiz-editorial-restart.service
+
+[Install]
+WantedBy=multi-user.target

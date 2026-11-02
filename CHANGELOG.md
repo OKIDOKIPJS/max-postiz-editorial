@@ -1,5 +1,550 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: ограниченный RFB/WebSocket probe без EOF busy loop
+
+- R20 run 41378325059 прошёл стандартный CI/CodeQL, полную сборку, owner API/UI
+  exercise, Linux supervisor и single-worker fence; строгий collector впервые
+  сохранил PNG и пройденные сценарии. Native accepted=false: portal client был
+  остановлен по 780-секундному timeout, почти всё время потребляя CPU. В прежних
+  recv loops подтверждён дефект: пустой recv не завершал цикл. Какой upstream
+  закрыл соединение и какой именно loop вызвал R20 timeout, не установлено.
+- Portal probe теперь немедленно прекращается при EOF, ограничивает socket reads,
+  абсолютный WebSocket deadline 10 секунд и HTTP headers 8192 bytes. До одного
+  owner WebSocket handshake выполняется read-only ожидание настоящего RFB banner
+  на 5900 не более 15 секунд. Login/prepare_login и другие POST не повторяются;
+  реальные 600 секунд selection lease и общий client budget 780 секунд сохранены.
+- Проверяются 101, точный nonce accept, Upgrade/Connection и точный 12-byte RFB
+  banner. Поток собирается из нескольких binary messages или корректных
+  continuation frames с общими пределами 512 bytes / 32 frames; control/close,
+  неверные frames, неполный banner и превышения не принимаются. Диагностика
+  содержит только фиксированные platform/stage/error literals, без cookie.
+- Проверки: 106 passed / 8 Windows skips, включая EOF обоих loops, partial и
+  coalesced stream, несколько binary frames, continuation, slow dribble deadline,
+  caps, timeout, неверные 101/accept/RFB и отсутствие повторов. Ruff/diff и
+  независимое review прошли. Продуктовые auth/units/Node context не изменены;
+  server-side race не объявляется доказанной. Полная native приёмка нового
+  exact commit ещё обязательна; default boot и image export остаются непроверенными.
+  Рабочая VM, Пикабу и внешние публикации не затрагивались.
+
+## 0.14.0 — 2026-11-02: готовность backend после restore и приватный producer PNG
+
+- R19 run 41374913726 прошёл полный native build, реальные owner API проверки,
+  загрузку изображений и граничные отказы, создание/правку/preview материалов,
+  restart с сохранением истории, browser UI, 29 Linux supervisor tests и запрет
+  второго worker. Оба MAX/VK portal механизма прошли native Chrome/profile/VNC
+  проверки с настоящим ожиданием 600-секундной lease; это не вход в аккаунты
+  платформ и не живая доставка. Стандартный CI R19 прошёл. Native accepted=false:
+  проверка восстановленного клона получила 502 на первом auth POST, пока новый
+  backend ещё не слушал порт; default boot и image export не были достигнуты.
+- После запуска backend-restored добавлено ограниченное read-only ожидание GET
+  can-register до первого auth POST. Auth и другие POST не повторяются, 502 не
+  принимается за успех. Источник следующего default clone переключается именно
+  на восстановленную БД только после успешной проверки restore и прежних точных
+  fingerprints; при любом отказе старое binding остаётся, история не меняется.
+- Отдельно исправлена переносимость PNG producer: Playwright screenshot(path)
+  наследовал umask, поэтому файл мог получить group-write. Теперь точные bytes
+  сохраняются один раз через private held directory FD, O_EXCL/NOFOLLOW, 0600 и
+  fsync без замены существующего файла. Это подтверждённый дефект переносимости,
+  но не доказанная причина R19 collection failure. Строгие collector проверки
+  сохранены; диагностика допускает только конечные коды, безопасные file bits и
+  четыре известных cleanup-кода без сырых ошибок, путей, содержимого и секретов.
+- Проверки: Main 85 passed / 8 Windows skips, Scenario 69 passed / 4 POSIX skips
+  на Windows; всего 154 passed / 12 skipped, включая два реальных sandboxed Chrome
+  set_content regression. Ruff/diff и независимое review прошли. Полная native
+  приёмка нового exact commit ещё обязательна; production service/helper limits,
+  Node context, auth/approval/send guards не ослаблены. Рабочий сервер и Пикабу
+  не затрагивались, внешних публикаций не выполнялось.
+
+## 0.14.0 — 2026-11-02: строгий UI locator области редакции
+
+- R18 run 41373325763 подтвердил ранний реальный sandboxed Chrome, большой nginx
+  transport и весь API exercise до preflight 201 после смены worker, включая
+  upload limits/create/revise/preview/restart/history. Безопасная диагностика
+  локализовала generic exception: strict_mode при глобальном heading «Редакция».
+  Закреплённый Postiz title.tsx и наша панель оба содержат h1 с таким текстом;
+  прежний результат не доказывал OOM или ошибку sandbox.
+- UI-проверка теперь требует ровно один видимый main и ровно один его видимый
+  level-1 heading с точным именем. .first/.last не используются; status/auth,
+  JavaScript, наличие трёх каналов и screenshot проверки сохранены. Продуктовый
+  frontend и Node context не изменены, уточнён только harness locator.
+- Проверки: полный Scenario 67 passed, в том числе два реальных sandboxed Chrome
+  set_content regression — внешний одноимённый h1 допускается, дубликат внутри
+  main отклоняется. Ruff/diff и независимый review прошли. Полная native/CI
+  приёмка нового exact commit обязательна; R18 accepted=false без image export.
+  Рабочий сервер и Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: диагностика Python/Chrome этапа native exercise
+
+- R17 run 41371284426 подтвердил исправленный 14 MiB nginx transport, полный
+  build и реальные API-проверки загрузки ровно 10 MiB, превышения и 15m/1m/200KiB
+  limits. Позже exercise завершился SCENARIO_FAILED без HTTP-отказа; unit exit 1,
+  peak 848 MiB. Тип/строка исходное сообщение не сохраняло; OOM либо Chrome cause
+  не объявляются доказанными. Accepted=false, переносимый image не экспортирован.
+- Диагностика теперь публикует только конечный enum исключения, до восьми frames
+  точного readiness_scenario.py (static function/line, без paths/message/locals),
+  безопасный last_http и фиксированные Playwright boolean hints. Ответы и секреты
+  не выводятся; все HTTP/status/auth/assertions и порядок exercise сохранены.
+- До build добавлен реальный sandboxed Chrome about:blank prerequisite в own
+  loopback namespace/transient unit с NNP/Delegate/45s и отдельным приватным HOME
+  существующего nonroot runner. Это не owner login proof. Только тестовые transient
+  clients получили явные 2 GiB для HTTP+browser; production service остаётся 1 GiB,
+  helper/Engine limits не изменены. --no-sandbox/sysctl обходов нет.
+- Проверки: scenario 65 pure passed; native 77 passed, 8 Windows FD/symlink skips;
+  Ruff/diff и независимый review прошли. Полные native/canonical/CI проверки
+  следующего exact commit обязательны; рабочий сервер и Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: лимит тела внутреннего nginx auth subrequest
+
+- R16 run 41370668926 воспроизвёл ошибку до тяжёлой сборки. Точный nginx log:
+  client intended to send too large body 14680064 bytes в subrequest
+  /_editorial-owner-auth, затем auth request unexpected status 413. Внутренний
+  location наследовал server 1m и проверял исходную длину до удаления upstream
+  Content-Length; отсюда внешний 500 на разрешённом большом upload.
+- Только внутренний /_editorial-owner-auth получил client_max_body_size 15m,
+  как точный route-admin. internal, auth_request, Cookie/Origin, body off и
+  очистка Content-Length сохранены; общий server остаётся 1m, прочие locations
+  не расширены. Это исправление production-шаблона, выполненное только в копии.
+- Проверки: 75 pure/mock passed, 8 Windows FD/symlink skips; отдельный contract
+  разрешает 15m ровно двум указанным scopes. Все 179 Node contracts прошли,
+  Ruff/diff и независимый review прошли. Новый early 14 MiB probe и полная
+  native/CI приёмка exact commit обязательны; R16 не принят целиком. Рабочий
+  сервер, его nginx и Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: ранний probe большого тела и приватный nginx log
+
+- R15 run 41368799645 прошёл configure_target с 201 и дошёл до upload_media;
+  там HTTP 500 без известного JSON code. SHA тела совпал с штатным CRLF HTML
+  nginx/1.22.1, а не Nest JSON. Причина proxy-ошибки пока не установлена; типовые
+  версии о правах или месте не объявляются доказанными. Native acceptance false.
+- До тяжёлой сборки добавлен 14 MiB body transport probe через тот же BASE,
+  nginx config/read-only/tmpfs и lo-only namespace. Отдельные ограниченные client
+  и streaming stub контейнеры проверяют точное число bytes; stub auth 204 явно
+  fixture, не owner proof. Proxy остаётся 96 MiB, client/stub — 128 MiB.
+  После проверки все три процесса останавливаются и три listener ports свободны.
+- При отказе собирается только фиксированный nginx error file после проверки
+  собственного ID/label/cgroup/role: NOFOLLOW/regular/singlelink, bounded complete
+  lines. Raw остаётся private и не входит в public glob; все известные passwords,
+  auth lines и JWT удаляются до public tail и общего privacy gate. Тот же сбор
+  применяется к runtime Scenario failure до удаления собственного Engine.
+- Проверки: 74 pure/mock passed, 8 Windows FD/symlink skips; Ruff/diff и отдельный
+  review прошли. App/Node context, реальные auth/status проверки и default CMD
+  не менялись. Новый run должен дать раннюю причину либо выполнить весь native
+  сценарий; рабочий сервер и аккаунт Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: точный успешный статус Nest POST в native harness
+
+- R14 run 41367369667 подтвердил первый отказ: POST /api/editorial/route-admin,
+  configure_target, HTTP 201. Проверки доступа перед ним прошли. Закреплённый
+  Nest 11.1.21 по умолчанию выдаёт CREATED для POST без HttpCode; три BFF handler
+  его не переопределяют. Это несовпадение harness с действующим API, не auth отказ.
+- У native scenario точная карта: GET и auth register/login — 200; route-admin,
+  route-action и control POST — 201. Admin наследует эту карту. Явные отрицательные
+  ожидания 401/403/413/422, порядок, cookie/Bearer guards и запрет повтора сохранены.
+  Нет разрешения любого 2xx или изменения production handler/авторизации.
+- Проверки: 57 pure scenario tests passed, включая отклонение 200/202 для BFF,
+  201 для auth и сохранение negative overrides; Ruff/diff и независимый review
+  прошли. В этот кандидат также входит локально проверенный monitor fixture
+  commit 1656d22. Полные CI/canonical/native проверки обязательны для exact head;
+  R14 accepted=false и без image export, рабочий сервер/Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: настоящий Hub context в monitor command fixtures
+
+- Полный R13 CI выявил четыре monitor-command отказа после объединения main:
+  устаревший контекст Service не реализовывал новый Hub runtime-generation guard.
+  Две команды завершались unknown до смысловой проверки, два прямых start теста
+  получали AttributeError. Production Hub/guards не изменены.
+- Локальный gateway fixture теперь создаёт настоящий HubService с теми же
+  settings/БД и fake editor/publisher/http; валидный пустой publishing сохранён
+  до capture поколения, bootstrap_targets=False. Нет noop/monkeypatch guard или
+  изменения assertions. Новый Postiz client закрывается отдельно, владельцем
+  общей БД/http остаётся исходный fixture.
+- Проверки: весь tests/test_monitor_commands.py — 176 passed; focused 6 passed
+  сохраняют done/blocked, паузу, mutation и busy-translator ожидания. Ruff/diff
+  и независимый review прошли. Полный CI окончательного commit ещё требуется;
+  этот test-only фикс не подтверждает HTTP native exercise или перенос на VM.
+
+## 0.14.0 — 2026-11-02: точная безопасная диагностика HTTP native сценария
+
+- R13 run 41365421111 подтвердил полные Next/Nest builds объединённого UI,
+  11 compiled artifacts, реальные 8 GiB RAM / 4 GiB swap / CPU 4 и lo-only сеть,
+  свежие зависимости, owner register/cookie/API key, migrate на паузе и установку
+  portal units. Первый exercise остановился через SCENARIO_HTTP_STATUS_INVALID;
+  endpoint/status исходная диагностика не сохранила. Образ не экспортирован.
+- При неуспешном HTTP добавляется только method, статический allowlisted path,
+  status, разрешённое literal action, body SHA и необязательный response_code из
+  конечного набора 35 известных констант. Код извлекается лишь из JSON object
+  до 64 KiB и повторно проецируется перед public JSON. Body, headers, cookies,
+  неизвестные коды и private canaries не выводятся.
+- Исходные auth probes, включая cookie+Bearer с ожиданием 401/403, порядок,
+  разрешённые статусы, retries и production guards не изменены. Причина HTTP
+  отказа пока не установлена; гипотеза о неправильном Bearer ожидании отозвана
+  после чтения явного guard, а не превращена в ослабление проверки.
+- Проверки: 41 pure сценарий passed; malformed/unknown/oversize/nonJSON privacy,
+  mixed-auth negative, Ruff/diff и независимый review прошли. Полная приёмка
+  следующего exact commit обязательна. Рабочий сервер и Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: явный root helper-сервисов изолированного стенда
+
+- Независимый разбор следующих native-этапов выявил две конкретные несовместимости
+  harness: перенесённые login/restart units оставляли helper default root
+  /opt/max-postiz; после завершённого restart ещё действовал его 60-секундный
+  manifest, намеренно блокирующий prepare_login. Production contracts не менялись.
+- Только в drop-ins двух собственных unit стенда сбрасывается ExecStart и передаётся
+  абсолютный helper с --root текущей копии. User/NNP/netns/slice и cleanup сохранены.
+  До portal unit добавлено ограниченное ожидание истечения точного приватного
+  restart manifest: FD/owner/0600/singlelink/size/shape/TTL и повторная сверка bytes;
+  максимум 65 секунд по monotonic. Manifest и сроки не изменяются, POST не повторяется.
+- Проверки: 68 pure/mock native tests passed, 8 Windows FD/symlink skips;
+  Ruff/diff и независимый review прошли. Незавершённый R12 заменяется новым точным
+  кандидатом; его сборка и полная приёмка не объявляются успешными или неуспешными
+  без terminal proof. Новому commit требуются все CI/canonical/native проверки.
+  Рабочий сервер, production units и Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: память полной Next/TypeScript сборки
+
+- R11 run 41363544861 прошёл строгий resource/network probe и оба Nest builds;
+  webpack нового объединённого UI собран за 3.7 минуты. Затем TypeScript worker
+  получил SIGKILL, BuildKit сообщил ResourceExhausted/cannot allocate memory.
+  Kernel OOM event не зафиксирован; кодовая ошибка TypeScript не выведена.
+  R11 имеет accepted=false, экспорт образа пропущен, proof/privacy сохранены.
+- Максимум native RUN увеличен с 6 до 8 GiB при прежнем общем пределе 10 GiB,
+  ограничении common−2 GiB, внешнем запасе не менее 2 GiB, daemon 1 GiB,
+  native swap 4 GiB и CPU 4. Фактический probe/guards не ослаблены. Heap 6144 MiB,
+  Docker recipe, функции приложения и полная TypeScript-проверка не изменены.
+- Проверки: 53 pure/mock Engine tests passed, включая пять границ доступной памяти;
+  Ruff/diff и независимый review прошли. Это не успешный новый native build:
+  для точного commit остаются обязательны полные CI/canonical и native проверки.
+  Рабочий сервер и Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: выключенная политика свежего native стенда
+
+- R8 run 41362209481 подтвердил реальный fresh Postiz owner register/login,
+  cookie и API key, отслеживаемый User unit и безопасный сбор bootstrap evidence.
+  Дальше явный editorial migrate отказал до API-сценария: в новом runtime не было
+  data/hourly-article-policy.local.json. Полная приёмка R8 не заявляется.
+- В новый приватный data перед первой миграцией эксклюзивно копируется точный
+  config/hourly_article_policy.example.json: enabled=false, проверка формы,
+  held directory FD/NOFOLLOW, права 0600 и editorial owner. Имеющийся файл не
+  перезаписывается; адресаты, согласования и отправки не создаются. В handoff
+  уточнена разница fixture нового стенда и сохраняемой политики существующей VM.
+- Проверки: 51 pure/mock passed, 7 Windows FD/symlink skips; совместимость
+  проверена самим HourlyArticleCycle._policy(enabled=False) без БД и сети.
+  Ruff/diff и независимый review прошли. Полный новый CI/canonical checks и
+  native acceptance требуются уже для дерева с main 16efb38 и этим исправлением.
+  Действий на рабочем сервере или в аккаунте Пикабу не было.
+
+## 0.14.0 — 2026-11-02: объединение актуального main с тремя маршрутами
+
+- Включён main 16efb38 после Android/MAX monitoring 0.13.3: сохранены все команды,
+  UI/API мониторинга, исправления MAX, schema/history protections и обязательный
+  unified check. Настройки трёх маршрутов, selected login, original revision,
+  write-only Telegram token, raster Blob preview и bounded upload сохранены.
+- В VK объединены semantic fixture clock из main и локальный WeakMap snapshot;
+  production default остаётся real monotonic/1 секунда. Сохранены preview decode
+  guards, native_url lineage и все real-expiry/native-action проверки. Более
+  полная JUnit privacy диагностика main сохраняет assertions и устраняет прежний
+  synthetic-secret canary CodeQL path без suppression.
+- Private roots включают monitor/browser profiles и admin/restart/login state.
+  Перед первым filesystem stat в browse добавлена явная canonical containment
+  проверка с separator; прежние resolve/private guards сохранены. Traversal на
+  main не воспроизведён, новый CodeQL нужен для проверки ранее открытого alert.
+- Проверки объединения: 179 Node passed, строгий TypeScript/CAS; 40 VK focused
+  passed с real expiry/pause/decode/privacy, 224 deselected; 77 security passed,
+  6 Windows symlink skips и 6 Пикабу cases deselected. Ruff/diff прошли. Все 214
+  записи нашей ветки и 259 записей main сохранены, версии согласованы как 0.14.0.
+  Полные unified/CI/native проверки точного объединённого commit ещё обязательны;
+  эти локальные результаты не являются доставкой или установкой на VM.
+
+## 0.14.0 — 2026-11-02: сохранение TOPIC при строгой проверке release source
+
+- Для существующей VM с собственным TOPIC.md добавлен явный режим отдельного
+  EDITORIAL_RELEASE_ROOT: весь принятый source проверяется по manifest/tree,
+  затем каждый публичный runtime-файл — по тем же SHA. Единственное исключение
+  TOPIC.md требует точного EDITORIAL_PRESERVED_TOPIC_SHA256 из приватного backup
+  до обновления. Неверный SHA, иной source, drift кода/compose и baseline без
+  отдельного source блокируются. Строгий режим по умолчанию сохранён.
+- В handoff добавлена сверка приватных hash-only снимков TOPIC/config/env до и
+  после обновления; config/*.example.json, prompts, schemas и код не исключаются.
+  Runtime app/publishing остаются приватными неотслеживаемыми файлами. Новая
+  framework миграции или изменение runtime-политик не добавлены.
+- Проверки: 40 pure release tests passed; шесть Bash blocks и shell wrapper
+  прошли только синтаксический разбор; Ruff/diff check прошли. VM/Docker/БД не
+  изменялись. Отдельно полный VK regression текущего pre-merge кода: 589 passed,
+  1 Windows symlink skip, 1 предупреждение Starlette; это loopback/временные данные.
+  Итоговое дерево после объединения с новым main требует новой CI/native приёмки.
+
+## 0.14.0 — 2026-11-02: пути native evidence и стоимость свежего VK snapshot
+
+- R6 run 41360104726 подтвердил ранний nginx probe, полную Docker/Next сборку,
+  строгие лимиты/lo-only сеть и готовность зависимостей. До owner HTTP сценарий
+  остановился на EACCES родительского каталога RUNNER_TEMP. Вывод User-сценариев
+  перенесён в собственный project/data/ci-public 0700 без изменения общих прав.
+- Сценарии, portal/default checks и явная миграция запускаются в отслеживаемых
+  transient units пользователя editorial внутри собственного slice/netns с
+  RuntimeMaxSec/KillMode. Сбор отчётов допускается после closed/empty cleanup;
+  root читает только 11 разрешённых имён через held FD, NOFOLLOW, regular/singlelink,
+  owner и size/mtime checks. Полный privacy gate и карантин сохраняются.
+- R6 полный Linux CI: 6603 passed, 26 skipped, 1 failure до Next click VK —
+  VK_BROWSER_ACTION_AUTHORIZATION_EXPIRED, 0 publish clicks. Для сокращения
+  повторных DOM reads состояние одного элемента кешируется только внутри одного
+  атомарного evaluate. Следующий snapshot всегда новый; структура/hash, свежая
+  SQL-проверка и жёсткий лимит 1 секунды не изменены.
+- Проверки: native pure/mock 47 passed, 5 Windows FD/symlink skips; VK с coverage
+  31 passed, 218 deselected. На фиксированном DOM прежний exact hash сохранён,
+  style/rect reads сокращены с 21 до 6 для шести элементов; изменение checkbox
+  между evaluate меняет hash. Slow-authorization/pause и 16 readback races прошли.
+  Ruff/diff check и независимый review прошли. Полный новый CI и native acceptance
+  обязательны; R6 не принят целиком, portable image из него не экспортирован.
+- Рабочий сервер, аккаунты/публикации и Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: полный порядок переноса host-сервиса и proxy
+
+- В handoff явно разделены Postiz image и Python host runtime. Добавлены порядок
+  остановки после паузы/освобождения claims, адресное обновление source с сохранением
+  приватной конфигурации, установка pinned dependencies и проверенного wheel,
+  проверка фактического импорта, отдельная миграция только после клона/backup,
+  Linux Chrome/profile prerequisites и проверка версии/поколения после рестарта.
+- Для неактивного nginx-шаблона добавлены поиск реального listener текущего HTTP
+  origin, приватный backup, адресное слияние, nginx -t, reload и откат. Прочие
+  listeners сохраняются; прежний общий network-and-tools.sh не применяется.
+- Проверки документа: пять Bash blocks прошли синтаксический разбор; CLI argv и
+  существование путей сверены с исходниками, diff check прошёл. Команды установки,
+  миграции, nginx reload и рестарта на рабочем сервере не выполнялись. После
+  включения документа в release commit нужна native/CI приёмка точного дерева;
+  инструкция сама по себе не подтверждает перенос или авторизацию аккаунтов.
+
+## 0.14.0 — 2026-11-02: ранняя проверка прокси и диагностика Linux
+
+- R5 повторно подтвердил полную Docker/Next сборку, строгие ресурсные/сетевые
+  лимиты и готовность временных PostgreSQL/Redis/Temporal/Elasticsearch. Приёмка
+  остановилась на выходе временного nginx до owner-authentication; причина
+  выхода без его лога не установлена, image export и полная готовность не заявлены.
+- Запуск обоих nginx listeners перенесён перед тяжёлой сборкой. Конфигурация
+  повторно используется по SHA; проверяются ожидаемые 502 без приложений и
+  освобождение портов. Read-only filesystem сохранена, все пять nginx temporary
+  directories направлены в приватный tmpfs. Добавлена ограниченная диагностика
+  только собственного контейнера после сверки owner/cgroup; публичный лог проходит
+  полное редактирование секретов до усечения и общий privacy gate. Собственный
+  диагностический CLI закрывается и при ошибке запуска reader thread.
+- Проверки новой native-логики: 35 passed, 1 Windows symlink skip; Ruff и diff
+  check прошли. R5 CI: PostgreSQL 237 passed, четыре Windows shards — 6597 passed
+  и 24 skipped суммарно, Node/package/CodeQL прошли. Полный Linux — 6593 passed,
+  26 skipped и два отказа положительных loopback-сценариев VK; для следующего
+  прогона расширена диагностика fixture без ослабления production fence или
+  assertions. Узкая повторная проверка этих двух сценариев, отрицательных
+  pause/slow-authorization и приватности диагностики: 5 passed, 243 deselected;
+  локально отказы не воспроизвелись. Для нового commit нужны повторный CI и
+  полная native-приёмка.
+- Рабочий сервер, внешние публикации и Пикабу не затрагивались.
+
+## 0.14.0 — 2026-11-02: нативная сборка подтверждена, исправлен argv стенда
+
+- R4 run 41356345817 подтвердил реальные RUN-лимиты 6 GiB RAM / 4 GiB swap /
+  4 CPU и lo-only сеть на собственном Docker 29.9.2 / BuildKit 0.34. Полностью
+  собраны backend, orchestrator и Next webpack/TypeScript; проверены native
+  artifacts, CSS и безопасный CMD. Получен image
+  sha256:5df50071b1468c11b074af60dd69689978254f78a5a48a8c655537143fe573f8.
+- Свежие PostgreSQL/Redis/Temporal/Elasticsearch готовы. Позднее native run
+  остановился до owner-authentication: Next hostname shorthand -H был отклонён
+  общим запретом Docker host overrides. В argv стенда использован --hostname;
+  Engine guard не ослаблен, production Node sources не менялись.
+- R4 не принят целиком: owner/BFF/restart/restore/default-startup приёмка и
+  portable export в нём не завершены. Для нового commit требуются полный
+  native run и CI; успешный build сам по себе не объявляется полной готовностью.
+  CodeQL всех языков и PostgreSQL CI текущего R4 прошли; local Ruff/diff-check
+  узкой argv-правки прошли. Рабочий сервер и Пикабу не изменялись.
+
+## 0.14.0 — 2026-11-02: явный TLS для временного набора Docker
+
+- После CodeQL на следующем кандидате в downloader явно зафиксирован минимум
+  TLS 1.2. Проверка сертификата и hostname сохраняется; источник, SNI, SHA и
+  отсутствие redirects/proxies не меняются. Suppression не добавлен.
+- Все 23 pure-теста downloader прошли, включая certificate/hostname/minimum
+  TLS; Ruff/diff-check прошли. Новый CodeQL и нативный run требуются для точного
+  исправленного commit. Предыдущий незавершённый native-кандидат заменяется этим
+  по source identity, а не считается успешной либо неуспешной сборкой приложения.
+
+## 0.14.0 — 2026-11-02: закреплённый Docker для нативного стенда
+
+- Native run 41354862919 прошёл bootstrap/dependencies/pinned pulls и подтвердил
+  отсутствие внешней сети в RUN, затем остановился до полной сборки: требуемые
+  per-step CPU/memory/swap лимиты не подтвердились на Docker runner. Его отказ
+  и доказательства сохранены; он не считается успешным build или приёмкой.
+- Для следующего disposable GitHub run добавлен собственный Docker 29.9.2 только
+  в RUNNER_TEMP: официальный TLS URL, фиксированные SHA/размер архива и SHA восьми
+  бинарников, публичный IPv4/SNI без proxies/redirects, ручное извлечение только
+  проверенных regular members. Системный Docker/пакеты/daemon не заменяются.
+- Engine использует проверенные CLI/daemon/helper PATH; сохраняются собственные
+  socket/data/cgroup, fd cleanup и строгий реальный resource/network probe.
+  В диагностике probe добавлены self cgroup и mount information; неограниченные
+  значения по-прежнему блокируют тяжёлую сборку.
+- Проверки: 97 pure/mock tests passed, 1 Windows symlink skip, Ruff/diff-check
+  прошли, независимый review без блокеров. Исполнения нового Linux набора ещё
+  не было. В R2 отдельно прошли настоящий PostgreSQL CI (237 tests) и CodeQL;
+  общий CI следующего commit и полная нативная приёмка остаются обязательными.
+
+## 0.14.0 — 2026-11-02: исправления первого независимого CI
+
+- Первый native run 41353716315 остановился в preflight до копирования исходников,
+  сборки и runtime. Учтена несовместимость systemd при пустом фильтрованном списке:
+  проверяются полные inventories с обязательным RC=0 и точными собственными именами.
+  Добавлены приватная диагностика этапа/кода и публичные только typed metadata/SHA.
+  Общие логи редактируются до усечения, чтобы граница tail не раскрывала секрет.
+- Первый PostgreSQL job выявил рассинхронизацию временных MAX fixtures: их
+  намеренные правки publishing/TOPIC теперь записываются и во временные файлы.
+  Production guards не ослаблены. Локальная затронутая SQLite-регрессия:
+  348 passed, 9 deselected; PostgreSQL требует повторного настоящего CI.
+- Для отмеченного CodeQL пути локального preview URL создаётся новый Blob
+  из тех же загруженных байтов с явным растровым MIME. DOM File не используется
+  напрямую как источник URL. SHA, upload и отдельное согласование сохранены.
+  CodeQL suppression не добавлен; новый результат сканирования ещё требуется.
+- В native default-startup учтены и обычные, и prepared записи PostgreSQL
+  log_statement=ddl, включая SQL с комментариями. Проверки: 174 Node passed;
+  59 native/engine pure tests passed, 1 Windows symlink skip; Ruff/diff-check прошли.
+  Source ZIP, wheel/sdist и relocation первого commit прошли privacy/610-file audit,
+  но не заменяют нативную приёмку следующего исправленного commit.
+
+## 0.14.0 — 2026-11-02: заморозка кандидата для независимой нативной приёмки
+
+- Итоговый совместный набор guard/scenario/engine/portal/restart/handoff:
+  110 passed; текущие source/runtime модули проверены Ruff без ошибок.
+  В обычный Node CI включены новый startup suite и тест фиксированного Polkit
+  разрешения; полный результат — 173 passed, без drift 53 проверенных файлов.
+- Все изменения остаются в отдельной копии. Новый workflow собирает и принимает
+  точный commit/source tree, сохраняет только прошедшие privacy scan доказательства
+  и отдельно переносимый image archive. Ошибка cleanup, DDL, приватности или
+  выгрузки образа не подменяется общей готовностью. Реальный полный прогон GitHub
+  и source ZIP/wheel/sdist выполняются после этой заморозки; их результаты
+  хранятся в отдельных проверяемых отчётах, не в runtime исходного архива.
+
+## 0.14.0 — 2026-11-02: запуск без DDL и проверяемая передача образа
+
+- Обычный production CMD заменён на явный запуск nginx и трёх приложений
+  через их проверенные PM2 scripts. Унаследованный root alias с prisma-db-push
+  не вызывается; схема изменяется отдельной операцией. Read-only build checker
+  сверяет три app scripts и SHA startup, shell завершает свои процессы по сигналу.
+- Добавлены последний compose override с immutable image ID и pull_policy never,
+  отдельный release helper с read-only --check по умолчанию и guard source tree /
+  source ZIP manifest, принятого native proof, image ID, SHA/размера архива,
+  baked origin/profile и безопасного CMD. Прежние compose/postiz.sh сохранены;
+  новый helper не принимает один tag или ручной флаг вместо доказательств приёмки.
+- Проверки: 13 startup contract tests отдельно и полный Node runner —
+  173 passed без пропусков; 53 файла совпали до и после полного прогона.
+  23 pure-теста handoff guard прошли. Для приватности публикации proof —
+  19 pure-тестов, включая карантин не прошедшего scan набора и отдельную
+  безопасную квитанцию. Ruff, diff-check и сверка 55 dependency pins прошли.
+- Нативный workflow проверяет безопасный CMD отдельно на восстановленном
+  synthetic клоне с аудитом DDL; его фактический результат обязателен перед
+  принятием переносимого образа. Приведённые числа относятся к локальным
+  контрактам, а не успешной нативной сборке. Рабочий сервер и Пикабу не менялись.
+
+## 0.14.0 — 2026-11-02: защита нативного runner и публичных доказательств
+
+- Добавлены отдельные pure-тесты, запрещающие запуск вне GitHub-hosted root
+  Linux с точным commit, перезапись существующего private state, публикацию
+  HAR/env/raw logs и утечку в proof декодированных паролей DSN/вложенных ключей.
+  Недостаток диска блокирует build, достаточный объём не вызывает cleanup.
+- Проверки: 16 passed, Ruff и diff-check прошли; реальные Docker/systemd,
+  сеть, рабочий сервер и аккаунты этими тестами не запускались.
+
+## 0.14.0 — 2026-11-02: полная локальная регрессия VK и сценарий Linux-приёмки
+
+- Восемь модулей VK: 587 passed, 1 skipped из-за права symlink в Windows;
+  17 исходных файлов совпали до и после прогона. Проверки использовали только
+  mock/loopback Chromium и временные БД, без аккаунта VK и внешних публикаций.
+- Сценарий будущей нативной приёмки проверяет первый synthetic owner Postiz,
+  cookie/CSRF/BFF, точный предел загрузки 10 MiB, создание и правку оригиналов,
+  один запрос restart без повторного POST при потерянной квитанции, новый worker,
+  историю и backup/restore с отдельным unknown fixture. Его 24 pure-теста прошли;
+  они не являются успешным запуском полного стека.
+- Новый workflow использует одноразовый GitHub-hosted Linux runner, собственный
+  Docker engine, ограничения cgroup и сеть приложения только через loopback.
+  Сохранённый LAN origin не используется для запроса к рабочему серверу.
+  Тяжёлая нативная приёмка и поставляемый image принимаются только по её
+  фактическому отчёту; production credentials и runtime не входят в артефакты.
+
+## 0.14.0 — 2026-11-02: воспроизводимость проверок исходного пакета
+
+- В sdist явно включены публичные workflow, pinned Node tooling manifests
+  и scripts/*.cjs; node_modules и runtime не включаются. Исправлена изолированная
+  CI-копия нового публичного backend bootstrap fixture без изменения source pins.
+- Проверки: полный Node runner воспроизвёл отсутствие fixture, после исправления
+  прошли все 159 mock-тестов. Статический аудит MANIFEST подтвердил новые Python,
+  systemd и backend source paths; фактическая сборка пакетов выполняется отдельно
+  после заморозки исходников. Внешние аккаунты, сервер и Пикабу не использовались.
+
+## 0.14.0 — 2026-11-02: управление тремя маршрутами и восстановление настроек
+
+- Из панели Postiz доступны адресат MAX из действующего allowlist, Telegram
+  и личная страница VK, отдельный write-only ввод токенов, загрузка PNG/JPEG
+  с SHA, создание и CAS-редактирование оригиналов. Изменение версии сбрасывает
+  прежние проверки; точное согласование публикации сохраняется отдельным действием.
+- Вход в браузер и перезапуск Linux-обработчика используют ограниченные
+  одноразовые manifests, фиксированные systemd units и Polkit. Обычные serve/status
+  не выполняют миграцию и не синхронизируют адресатов поверх существующей истории.
+  Перед перезапуском проверяются пауза, leases, unknown и readonly очередь Postiz.
+- При сбое между файлом настроек и commit БД сохраняется приватный intent;
+  восстановление сверяет старое/новое состояние и audit nonce. Неоднозначность
+  блокирует изменение без слепого отката. Секреты не попадают в JSON/ответы.
+- Проверки: 73 Python теста настройки, восстановления, bootstrap и maintenance
+  прошли; 25 pure/mock тестов отдельного Docker engine прошли. Это проверки
+  кода и синтетических состояний, не нативная сборка и не живая доставка.
+  README обновлён на 0.14.0. Полная нативная приёмка ещё выполняется отдельно.
+- Действующий HTTP origin сохранён отдельным ограниченным build-профилем.
+  Две локальные попытки build остановлены RAM guard; следующая локальная
+  попытка не стартовала из-за preflight. Тяжёлая приёмка переносится на
+  одноразовый GitHub-hosted Linux runner без production credentials.
+  Рабочий сервер, его БД и Пикабу не изменялись; новых публикаций нет.
+
+## 0.14.0 — 2026-11-01: состав серверного исходного пакета
+
+- В sdist включены source systemd .path и Polkit .rules для новых фиксированных
+  операций входа/перезапуска. Runtime, credentials и volumes в пакет не добавляются.
+- Статическая проверка MANIFEST выполнена; окончательная wheel/sdist-приёмка
+  проводится после заморозки всех исходников. Первый и второй native build
+  безопасно остановлены host RAM guard без OOM; их traces сохранены отдельно.
+  После остановки только собственного WSL runtime освобождено около 1,5 GiB RAM;
+  следующий build использует прежние функции/типизацию и ограниченные ресурсы.
+
+## 0.14.0 — 2026-11-01: решение владельца о VK и действующем адресе
+
+- В AGENTS сохранены прямые решения владельца: действующий
+  http://10.20.30.45:4007 сохраняется; рабочий сервер и Пикабу не участвуют
+  в испытаниях; ограниченный native-uniform-edge-lineage-v1 разрешён для
+  будущих отдельно согласованных изображений VK. Это не общее разрешение
+  публикаций и не переоценка истории.
+- Добавлена интеграционная проверка нового policy/evidence binding: теперь
+  101 VK media/edge тест прошёл. Offline replay сохранённой геометрии прежней
+  картинки подтвердил случай 1400×1000 → 1399×999 с однородной границей;
+  сеть, новая публикация и изменение прежней dispatch/history не использовались.
+- Read-only Telegram getMe/getChat/getChatMember в копии подтвердили канал и
+  право бота публиковать. Это access_only, не новая доставка; существующая
+  приёмка фото и API verified=false сохраняются раздельно.
+- Предварительные onboarding проверки: 40 Node/TypeScript и 46 Python tests
+  прошли. Native-сборка и полная серверная приёмка продолжаются отдельно;
+  остановка первого build по host RAM guard сохранена как resource failure,
+  не как успешная сборка или ошибка исходников. Межресурсное восстановление
+  конфигурации file/DB проходит дополнительную реализацию и проверку.
+
+## 0.14.0 — 2026-11-01: подготовка трёх маршрутов к серверной установке
+
+- Разработка ведётся от main в отдельной копии; исходный runtime, рабочая VM
+  и Пикабу не изменяются. Сохраняются история, approvals, unknown и leases.
+- Добавлен отдельный выключенный по умолчанию контракт VK
+  native-uniform-edge-lineage-v1: при согласованном native asset lineage
+  допустимо удалить максимум один непрозрачный одноцветный пиксель границы
+  справа/снизу. Требуются точный native crop=0,0,width,height, прежние asset,
+  snapshot/source SHA и независимые readbacks. Resize, поворот, crop слева/сверху,
+  удаление содержательной/прозрачной границы и неоднозначные параметры запрещены.
+  Прежние политики, точные source identities и согласования не переписываются.
+- Проверки этого этапа: 100 VK media/edge unit-тестов прошли. Это синтетическая
+  регрессия, не новая живая публикация. Новый контракт не активирован без
+  отдельного решения владельца; изображения по прежним правилам сохраняют gates.
+- Остальные серверные изменения и их приёмка будут зафиксированы отдельной
+  записью после завершения. Текущий адрес рабочего Postiz сохраняется по прямому
+  указанию владельца; реальный сервер при испытаниях не используется.
+
+
 ## 0.13.3 — 2026-11-02: явные часы семантических VK-fixtures
 
 - CI 1672151 подтвердил normal 7042 passed/35 skips и согласованный Windows

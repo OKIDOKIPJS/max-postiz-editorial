@@ -303,15 +303,19 @@ def _mutation_stamp(page, selectors):
             "uploaded_asset", "preview_asset", "image_edit_active", "blocked", "errors")
     try:
         result = page.evaluate("""selectors => {
+          const states=new WeakMap();
           const state = e => {
+            if(states.has(e))return states.get(e);
             const s=getComputedStyle(e), r=e.getBoundingClientRect();
-            return {value:'value' in e?e.value:null,checked:'checked' in e?e.checked:null,
+            const captured={value:'value' in e?e.value:null,checked:'checked' in e?e.checked:null,
               disabled:'disabled' in e?e.disabled:null,inert:e.inert,
               files:e.files?[...e.files].map(f=>[f.name,f.size,f.lastModified]):null,
               image:e.tagName==='IMG'?{url:e.currentSrc||e.src,complete:e.complete,
                 width:e.naturalWidth,height:e.naturalHeight}:null,
               visible:r.width>0&&r.height>0,display:s.display,visibility:s.visibility,
               opaque:Number(s.opacity)>0,pointerEvents:s.pointerEvents,clip:s.clip,clipPath:s.clipPath};
+            states.set(e,captured);
+            return captured;
           };
           const capture = e => {
             const nodes=[e,...e.querySelectorAll('*')];
@@ -711,7 +715,8 @@ def _photo_original(page, plan, selectors, expected_asset, *, origin, media_revi
             proof = accepted_proof(response.body(), plan["source_image"], plan["image_contract"], expected_asset,
                                    media_review, before["original"], origin=origin)
         else:
-            proof = derivative_proof(response.body(), plan["source_image"], expected_asset, plan["image_contract"])
+            proof = derivative_proof(response.body(), plan["source_image"], expected_asset, plan["image_contract"],
+                                     native_url=before["original"])
         after = capture()
         if before != after:
             raise AgentError("VK_BROWSER_PHOTO_VIEWER_CHANGED_DURING_READ")

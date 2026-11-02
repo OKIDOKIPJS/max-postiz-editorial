@@ -1,0 +1,484 @@
+"""Pure/mock tests: no Docker daemon, systemd, Linux runtime or browser starts."""
+
+import importlib.util
+import hashlib
+import json
+from pathlib import Path
+import stat
+import subprocess
+from types import SimpleNamespace
+
+import pytest
+
+
+PATH = Path(__file__).resolve().parents[1] / "deployment/linux/readiness_engine.py"
+SPEC = importlib.util.spec_from_file_location("readiness_engine", PATH)
+engine_module = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(engine_module)
+Engine, EngineError, GIB = engine_module.Engine, engine_module.EngineError, engine_module.GIB
+
+
+def test_construction_and_plan_are_pure_on_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_module.subprocess, "run", lambda *a, **k: pytest.fail("spawn forbidden"))
+    engine = Engine(tmp_path / "new-engine", tmp_path / "evidence")
+    plan = engine.plan(14 * GIB)
+    assert not engine.root.exists()
+    assert plan["limits"]["memory_bytes"] == 10 * GIB
+    assert plan["limits"]["native_memory_bytes"] == 8 * GIB
+    assert plan["limits"]["daemon_memory_bytes"] == GIB
+    assert plan["cgroup_parent"] == "/" + engine.slice
+    assert "--data-root=" + str(engine.data_root) in plan["daemon"]
+    assert "--exec-root=" + str(engine.exec_root) in plan["daemon"]
+    assert "--cgroup-parent=" + engine.cgroup_parent in plan["daemon"]
+    for flag in ("--bridge=none", "--iptables=false", "--ip-forward=false", "--ip-masq=false"):
+        assert flag in plan["daemon"]
+    assert all("/var/run/docker.sock" not in flag for flag in plan["daemon"])
+
+
+@pytest.mark.parametrize("platform,uid,environment", [
+    ("win32", 0, {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"}),
+    ("linux", 1000, {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"}),
+    ("linux", 0, {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "self-hosted"}),
+    ("linux", 0, {"GITHUB_ACTIONS": "false", "RUNNER_ENVIRONMENT": "github-hosted"}),
+    ("linux", 0, {}),
+])
+def test_ephemeral_guard_rejects_every_ambient_or_nonroot_host(platform, uid, environment):
+    with pytest.raises(EngineError, match="OWN_ENGINE_EPHEMERAL_RUNNER_REQUIRED"):
+        engine_module._ephemeral_environment(platform, uid, environment)
+
+
+def test_ephemeral_guard_accepts_only_explicit_hosted_linux_root():
+    engine_module._ephemeral_environment("linux", 0, {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"})
+
+
+def test_memory_budget_reserves_two_gib_and_rejects_low_host():
+    limits = engine_module._limits(7 * GIB)
+    assert limits["memory_bytes"] == 5 * GIB and limits["native_memory_bytes"] == 3 * GIB
+    assert limits["swap_bytes"] == 8 * GIB
+    for value in (6 * GIB, -1, True, float(14 * GIB)):
+        with pytest.raises(EngineError):
+            engine_module._limits(value)
+
+
+@pytest.mark.parametrize("available,native", [
+    (8 * GIB, 4 * GIB), (11 * GIB, 7 * GIB), (12 * GIB - 1, 8 * GIB - 1),
+    (12 * GIB, 8 * GIB), (16 * GIB, 8 * GIB),
+])
+def test_eight_gib_run_cap_preserves_daemon_headroom_and_host_reserve(available, native):
+    limits = engine_module._limits(available)
+    assert limits["native_memory_bytes"] == native
+    assert limits["memory_bytes"] <= 10 * GIB
+    assert limits["memory_bytes"] <= available - 2 * GIB
+    assert native <= limits["memory_bytes"] - 2 * GIB
+    assert limits["daemon_memory_bytes"] == GIB
+    assert limits["native_swap_bytes"] == 4 * GIB
+    assert limits["cpus"] == 4 and limits["host_reserve_bytes"] == 2 * GIB
+
+
+def test_paths_must_be_new_plain_children_of_runner_temp(tmp_path, monkeypatch):
+    assert engine_module._inside_plain(tmp_path / "owned" / "proof.json", tmp_path) == (tmp_path / "owned/proof.json").resolve()
+    for path in (tmp_path, tmp_path / "../outside", Path("relative")):
+        with pytest.raises(EngineError):
+            engine_module._inside_plain(path, tmp_path)
+    original = Path.is_symlink
+    linked = tmp_path / "linked"
+    monkeypatch.setattr(Path, "is_symlink", lambda self: self == linked or original(self))
+    with pytest.raises(EngineError):
+        engine_module._inside_plain(linked / "engine", tmp_path)
+
+
+def test_docker_environment_uses_fresh_private_config_without_ambient_host_or_credentials(tmp_path):
+    value = engine_module._environment({"DOCKER_HOST": "tcp://other:2375", "DOCKER_CONTEXT": "other",
+        "DOCKER_AUTH_CONFIG": "secret", "DOCKER_CONFIG": "/ambient", "BUILDX_BUILDER": "ambient", "BUILDKIT_HOST": "tcp://other", "SAFE": "yes"},
+        config_dir=tmp_path / "private-client")
+    assert value["DOCKER_CONFIG"] == str(tmp_path / "private-client")
+    assert value["SAFE"] == "yes"
+    assert "DOCKER_HOST" not in value and "DOCKER_CONTEXT" not in value and "DOCKER_AUTH_CONFIG" not in value
+    assert "BUILDX_BUILDER" not in value and "secret" not in json.dumps(value)
+    assert "BUILDKIT_HOST" not in value
+
+
+def test_every_cli_call_pins_private_socket_and_config(tmp_path, monkeypatch):
+    calls = []
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._created = True
+    monkeypatch.setattr(engine_module.subprocess, "run", lambda command, **kwargs:
+        calls.append((command, kwargs)) or subprocess.CompletedProcess(command, 0, "result", ""))
+    result = engine.docker("version", env={"DOCKER_HOST": "unix:///var/run/docker.sock"})
+    assert result.stdout == "result"
+    command, kwargs = calls[0]
+    assert command[:5] == ["/usr/bin/docker", "--host", engine.socket, "--config", str(engine.config_dir)]
+    assert "DOCKER_HOST" not in kwargs["env"]
+    assert kwargs["timeout"] == 60 and kwargs["capture_output"] is True and kwargs["check"] is True
+    engine.docker("load", input=b"image", text=False, timeout=180)
+    assert calls[1][1]["input"] == b"image" and calls[1][1]["text"] is False
+    for args in (("--host", "unix:///var/run/docker.sock"), ("--context=default",), ("--config=/ambient",)):
+        with pytest.raises(EngineError):
+            engine.docker(*args)
+    with pytest.raises(EngineError):
+        engine.docker("info", shell=True)  # noqa: S604 - rejection test; never executes a shell.
+    assert len(calls) == 2
+
+
+def mock_engine(tmp_path, monkeypatch, *, dirty=False, identity_override=None):
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    calls = []
+    def guard():
+        engine.commonlimits = engine_module._limits(14 * GIB)
+        engine._evidence_file = tmp_path / "evidence/engine.json"
+    engine._guard = guard
+    engine._capture_cgroup = lambda: None
+    engine._kill_owned_cgroup = lambda: None
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        output = ""
+        if command[0] == "/usr/bin/systemctl" and "--property=ControlGroup" in command:
+            output = engine.cgroup_parent
+        if command[0] == str(engine.docker_binary):
+            args = command[5:]
+            if args[0] == "info":
+                output = json.dumps({"ID": "own-engine-id", "DockerRootDir": str(engine.data_root),
+                    "CgroupDriver": "cgroupfs", "Labels": [engine_module.LABEL_KEY + "=" + engine.label_value],
+                    **(identity_override or {})})
+            elif args[:2] == ["ps", "-aq"]:
+                output = "a" * 64 if dirty and "--filter" not in args else ""
+        return subprocess.CompletedProcess(command, 0, output, "")
+    engine._run = run
+    return engine, calls
+
+
+def test_mock_lifecycle_caps_slice_before_daemon_and_preserves_host_resources(tmp_path, monkeypatch):
+    engine, calls = mock_engine(tmp_path, monkeypatch)
+    with engine as entered:
+        assert entered.engine_id == "own-engine-id"
+        assert json.loads((tmp_path / "evidence/engine.json").read_text())["initial_volumes"] == 0
+    commands = [command for command, _ in calls]
+    cap = next(index for index, command in enumerate(commands) if "set-property" in command)
+    daemon = next(index for index, command in enumerate(commands) if "/usr/bin/dockerd" in command)
+    assert cap < daemon
+    assert all("prune" not in command and "volume rm" not in " ".join(command) for command in commands)
+    stops = [command[-1] for command in commands if command[:2] == ["/usr/bin/systemctl", "stop"]]
+    assert stops == [engine.daemon_unit, engine.anchor_unit, engine.slice]
+    assert all("docker.service" != item for item in stops)
+    proof = json.loads((tmp_path / "evidence/engine.json").read_text())
+    assert proof["state"] == "closed" and proof["host_daemon_used"] is False
+    assert engine.data_root.parent.is_dir()  # No recursive deletion/pruning.
+    before = len(calls)
+    engine.close()
+    assert len(calls) == before
+
+
+def test_nonempty_new_engine_fails_before_any_native_work_and_closes_units(tmp_path, monkeypatch):
+    engine, calls = mock_engine(tmp_path, monkeypatch, dirty=True)
+    with pytest.raises(EngineError, match="OWN_ENGINE_NOT_EMPTY"):
+        engine.__enter__()
+    assert engine._closed
+    assert any(command[:2] == ["/usr/bin/systemctl", "stop"] for command, _ in calls)
+
+
+def test_wrong_daemon_identity_is_never_validated_or_used_for_container_cleanup(tmp_path, monkeypatch):
+    engine, calls = mock_engine(tmp_path, monkeypatch, identity_override={"DockerRootDir": "/var/lib/docker"})
+    clock = iter([0, 41])
+    monkeypatch.setattr(engine_module.time, "monotonic", lambda: next(clock))
+    with pytest.raises(EngineError, match="OWN_ENGINE_START_TIMEOUT"):
+        engine.__enter__()
+    assert not engine._validated
+    assert not any(command[5:6] == ["stop"] for command, _ in calls if command[0] == "/usr/bin/docker")
+
+
+def test_cleanup_stops_only_labelled_owned_containers_under_the_owned_cgroup(tmp_path, monkeypatch):
+    engine, calls = mock_engine(tmp_path, monkeypatch)
+    engine.__enter__()
+    original = engine._run
+    ident = "f" * 64
+    def run(command, **kwargs):
+        args = command[5:] if command[0] == "/usr/bin/docker" else []
+        if args[:2] == ["ps", "-aq"] and "--filter" in args:
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, ident, "")
+        if args[:1] == ["inspect"]:
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, json.dumps([{"Config": {"Labels": {engine_module.LABEL_KEY: engine.label_value}},
+                "HostConfig": {"CgroupParent": engine.cgroup_parent}}]), "")
+        return original(command, **kwargs)
+    engine._run = run
+    engine.close()
+    stops = [command[5:] for command, _ in calls if command[0] == "/usr/bin/docker" and command[5:6] == ["stop"]]
+    assert stops == [["stop", "--time=10", ident]]
+
+
+def test_namespace_wrapper_binds_only_inside_private_namespace_and_keeps_argv_literal(tmp_path, monkeypatch):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._validated = True
+    original = Path.stat
+    monkeypatch.setattr(Path, "stat", lambda self, *args, **kwargs:
+        type("SocketStat", (), {"st_mode": stat.S_IFSOCK})() if self == Path("/var/run/docker.sock")
+        else original(self, *args, **kwargs))
+    command = ["node", "script with spaces.cjs", "$(do-not-run); literally"]
+    result = engine.namespace_command(command)
+    assert result[:4] == ["/usr/bin/unshare", "--mount", "--propagation", "private"]
+    assert result[-3:] == command
+    assert str(engine.socket_path) not in result[7]  # Source path is argv, never shell interpolation.
+    assert 'exec "$@"' in result[7] and '"$1" /var/run/docker.sock' in result[7]
+
+
+def test_namespace_wrapper_never_creates_a_missing_host_socket(tmp_path, monkeypatch):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._validated = True
+    monkeypatch.setattr(Path, "stat", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    with pytest.raises(EngineError, match="OWN_ENGINE_HOST_SOCKET_MISSING"):
+        engine.namespace_command(["node", "runner.cjs"])
+
+
+def test_command_errors_do_not_expose_captured_private_output(tmp_path, monkeypatch):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    monkeypatch.setattr(engine_module.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+        subprocess.CalledProcessError(1, ["private"], output="secret", stderr="secret")))
+    with pytest.raises(EngineError) as caught:
+        engine._run(["/usr/bin/systemctl", "show", engine.slice])
+    assert str(caught.value) == "OWN_ENGINE_COMMAND_FAILED"
+
+
+def test_all_subprocess_timeouts_remain_bounded(tmp_path, monkeypatch):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    monkeypatch.setattr(engine_module.subprocess, "run", lambda *a, **k: pytest.fail("unbounded call"))
+    for timeout in (None, True, 0, -1, float("nan"), float("inf")):
+        with pytest.raises(EngineError, match="OWN_ENGINE_TIMEOUT_REQUIRED"):
+            engine._run(["/usr/bin/docker", "info"], timeout=timeout)
+
+
+@pytest.mark.parametrize("foreign", ["label", "cgroup"])
+def test_cleanup_never_stops_a_foreign_label_or_parent(tmp_path, monkeypatch, foreign):
+    engine, calls = mock_engine(tmp_path, monkeypatch)
+    engine.__enter__()
+    original = engine._run
+    ident = "f" * 64
+    def run(command, **kwargs):
+        args = command[5:] if command[0] == "/usr/bin/docker" else []
+        if args[:2] == ["ps", "-aq"] and "--filter" in args:
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, ident, "")
+        if args[:1] == ["inspect"]:
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, json.dumps([{
+                "Config": {"Labels": {engine_module.LABEL_KEY: "foreign" if foreign == "label" else engine.label_value}},
+                "HostConfig": {"CgroupParent": "/foreign.slice" if foreign == "cgroup" else engine.cgroup_parent}}]), "")
+        return original(command, **kwargs)
+    engine._run = run
+    with pytest.raises(EngineError, match="OWN_ENGINE_CLEANUP_UNCONFIRMED"):
+        engine.close()
+    assert not any(command[5:6] == ["stop"] for command, _ in calls if command[0] == "/usr/bin/docker")
+    assert any(command[:2] == ["/usr/bin/systemctl", "stop"] for command, _ in calls)
+
+
+def fake_cgroup(tmp_path, monkeypatch, *, missing_kill=False, never_empty=False, populated=True):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._cgroup_fd = 41
+    state = {"populated": populated, "writes": [], "opens": []}
+    def opened(name, flags, *, dir_fd):
+        state["opens"].append((name, flags, dir_fd))
+        assert name == "cgroup.kill" and dir_fd == 41
+        if missing_kill:
+            raise FileNotFoundError
+        return 42
+    def written(descriptor, value):
+        assert descriptor == 42
+        state["writes"].append(value)
+        if not never_empty:
+            state["populated"] = False
+        return len(value)
+    fake = SimpleNamespace(O_WRONLY=1, O_NOFOLLOW=0x20000, open=opened, write=written,
+                           close=lambda fd: None, fstat=lambda fd: SimpleNamespace(st_nlink=1))
+    monkeypatch.setattr(engine_module, "os", fake)
+    engine._cgroup_read = lambda name: "populated " + ("1" if state["populated"] else "0") + "\nfrozen 0"
+    return engine, state
+
+
+def test_detached_buildkit_cleanup_kills_only_the_held_owned_cgroup_and_proves_empty(tmp_path, monkeypatch):
+    engine, state = fake_cgroup(tmp_path, monkeypatch)
+    engine._kill_owned_cgroup()
+    assert state["writes"] == [b"1"]
+    assert state["opens"] == [("cgroup.kill", 1 | 0x20000, 41)]
+    assert not state["populated"]
+
+
+def test_missing_cgroup_kill_remains_unconfirmed_without_any_fallback_pid_kill(tmp_path, monkeypatch):
+    engine, state = fake_cgroup(tmp_path, monkeypatch, missing_kill=True)
+    with pytest.raises(EngineError, match="OWN_ENGINE_CGROUP_CLEANUP_UNCONFIRMED"):
+        engine._kill_owned_cgroup()
+    assert not state["writes"] and state["populated"]
+
+
+def test_cgroup_kill_wait_is_bounded_and_never_repeats_the_kill(tmp_path, monkeypatch):
+    engine, state = fake_cgroup(tmp_path, monkeypatch, never_empty=True)
+    clock = iter([0, 11])
+    monkeypatch.setattr(engine_module.time, "monotonic", lambda: next(clock))
+    with pytest.raises(EngineError, match="OWN_ENGINE_CGROUP_CLEANUP_UNCONFIRMED"):
+        engine._kill_owned_cgroup()
+    assert state["writes"] == [b"1"]
+
+
+def test_empty_held_cgroup_requires_no_kill(tmp_path, monkeypatch):
+    engine, state = fake_cgroup(tmp_path, monkeypatch, populated=False)
+    engine._kill_owned_cgroup()
+    assert state["opens"] == [] and state["writes"] == []
+
+
+def test_full_unit_inventory_ignores_unrelated_units_and_queries_without_empty_patterns(tmp_path):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        # systemd 262: filtered names with zero matches return ENOENT. The new
+        # full inventories never submit those patterns in the first place.
+        assert engine.slice not in command and engine.daemon_unit not in command and engine.anchor_unit not in command
+        assert "--plain" in command and "--no-legend" in command
+        assert kwargs["env"]["SYSTEMD_COLORS"] == "0"
+        return subprocess.CompletedProcess(command, 0, "ssh.service loaded active running SSH\nunrelated.slice loaded active active Slice\n", "")
+    engine._run = run
+    engine._assert_unused_units()
+    assert [command[1] for command in calls] == ["list-units", "list-unit-files"]
+
+
+@pytest.mark.parametrize("kind", ["slice", "daemon_unit", "anchor_unit"])
+def test_full_inventory_exact_owned_name_collision_blocks_before_any_start(tmp_path, kind):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._run = lambda command, **kwargs: subprocess.CompletedProcess(command, 0, getattr(engine, kind) + " loaded inactive dead owned\n", "")
+    with pytest.raises(EngineError, match="OWN_ENGINE_UNIT_ALREADY_EXISTS"):
+        engine._assert_unused_units()
+    assert not engine._anchor_started and not engine._daemon_started
+
+
+def test_failing_full_inventory_is_never_treated_as_absence(tmp_path):
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._run = lambda command, **kwargs: subprocess.CompletedProcess(command, 1, "", "bus unavailable")
+    with pytest.raises(EngineError, match="OWN_ENGINE_COMMAND_FAILED") as caught:
+        engine._assert_unused_units()
+    assert caught.value.returncode == 1 and caught.value.stage == "UNIT_LIST_QUERY"
+    assert not engine._anchor_started and not engine._daemon_started
+
+
+def test_private_failure_records_stage_and_bounded_output_without_argv_or_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._created = True
+    engine._evidence_file = tmp_path / "private/engine.json"
+    engine._stage = "UNIT_FILE_LIST_QUERY"
+    def failed(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["never-store-this-argument"], output="x" * 12000, stderr="bounded private stderr")
+    monkeypatch.setattr(engine_module.subprocess, "run", failed)
+    with pytest.raises(EngineError) as caught:
+        engine._run(["/usr/bin/systemctl", "list-unit-files"], env={"PRIVATE": "never-store-this-environment"})
+    assert str(caught.value) == "OWN_ENGINE_COMMAND_FAILED"
+    assert caught.value.stage == "UNIT_FILE_LIST_QUERY" and caught.value.returncode == 1
+    path = tmp_path / "private/engine-failure.json"
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    assert value["stage"] == "UNIT_FILE_LIST_QUERY" and value["returncode"] == 1
+    assert value["stdout_tail"] == "x" * 4096 and value["stderr_tail"] == "bounded private stderr"
+    assert "never-store-this" not in raw.decode() and len(raw) < 65536
+    # Cleanup's different failure must not replace the first fatal operation.
+    engine._stage = "CLEANUP_SLICE_STOP"
+    with pytest.raises(EngineError):
+        engine._run(["/usr/bin/systemctl", "stop", engine.slice])
+    assert path.read_bytes() == raw
+
+
+def test_readiness_poll_failures_are_not_persisted_unless_startup_times_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    engine = Engine(tmp_path / "engine", tmp_path / "evidence")
+    engine._created = True
+    engine._evidence_file = tmp_path / "private/engine.json"
+    engine._stage = "DAEMON_READY"
+    monkeypatch.setattr(engine_module.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+        subprocess.CalledProcessError(1, ["docker"], stderr="not ready yet")))
+    with pytest.raises(EngineError):
+        engine._run(["docker", "info"], record_failure=False)
+    assert engine.last_failure is None and not (tmp_path / "private/engine-failure.json").exists()
+    engine._persist_failure(engine._transient_failure)
+    assert json.loads((tmp_path / "private/engine-failure.json").read_bytes())["stage"] == "DAEMON_READY"
+
+
+def bundle_fixture(tmp_path, monkeypatch):
+    root = tmp_path / "download/bin"
+    root.mkdir(parents=True)
+    contents = {name: ("synthetic-not-executable:" + name).encode() for name in engine_module.BUNDLE_FILES}
+    hashes = {name: hashlib.sha256(value).hexdigest() for name, value in contents.items()}
+    for name, value in contents.items():
+        (root / name).write_bytes(value)
+    marker = {"contract": engine_module.BUNDLE_CONTRACT, "version": engine_module.BUNDLE_VERSION,
+              "archive_sha256": engine_module.BUNDLE_SHA256, "archive_bytes": engine_module.BUNDLE_BYTES,
+              "binaries": hashes}
+    (root / "bundle.json").write_text(json.dumps(marker))
+    # Windows does not expose POSIX owner/execute bits. Ownership/modes are
+    # tested independently with Linux-shaped stat values below; no binary runs.
+    monkeypatch.setattr(engine_module, "_bundle_stat", lambda *a, **k: None)
+    monkeypatch.setattr(engine_module, "BUNDLE_BINARY_SHA256", hashes)
+    return root, marker
+
+
+def test_owned_bundle_validates_every_byte_against_pinned_manifest_without_execution(tmp_path, monkeypatch):
+    root, _ = bundle_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(engine_module.subprocess, "run", lambda *a, **k: pytest.fail("execution forbidden"))
+    assert engine_module._validate_binary_root(root, tmp_path) == root.resolve()
+    (root / "runc").write_bytes(b"replacement")
+    with pytest.raises(EngineError, match="OWN_ENGINE_BINARY_BUNDLE_INVALID"):
+        engine_module._validate_binary_root(root, tmp_path)
+
+
+@pytest.mark.parametrize("change", ["version", "archive_sha", "archive_bytes", "forged_manifest", "missing", "extra", "duplicate"])
+def test_owned_bundle_rejects_unpinned_or_incomplete_markers(tmp_path, monkeypatch, change):
+    root, marker = bundle_fixture(tmp_path, monkeypatch)
+    if change == "version":
+        marker["version"] = "29.4.2"
+    elif change == "archive_sha":
+        marker["archive_sha256"] = "0" * 64
+    elif change == "archive_bytes":
+        marker["archive_bytes"] = True
+    elif change == "forged_manifest":
+        marker["binaries"] = {**marker["binaries"], "runc": "0" * 64}
+    elif change == "missing":
+        (root / "runc").unlink()
+    elif change == "extra":
+        (root / "unapproved-helper").write_bytes(b"extra")
+    if change == "duplicate":
+        raw = json.dumps(marker)[:-1] + ',"version":"29.9.2"}'
+    else:
+        raw = json.dumps(marker)
+    (root / "bundle.json").write_text(raw)
+    with pytest.raises(EngineError, match="OWN_ENGINE_BINARY_BUNDLE_INVALID"):
+        engine_module._validate_binary_root(root, tmp_path)
+
+
+def test_owned_bundle_cannot_reside_outside_runner_temp(tmp_path, monkeypatch):
+    root, _ = bundle_fixture(tmp_path, monkeypatch)
+    with pytest.raises(EngineError):
+        engine_module._validate_binary_root(root, tmp_path / "different-root")
+
+
+@pytest.mark.parametrize("changes", [
+    {"st_uid": 1000}, {"st_mode": stat.S_IFREG | 0o577},
+    {"st_mode": stat.S_IFREG | 0o4755}, {"st_mode": stat.S_IFLNK | 0o777},
+    {"st_nlink": 2}, {"st_mode": stat.S_IFREG | 0o444},
+])
+def test_binary_stat_requires_root_owned_plain_single_link_executable(changes):
+    value = {"st_uid": 0, "st_mode": stat.S_IFREG | 0o555, "st_nlink": 1, **changes}
+    with pytest.raises(EngineError, match="OWN_ENGINE_BINARY_BUNDLE_INVALID"):
+        engine_module._bundle_stat(SimpleNamespace(**value), executable=True)
+
+
+def test_owned_bundle_cli_and_systemd_helper_path_are_explicit_without_global_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "ambient-unsafe-path")
+    engine, calls = mock_engine(tmp_path, monkeypatch)
+    engine.binary_root = tmp_path / "owned-docker/bin"
+    engine.__enter__()
+    expected = str(engine.binary_root) + ":/usr/bin:/bin"
+    daemon = next(command for command, _ in calls if str(engine.dockerd_binary) in command)
+    assert "--setenv=PATH=" + expected in daemon
+    assert str(engine.dockerd_binary) == daemon[daemon.index(str(engine.dockerd_binary))]
+    cli_calls = [(command, options) for command, options in calls if command[0] == str(engine.docker_binary)]
+    assert cli_calls and all(options["env"]["PATH"] == expected for _, options in cli_calls)
+    assert all(command[1:5] == ["--host", engine.socket, "--config", str(engine.config_dir)] for command, _ in cli_calls)
+    assert engine_module.os.environ["PATH"] == "ambient-unsafe-path"
+    engine.close()

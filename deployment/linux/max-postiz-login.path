@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch authenticated owner login selections only
+
+[Path]
+PathChanged=/opt/max-postiz/data/owner-browser-selection.json
+Unit=max-postiz-login.service
+
+[Install]
+WantedBy=multi-user.target

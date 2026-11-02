@@ -10,6 +10,7 @@ from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit, Draft, Material, Story, now
 from max_postiz_agent.hub_models import BridgePost, Dispatch, RemoteDraft, Target, TargetApproval, Variant, VariantRevision
 from max_postiz_agent.reddit import text_hash
+from conftest import write_topic
 
 pytest_plugins = ["test_max_bridge"]
 
@@ -48,6 +49,7 @@ def cycle(bridge, monkeypatch):
     core, records, _, _, _ = bridge
     records.clear()
     core.settings.channel("main")["publication"].update(max_posts_per_day=24, min_gap_minutes=60)
+    write_topic(core.settings.root, core.settings.topic)
     stamp = [int(now() // 3600) * 3600 + 1800]
     monkeypatch.setattr("max_postiz_agent.article_cycle.now", lambda: stamp[0])
     policy = {"enabled": True, "target_id": "max", "source_id": "example_rss",

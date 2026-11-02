@@ -1,0 +1,14 @@
+# Apply LAST, after deployment/linux/compose.yaml. An immutable accepted ID only.
+# The historical project, databases, volumes, ports and secrets are unchanged.
+services:
+  postiz:
+    image: ${EDITORIAL_POSTIZ_IMAGE:?Set the exact sha256 image ID from the accepted release}
+    pull_policy: never
+    environment:
+      MAIN_URL: http://10.20.30.45:4007
+      FRONTEND_URL: http://10.20.30.45:4007
+      NEXT_PUBLIC_BACKEND_URL: http://10.20.30.45:4007/api
+      NOT_SECURED: 'true'
+      PRODUCTION_ORIGIN_PROFILE: legacy-private-lan-http-v1
+      RUN_CRON: ''
+      EXCLUDE_QUEUE: bluesky,devto,discord,dribbble,email,email-bulk,facebook,gmb,hashnode,instagram,kick,lemmy,linkedin,listmonk,mastodon,medium,mewe,moltbook,nostr,pinterest,reddit,skool,slack,telegram,threads,tiktok,tumblr,twitch,vk,whop,wordpress,wrapcast,x,youtube,main,max

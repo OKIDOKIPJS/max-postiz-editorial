@@ -1,0 +1,13 @@
+// Install root-owned under /etc/polkit-1/rules.d; never import project Python as root.
+// https://polkit.pages.freedesktop.org/polkit/polkit.8.html
+polkit.addRule(function(action, subject) {
+    if (action.id === 'org.freedesktop.systemd1.manage-units' &&
+        action.lookup('unit') === 'max-postiz-editorial.service' &&
+        action.lookup('verb') === 'restart' &&
+        subject.user === 'editorial' &&
+        subject.system_unit === 'max-postiz-editorial-restart.service' &&
+        subject.no_new_privileges === true) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

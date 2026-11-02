@@ -1,0 +1,102 @@
+name: Isolated native three-platform readiness
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/three-platform-server-readiness]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-readiness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[native-readiness]')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Build and exercise only a new owned engine and loopback namespace
+        shell: bash
+        run: |
+          sudo env -i PATH="$PATH" HOME=/root \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_TEMP="$RUNNER_TEMP" GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            LD_LIBRARY_PATH="$pythonLocation/lib" \
+            GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" PYTHONUTF8=1 \
+            DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            "$pythonLocation/bin/python" deployment/linux/native_readiness.py \
+            --github-hosted --evidence "$RUNNER_TEMP/native-readiness-public"
+      - name: Validate the completed privacy receipt and image export manifest
+        if: always()
+        id: artifacts
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          public=root/'native-readiness-public'
+          allowed=False; image=False
+          try:
+              receipt=json.loads((public/'.privacy-verified.json').read_text())
+              assert receipt['contract']=='native-public-privacy-v1' and receipt['secret_matches']==0
+              assert set(receipt['files'])=={p.name for p in public.iterdir() if p.name!='.privacy-verified.json'}
+              for name,sha in receipt['files'].items():
+                  path=public/name
+                  assert path.parent==public and path.is_file() and not path.is_symlink()
+                  assert hashlib.sha256(path.read_bytes()).hexdigest()==sha
+              allowed=True
+              proof=json.loads((public/'acceptance.json').read_text())
+              if proof.get('accepted') is True:
+                  manifest=json.loads((root/'native-readiness-image/image-verification.json').read_text())
+                  assert manifest==proof['portable_image'] and manifest['runtime_credentials_included'] is False
+                  path=root/'native-readiness-image'/manifest['filename']
+                  assert path.name=='max-postiz-0.14.0.tar.gz' and path.is_file() and not path.is_symlink()
+                  assert path.stat().st_size==manifest['bytes']
+                  folder=path.parent
+                  assert {p.name for p in folder.iterdir()}=={'max-postiz-0.14.0.tar.gz','image-verification.json','SHA256SUMS.txt'}
+                  assert all(p.is_file() and not p.is_symlink() for p in folder.iterdir())
+                  with path.open('rb') as stream:
+                      assert hashlib.file_digest(stream,'sha256').hexdigest()==manifest['sha256']
+                  image=True
+          except (AssertionError,OSError,ValueError,KeyError,TypeError):
+              pass
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('proof='+str(allowed).lower()+'\nimage='+str(image).lower()+'\n')
+          PY
+      - name: Preserve sanitized proof and synthetic screenshots only
+        # This directory is created only by a complete, fail-closed privacy scan.
+        if: always() && steps.artifacts.outputs.proof == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isolated-native-readiness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-readiness-public/
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 14
+      - name: Preserve tested portable image without runtime credentials
+        if: always() && steps.artifacts.outputs.image == 'true'
+        id: image-upload
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tested-postiz-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-readiness-image/
+          include-hidden-files: false
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Distinguish image artifact upload failure from native acceptance
+        if: always() && steps.image-upload.outcome == 'failure'
+        run: |
+          echo 'NATIVE_IMAGE_ARTIFACT_UPLOAD_FAILED: native proof is preserved separately.'
+          exit 1

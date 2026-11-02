@@ -510,6 +510,33 @@ def personal_wall(sample, state):
     selectors.update(identity_contract="personal-wall-settings-v1", text_contract="vk-spacer-div-v1")
 
 
+def test_atomic_stamp_reuses_element_reads_but_not_states_between_evaluations(page):
+    page.set_content('<a id="account" href="/id123456">Owner</a>'
+        '<div id="modal" role="dialog" style="display:block">'
+        '<span id="editor" contenteditable="true">A frozen article</span>'
+        '<input id="toggle" type="checkbox" checked></div>')
+    selectors = {"account": "#account", "modal": "#modal", "editor": "#editor", "preview_text": "#modal"}
+    page.evaluate("""() => {
+      window.probes=new Map();
+      const probe=e=>{if(!probes.has(e))probes.set(e,{style:0,rect:0});return probes.get(e);};
+      const style=window.getComputedStyle;
+      window.getComputedStyle=function(e,...args){probe(e).style++;return style.call(this,e,...args);};
+      const rect=Element.prototype.getBoundingClientRect;
+      Element.prototype.getBoundingClientRect=function(...args){probe(this).rect++;return rect.apply(this,args);};
+    }""")
+    before = worker._mutation_stamp(page, selectors)
+    # Captured with the previous uncached implementation on this exact DOM.
+    assert before == "cb8bd4f89277e00c37e1d1ce0e5edd7b976a7d4b73754e932d66c013ee69ce1c"
+    counts = page.evaluate("() => [...probes].map(([e,n])=>({element:e.tagName+'#'+e.id,...n}))")
+    assert len(counts) == 6 and all(row["style"] == row["rect"] == 1 for row in counts), counts
+    page.locator("#toggle").evaluate("e=>e.checked=false")
+    after = worker._mutation_stamp(page, selectors)
+    assert after != before
+    assert worker._mutation_stamp(page, selectors) == after
+    counts = page.evaluate("() => [...probes.values()]")
+    assert all(row["style"] == row["rect"] == 3 for row in counts), counts
+
+
 @pytest.mark.parametrize("composer_visible", [False, True])
 def test_background_create_changes_are_ignored_only_inside_visible_composer(sample, page, composer_visible):
     selectors = dom_contract(sample.options)

@@ -1,0 +1,14 @@
+[Unit]
+Description=One owner-requested restart of the fixed editorial service
+After=max-postiz-editorial.service
+
+[Service]
+Type=oneshot
+User=editorial
+WorkingDirectory=/opt/max-postiz
+ExecStart=/opt/max-postiz/.venv/bin/python deployment/linux/restart-editorial.py
+UMask=0077
+NoNewPrivileges=true
+RuntimeMaxSec=120
+TimeoutStopSec=10
+KillMode=control-group

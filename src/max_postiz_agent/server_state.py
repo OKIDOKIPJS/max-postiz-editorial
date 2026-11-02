@@ -162,6 +162,10 @@ class ServerState:
                 EditorialControl.id == CONTROL_ID).with_for_update())
             if row is None or row.revision != revision:
                 raise AgentError("EDITORIAL_REVISION_CONFLICT", 409)
+            if action == "start":
+                from .server_maintenance import guard_restart_operation
+                guard_restart_operation(self.core)
+                self.core._assert_current_route_runtime()
             row.paused, row.revision = action == "pause", row.revision + 1
             row.updated_at, row.updated_by = now(), actor
             if prepare_only:

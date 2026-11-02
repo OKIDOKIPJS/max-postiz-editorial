@@ -54,12 +54,13 @@ function main() {
     fs.mkdirSync(fixtureAdapter);
     for (const entry of fs.readdirSync(adapter, { withFileTypes: true })) {
       if (!entry.isFile() || !(entry.name.startsWith('Dockerfile') ||
+          entry.name === 'start-production.sh' ||
           ['.cjs', '.ts', '.tsx', '.json', '.css'].includes(path.extname(entry.name)))) continue;
       fs.writeFileSync(path.join(fixtureAdapter, entry.name),
         fs.readFileSync(path.join(adapter, entry.name), 'utf8').replace(/\r\n/g, '\n'), { flag: 'wx' });
     }
     // Копируем только явно требуемый публичный fixture, без runtime-каталогов.
-    for (const name of ['fixtures/production-next.config.upstream.cjs']) {
+    for (const name of ['fixtures/production-next.config.upstream.cjs', 'fixtures/production-backend-main.upstream.ts']) {
       const destination = path.join(fixtureAdapter, name);
       fs.mkdirSync(path.dirname(destination), { recursive: true });
       fs.writeFileSync(destination,
@@ -77,12 +78,20 @@ function main() {
       'test-provider-reliability-build.cjs',
       'test-provider-unavailable.cjs',
       'test-production-build.cjs',
+      'test-production-startup.cjs',
     ];
     assert.deepEqual(fs.readdirSync(adapter).filter(name => /^test-.*\.cjs$/.test(name)).sort(),
       [...suites].sort(), 'Update the CI runner when adding a Node contract suite');
+    const ownerPortal = path.join(temporary, 'owner-portal');
+    fs.mkdirSync(ownerPortal);
+    for (const name of ['test-owner-portal.cjs', '50-max-postiz-editorial-restart.rules']) {
+      fs.writeFileSync(path.join(ownerPortal, name),
+        fs.readFileSync(path.join(root, 'deployment', 'linux', name), 'utf8').replace(/\r\n/g, '\n'), { flag: 'wx' });
+    }
     const result = spawnSync(process.execPath, [
       '--unhandled-rejections=strict', '--test', '--test-reporter=tap',
       ...suites.map(name => path.join(fixtureAdapter, name)),
+      path.join(ownerPortal, 'test-owner-portal.cjs'),
     ], {
       cwd: root,
       env: {

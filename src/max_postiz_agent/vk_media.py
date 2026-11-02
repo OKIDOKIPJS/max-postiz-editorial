@@ -16,7 +16,11 @@ PROFILE = "personal-image-v1"
 CONTRACT = "vk-native-single-image-v1"
 OBSERVATIONS = "vk-native-image-observations-v1"
 PIXELS = "exif-transpose-rgba8-color-metadata-v1"
-POLICIES = {"exact-bytes-v1", "exact-pixels-v1", "native-asset-lineage-v1"}
+EDGE_POLICY = "native-uniform-edge-lineage-v1"
+POLICIES = {"exact-bytes-v1", "exact-pixels-v1", "native-asset-lineage-v1", EDGE_POLICY}
+COMPARISONS = {"exact-bytes-v1": "exact_bytes", "exact-pixels-v1": "exact_pixels",
+               "native-asset-lineage-v1": "native_asset_lineage",
+               EDGE_POLICY: "native_asset_lineage_uniform_edge"}
 SCOPES = {"upload_input", "uploaded_asset", "preview_uploaded_cdn", "public_photo", "photo_original_viewer"}
 REQUIRED_DOM = {"uploaded_asset", "uploaded_asset_id_attribute", "preview_asset", "preview_asset_binding",
                 "post_asset", "post_asset_id_attribute", "uploaded_images", "preview_images", "post_images",
@@ -121,6 +125,64 @@ def image_identity(raw):
             "pixel_contract": PIXELS, "bytes": len(raw)}
 
 
+def source_identity(raw, policy):
+    """Old policies retain their exact historical identity shape."""
+    result = image_identity(raw)
+    if policy != EDGE_POLICY:
+        return result
+    with Image.open(io.BytesIO(raw)) as image:
+        canonical = ImageOps.exif_transpose(image).convert("RGBA")
+        width, height = canonical.size
+        color = list(canonical.getpixel((width - 1, height - 1)))
+
+        def uniform(box):
+            return color[3] == 255 and all(low == high == value for (low, high), value in
+                zip(canonical.crop(box).getextrema(), color, strict=True))
+
+        result["uniform_edge_guard"] = {"contract": "vk-opaque-uniform-edge-v1", "rgba": color,
+            "right": width > 1 and uniform((width - 1, 0, width, height)),
+            "bottom": height > 1 and uniform((0, height - 1, width, height))}
+    return result
+
+
+def _edge_crop(source, dimensions, native_url=None):
+    """Only a native explicit 0,0 crop removing <=1 uniform opaque edge pixel."""
+    guard = source.get("uniform_edge_guard")
+    if (not isinstance(guard, dict) or set(guard) != {"contract", "rgba", "right", "bottom"}
+            or guard["contract"] != "vk-opaque-uniform-edge-v1"
+            or any(type(guard[k]) is not bool for k in ("right", "bottom"))
+            or not isinstance(guard["rgba"], list) or len(guard["rgba"]) != 4
+            or any(type(n) is not int or not 0 <= n <= 255 for n in guard["rgba"])):
+        raise AgentError("VK_BROWSER_IMAGE_READBACK_MISMATCH")
+    width, height = source["dimensions"]
+    if (not isinstance(dimensions, list) or len(dimensions) != 2
+            or any(type(n) is not int or n <= 0 for n in dimensions)):
+        raise AgentError("VK_BROWSER_IMAGE_READBACK_MISMATCH")
+    right, bottom = width - dimensions[0], height - dimensions[1]
+    if (right not in {0, 1} or bottom not in {0, 1}
+            or right and not guard["right"] or bottom and not guard["bottom"]
+            or (right or bottom) and guard["rgba"][3] != 255):
+        raise AgentError("VK_BROWSER_IMAGE_READBACK_MISMATCH")
+    box = [0, 0, *dimensions]
+    if native_url is not None:
+        from urllib.parse import parse_qsl
+        try:
+            query = parse_qsl(urlsplit(native_url).query, keep_blank_values=True, strict_parsing=True)
+            if len(query) != len({key for key, _ in query}):
+                raise ValueError
+            values = dict(query)
+            if ("crop" in values and values["crop"] != ",".join(str(n) for n in box)
+                    or (right or bottom) and "crop" not in values
+                    or "cs" in values and values["cs"] != str(dimensions[0]) + "x0"):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise AgentError("VK_BROWSER_IMAGE_READBACK_MISMATCH") from None
+    elif right or bottom:
+        raise AgentError("VK_BROWSER_IMAGE_READBACK_MISMATCH")
+    return {"contract": "vk-opaque-uniform-edge-v1", "source_guard_sha256": fingerprint(guard),
+            "crop_box": box, "removed_right": right, "removed_bottom": bottom}
+
+
 def asset_id(value, owner, *, origin="https://vk.ru"):
     if not isinstance(value, str):
         raise AgentError("VK_BROWSER_PHOTO_ASSET_INVALID")
@@ -163,25 +225,27 @@ def allowed_cdn(value, *, origin="https://vk.ru"):
         return False
 
 
-def derivative_proof(raw, source, remote_asset, contract):
+def derivative_proof(raw, source, remote_asset, contract, *, native_url=None):
     actual = image_identity(raw)
     same_bytes = actual["source_sha256"] == source["source_sha256"]
     same_pixels = actual["pixels_sha256"] == source["pixels_sha256"] and actual["dimensions"] == source["dimensions"]
     policy = contract["policy"]
     if (policy not in POLICIES or policy == "exact-bytes-v1" and not same_bytes
             or policy == "exact-pixels-v1" and not same_pixels
-            or actual["dimensions"] != source["dimensions"]):
+            or policy != EDGE_POLICY and actual["dimensions"] != source["dimensions"]):
         raise AgentError("VK_BROWSER_IMAGE_READBACK_MISMATCH")
     if _ASSET.fullmatch(remote_asset or "") is None:
         raise AgentError("VK_BROWSER_PHOTO_ASSET_INVALID")
-    return {"contract": CONTRACT, "policy": policy, "evidence_sha256": contract["evidence_sha256"],
+    proof = {"contract": CONTRACT, "policy": policy, "evidence_sha256": contract["evidence_sha256"],
         "asset_id": remote_asset, "source_sha256": source["source_sha256"],
         "source_pixels_sha256": source["pixels_sha256"], "source_dimensions": source["dimensions"],
         "derivative_sha256": actual["source_sha256"], "derivative_pixels_sha256": actual["pixels_sha256"],
         "derivative_dimensions": actual["dimensions"], "pixel_contract": PIXELS,
         "bytes_equal": same_bytes, "pixels_equal": same_pixels,
-        "comparison": {"exact-bytes-v1": "exact_bytes", "exact-pixels-v1": "exact_pixels",
-                       "native-asset-lineage-v1": "native_asset_lineage"}[policy]}
+        "comparison": COMPARISONS[policy]}
+    if policy == EDGE_POLICY:
+        proof["uniform_edge_crop"] = _edge_crop(source, actual["dimensions"], native_url)
+    return proof
 
 
 def validate_proof(proof, source, contract, owner, expected_asset=None, *, origin="https://vk.ru"):
@@ -193,8 +257,7 @@ def validate_proof(proof, source, contract, owner, expected_asset=None, *, origi
         expected = {"contract": CONTRACT, "policy": contract["policy"],
             "evidence_sha256": contract["evidence_sha256"], "source_sha256": source["source_sha256"],
             "source_pixels_sha256": source["pixels_sha256"], "source_dimensions": source["dimensions"],
-            "pixel_contract": PIXELS, "comparison": {"exact-bytes-v1": "exact_bytes",
-                "exact-pixels-v1": "exact_pixels", "native-asset-lineage-v1": "native_asset_lineage"}[contract["policy"]]}
+            "pixel_contract": PIXELS, "comparison": COMPARISONS[contract["policy"]]}
         if any(proof.get(key) != value for key, value in expected.items()) or expected_asset and ident != expected_asset:
             return False
         if any(not isinstance(proof.get(key), str) or not _HASH.fullmatch(proof[key])
@@ -202,7 +265,8 @@ def validate_proof(proof, source, contract, owner, expected_asset=None, *, origi
             return False
         size = proof.get("derivative_dimensions")
         if (not isinstance(size, list) or len(size) != 2 or any(type(v) is not int or v <= 0 for v in size)
-                or size != source["dimensions"] or size[0] * size[1] > 40_000_000 or type(proof.get("bytes_equal")) is not bool
+                or contract["policy"] != EDGE_POLICY and size != source["dimensions"]
+                or size[0] * size[1] > 40_000_000 or type(proof.get("bytes_equal")) is not bool
                 or type(proof.get("pixels_equal")) is not bool):
             return False
         same_bytes = proof["derivative_sha256"] == source["source_sha256"]
@@ -211,6 +275,9 @@ def validate_proof(proof, source, contract, owner, expected_asset=None, *, origi
             return False
         if (not allowed_cdn(proof.get("original_url"), origin=origin) or not isinstance(proof.get("viewer_sha256"), str)
                 or not _HASH.fullmatch(proof["viewer_sha256"])):
+            return False
+        if contract["policy"] == EDGE_POLICY and proof.get("uniform_edge_crop") != _edge_crop(
+                source, size, proof["original_url"]):
             return False
         return (proof["bytes_equal"] is same_bytes and proof["pixels_equal"] is same_pixels
             and (contract["policy"] != "exact-bytes-v1" or same_bytes)

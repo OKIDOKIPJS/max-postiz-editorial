@@ -153,7 +153,15 @@ class HubService(Service):
 
     def pause_target(self, target_id, paused, actor="owner"):
         with self.db.session.begin() as s:
+            if not paused:
+                from .server_models import EditorialControl
+                s.scalar(select(EditorialControl).where(EditorialControl.id == "main").with_for_update())
+                from .server_maintenance import guard_restart_operation
+                guard_restart_operation(self)
             t = self._target(s, target_id)
+            if not paused and t.platform in {"max", "vk"} and t.route in {"max_browser", "vk_browser"}:
+                from .server_route_admin import guard_login_resume
+                guard_login_resume(self, t)
             if not paused and not t.enabled:
                 raise AgentError("TARGET_DISABLED", 409)
             t.paused = paused
