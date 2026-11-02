@@ -72,6 +72,92 @@ def fake_client(scenario):
     return instance, calls
 
 
+def test_failed_http_evidence_keeps_only_fixed_route_status_action_and_body_digest(scenario, tmp_path, monkeypatch, capsys):
+    import hashlib
+    import json
+    fixture_canary = "private-fixture-must-not-enter-evidence"
+    response_body = json.dumps({"token": fixture_canary}).encode()
+    instance = object.__new__(scenario.Scenario)
+    instance.check = lambda: None
+    instance.client = httpx.Client(base_url=scenario.ORIGIN, cookies={"auth": fixture_canary},
+        transport=httpx.MockTransport(lambda request: httpx.Response(502, content=response_body,
+            headers={"Set-Cookie": "auth=" + fixture_canary})))
+    try:
+        with pytest.raises(scenario.ScenarioError, match="^SCENARIO_HTTP_STATUS_INVALID$") as caught:
+            instance.admin({"action": "set_secret", "id": "ci_tg", "value": fixture_canary})
+        expected = {"method": "POST", "path": "/api/editorial/route-admin", "status": 502,
+                    "action": "set_secret", "body_sha256": hashlib.sha256(response_body).hexdigest()}
+        assert scenario.safe_http_metadata(caught.value.http) == expected
+        instance.run = lambda mode: (_ for _ in ()).throw(caught.value)
+        monkeypatch.setattr(scenario, "Scenario", lambda *args: instance)
+        writes = []
+        monkeypatch.setattr(scenario, "atomic", lambda path, value, **kwargs: writes.append((path, value, kwargs)))
+        assert scenario.main(["--root", str(tmp_path), "--state", str(tmp_path / "private.json"),
+                              "--evidence", str(tmp_path / "public"), "--mode", "exercise"]) == 1
+        printed = capsys.readouterr().out
+        result = json.loads(printed)
+        assert result == {"mode": "exercise", "passed": False, "code": "SCENARIO_HTTP_STATUS_INVALID", "http": expected}
+        assert writes == [(tmp_path / "public/exercise-failed.json", result, {"exclusive": True})]
+        assert fixture_canary not in printed and fixture_canary not in json.dumps(writes, default=str)
+    finally:
+        instance.client.close()
+
+
+@pytest.mark.parametrize("change", [
+    {"path": "https://private.invalid/token"}, {"path": []}, {"action": "private-fixture-value"},
+    {"method": "DELETE"}, {"status": True}, {"body_sha256": "private-fixture-value"}, {"headers": "private-fixture-value"},
+    {"response_code": "PRIVATE_FIXTURE_CANARY"},
+])
+def test_http_diagnostic_projection_rejects_untrusted_or_private_fields(scenario, change):
+    value = {"method": "GET", "path": "/api/editorial/route-setup", "status": 403, "body_sha256": "a" * 64}
+    assert scenario.safe_http_metadata({**value, **change}) is None
+
+
+@pytest.mark.parametrize("body,expected", [
+    (b'{"code":"EDITORIAL_OWNER_REQUIRED","private":"fixture-private-value"}', "EDITORIAL_OWNER_REQUIRED"),
+    (b'{"code":"PRIVATE_FIXTURE_CANARY"}', None),
+    (b'{"code":["EDITORIAL_OWNER_REQUIRED"]}', None),
+    (b'non-json fixture-private-value', None),
+    (b'{"code":"EDITORIAL_OWNER_REQUIRED"}' + b' ' * 65536, None),
+], ids=["known", "unknown", "non-string", "non-json", "oversized"])
+def test_http_response_code_uses_only_finite_known_constants_and_bounded_json(scenario, body, expected):
+    instance = object.__new__(scenario.Scenario)
+    instance.check = lambda: None
+    instance.client = httpx.Client(base_url=scenario.ORIGIN,
+        transport=httpx.MockTransport(lambda request: httpx.Response(403, content=body)))
+    try:
+        with pytest.raises(scenario.ScenarioError) as caught:
+            instance.call("GET", "/api/editorial/route-setup")
+        metadata = scenario.safe_http_metadata(caught.value.http)
+        assert metadata["status"] == 403 and metadata.get("response_code") == expected
+        serialized = scenario.json.dumps(metadata)
+        assert "fixture-private-value" not in serialized and "PRIVATE_FIXTURE_CANARY" not in serialized
+        assert ("response_code" in metadata) is (expected is not None)
+    finally:
+        instance.client.close()
+
+
+@pytest.mark.parametrize("status", [200, 401, 403])
+def test_mixed_owner_cookie_and_bearer_probe_keeps_existing_rejection_expectations(scenario, status):
+    instance = object.__new__(scenario.Scenario)
+    instance.check = lambda: None
+    requests = []
+    instance.client = httpx.Client(base_url=scenario.ORIGIN, cookies={"auth": "fixture-owner-cookie"},
+        transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(status, json={})))
+    try:
+        if status == 200:
+            with pytest.raises(scenario.ScenarioError, match="SCENARIO_HTTP_STATUS_INVALID"):
+                instance.call("GET", "/api/editorial/route-setup", allowed=(401, 403),
+                              headers={"Authorization": "Bearer ci-invalid"})
+        else:
+            assert instance.call("GET", "/api/editorial/route-setup", allowed=(401, 403),
+                                 headers={"Authorization": "Bearer ci-invalid"}).status_code == status
+        assert len(requests) == 1 and requests[0].headers["Authorization"] == "Bearer ci-invalid"
+        assert "auth=fixture-owner-cookie" in requests[0].headers["Cookie"]
+    finally:
+        instance.client.close()
+
+
 @pytest.mark.parametrize("method,path,payload", [
     ("POST", "/api/editorial/route-action", {"action": "approve"}),
     ("POST", "/api/editorial/route-action", {"action": "inspect"}),

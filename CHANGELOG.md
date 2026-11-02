@@ -1,5 +1,25 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: точная безопасная диагностика HTTP native сценария
+
+- R13 run 41365421111 подтвердил полные Next/Nest builds объединённого UI,
+  11 compiled artifacts, реальные 8 GiB RAM / 4 GiB swap / CPU 4 и lo-only сеть,
+  свежие зависимости, owner register/cookie/API key, migrate на паузе и установку
+  portal units. Первый exercise остановился через SCENARIO_HTTP_STATUS_INVALID;
+  endpoint/status исходная диагностика не сохранила. Образ не экспортирован.
+- При неуспешном HTTP добавляется только method, статический allowlisted path,
+  status, разрешённое literal action, body SHA и необязательный response_code из
+  конечного набора 35 известных констант. Код извлекается лишь из JSON object
+  до 64 KiB и повторно проецируется перед public JSON. Body, headers, cookies,
+  неизвестные коды и private canaries не выводятся.
+- Исходные auth probes, включая cookie+Bearer с ожиданием 401/403, порядок,
+  разрешённые статусы, retries и production guards не изменены. Причина HTTP
+  отказа пока не установлена; гипотеза о неправильном Bearer ожидании отозвана
+  после чтения явного guard, а не превращена в ослабление проверки.
+- Проверки: 41 pure сценарий passed; malformed/unknown/oversize/nonJSON privacy,
+  mixed-auth negative, Ruff/diff и независимый review прошли. Полная приёмка
+  следующего exact commit обязательна. Рабочий сервер и Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: явный root helper-сервисов изолированного стенда
 
 - Независимый разбор следующих native-этапов выявил две конкретные несовместимости

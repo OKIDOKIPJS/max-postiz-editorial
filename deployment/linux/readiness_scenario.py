@@ -28,10 +28,44 @@ ORIGIN = "http://10.20.30.45:4007"
 POSTIZ = "http://127.0.0.1:14007/api/public/v1"
 TARGETS = {"max": "ci_max", "telegram": "ci_tg", "vk": "ci_vk"}
 MIB = 1024 * 1024
+HTTP_PATHS = frozenset({"/api/auth/register", "/api/auth/login", "/api/user/self", "/api/editorial/route-setup",
+    "/api/editorial/settings", "/api/editorial/control", "/api/editorial/route-admin", "/api/editorial/route-action"})
+HTTP_ACTIONS = frozenset({"configure_target", "set_secret", "upload_media", "create_original", "revise_original",
+    "request_restart", "prepare_login", "preview", "preflight", "pause"})
+HTTP_ERROR_CODES = frozenset({
+    "EDITORIAL_CONTROL_INVALID", "EDITORIAL_COOKIE_SESSION_REQUIRED", "EDITORIAL_JSON_REQUIRED",
+    "EDITORIAL_NOT_CONFIGURED", "EDITORIAL_ORIGIN_REQUIRED", "EDITORIAL_OWNER_REQUIRED",
+    "EDITORIAL_RESPONSE_INVALID", "EDITORIAL_ROUTE_ACTION_INVALID", "EDITORIAL_ROUTE_ADMIN_INVALID",
+    "EDITORIAL_ROUTE_LIST_INVALID", "EDITORIAL_SERVICE_UNAVAILABLE", "EDITORIAL_SETTINGS_INVALID",
+    "EDITORIAL_REQUEST_FAILED", "INPUT_INVALID", "CREDENTIAL_FORMAT_INVALID", "CREDENTIAL_TARGET_INVALID",
+    "CREDENTIAL_ENV_NOT_DEDICATED", "TARGET_BINDING_CONFLICT", "TARGET_PAUSE_REQUIRED",
+    "CANCEL_OR_RECONCILE_FIRST", "BRIDGE_EDIT_IN_PROGRESS", "ROUTE_CONFIGURATION_CHANGED",
+    "LOGIN_SELECTION_ACTIVE", "ROUTE_RUNTIME_RESTART_REQUIRED", "ROUTE_ADMIN_BUSY", "ROUTE_ADMIN_CONFLICT",
+    "ROUTE_ADMIN_RECOVERY_REQUIRED", "EDITORIAL_PAUSE_BEFORE_SETTINGS", "EDITORIAL_REVISION_CONFLICT",
+    "EDITORIAL_MAINTENANCE_BUSY", "POSTIZ_NEAR_QUEUE_RESTART_BLOCKED", "POSTIZ_NOT_CONFIGURED",
+    "RESTART_ALREADY_REQUESTED", "RESTART_SELECTION_INVALID", "ROUTE_CONFIG_CONFLICT",
+})
 
 
 class ScenarioError(RuntimeError):
-    pass
+    def __init__(self, code, *, http=None):
+        super().__init__(code)
+        self.http = http
+
+
+def safe_http_metadata(value):
+    """Only fixed routing metadata and a response digest may enter public evidence."""
+    fields = {"method", "path", "status", "body_sha256"}
+    if (not isinstance(value, dict) or not fields.issubset(value) or set(value) - fields - {"action", "response_code"}
+            or value.get("method") not in ("GET", "POST")
+            or not isinstance(value.get("path"), str) or value["path"] not in HTTP_PATHS
+            or type(value.get("status")) is not int or not 100 <= value["status"] <= 599
+            or not isinstance(value.get("body_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", value["body_sha256"])
+            or ("action" in value and (not isinstance(value["action"], str) or value["action"] not in HTTP_ACTIONS))
+            or ("response_code" in value and (not isinstance(value["response_code"], str)
+                or value["response_code"] not in HTTP_ERROR_CODES))):
+        return None
+    return dict(value)
 
 
 def require(condition, code):
@@ -178,9 +212,7 @@ class Scenario:
     def call(self, method, path, *, allowed=(200,), **kwargs):
         self.check()
         require(method in {"GET", "POST"}, "SCENARIO_HTTP_SCOPE_INVALID")
-        require(path in {"/api/auth/register", "/api/auth/login", "/api/user/self", "/api/editorial/route-setup",
-                "/api/editorial/settings", "/api/editorial/control", "/api/editorial/route-admin", "/api/editorial/route-action"},
-                "SCENARIO_HTTP_SCOPE_INVALID")
+        require(path in HTTP_PATHS, "SCENARIO_HTTP_SCOPE_INVALID")
         if path == "/api/editorial/route-action":
             require(kwargs.get("json", {}).get("action") in {"preview", "preflight"}, "SCENARIO_EXTERNAL_ACTION_FORBIDDEN")
         if path == "/api/editorial/control" and "json" in kwargs:
@@ -189,7 +221,22 @@ class Scenario:
             response = self.client.request(method, path, **kwargs)
         except httpx.HTTPError:
             raise ScenarioError("SCENARIO_HTTP_UNAVAILABLE") from None
-        require(response.status_code in allowed and not response.is_redirect, "SCENARIO_HTTP_STATUS_INVALID")
+        if response.status_code not in allowed or response.is_redirect:
+            metadata = {"method": method, "path": path, "status": response.status_code,
+                        "body_sha256": hashlib.sha256(response.content).hexdigest()}
+            payload = kwargs.get("json")
+            action = payload.get("action") if isinstance(payload, dict) else None
+            if isinstance(action, str) and action in HTTP_ACTIONS:
+                metadata["action"] = action
+            if len(response.content) <= 65536:
+                try:
+                    body = json.loads(response.content)
+                except (ValueError, UnicodeError):
+                    body = None
+                code = body.get("code") if isinstance(body, dict) else None
+                if isinstance(code, str) and code in HTTP_ERROR_CODES:
+                    metadata["response_code"] = code
+            raise ScenarioError("SCENARIO_HTTP_STATUS_INVALID", http=metadata)
         return response
 
     def body(self, response):
@@ -536,8 +583,12 @@ def main(argv=None):
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,99}", code):
             code = "SCENARIO_FAILED"
         # Never print an HTTP response, DSN, exception text, cookie or secret.
-        atomic(args.evidence / (args.mode + "-failed.json"), {"mode": args.mode, "passed": False, "code": code}, exclusive=True)
-        print(json.dumps({"mode": args.mode, "passed": False, "code": code}))
+        result = {"mode": args.mode, "passed": False, "code": code}
+        metadata = safe_http_metadata(getattr(error, "http", None)) if isinstance(error, ScenarioError) else None
+        if metadata is not None:
+            result["http"] = metadata
+        atomic(args.evidence / (args.mode + "-failed.json"), result, exclusive=True)
+        print(json.dumps(result))
         return 1
     finally:
         if scenario is not None:
