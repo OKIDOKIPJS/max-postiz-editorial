@@ -648,3 +648,15 @@ def test_owned_nginx_error_capture_discards_partial_line_and_never_publishes_aut
     assert raw.endswith(b'\n') and b'private-key-fragment' not in raw
     assert b'fixture-private-key' not in published and b'unknown-cookie' not in published
     assert instance.report["checks"]["proxy_error_capture"]["owner_verified"] is True
+
+
+def test_only_internal_owner_auth_and_exact_admin_scopes_allow_bounded_image_envelope():
+    import re
+    text = (Path(__file__).resolve().parents[1] / "deployment/linux/editorial-postiz.nginx.conf").read_text()
+    locations = dict(re.findall(r"location\s+(=\s+\S+|\S+)\s*\{(.*?)\n    \}", text, re.S))
+    enlarged = {name for name, body in locations.items() if "client_max_body_size 15m;" in body}
+    assert enlarged == {"= /_editorial-owner-auth", "= /api/editorial/route-admin"}
+    assert text.count("client_max_body_size 15m;") == 2 and text.count("client_max_body_size 1m;") == 1
+    auth = locations["= /_editorial-owner-auth"]
+    assert "internal;" in auth and "proxy_pass_request_body off;" in auth and 'proxy_set_header Content-Length "";' in auth
+    assert "auth_request /_editorial-owner-auth;" in locations["= /api/editorial/route-admin"]

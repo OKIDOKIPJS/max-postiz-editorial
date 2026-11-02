@@ -1,5 +1,22 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: лимит тела внутреннего nginx auth subrequest
+
+- R16 run 41370668926 воспроизвёл ошибку до тяжёлой сборки. Точный nginx log:
+  client intended to send too large body 14680064 bytes в subrequest
+  /_editorial-owner-auth, затем auth request unexpected status 413. Внутренний
+  location наследовал server 1m и проверял исходную длину до удаления upstream
+  Content-Length; отсюда внешний 500 на разрешённом большом upload.
+- Только внутренний /_editorial-owner-auth получил client_max_body_size 15m,
+  как точный route-admin. internal, auth_request, Cookie/Origin, body off и
+  очистка Content-Length сохранены; общий server остаётся 1m, прочие locations
+  не расширены. Это исправление production-шаблона, выполненное только в копии.
+- Проверки: 75 pure/mock passed, 8 Windows FD/symlink skips; отдельный contract
+  разрешает 15m ровно двум указанным scopes. Все 179 Node contracts прошли,
+  Ruff/diff и независимый review прошли. Новый early 14 MiB probe и полная
+  native/CI приёмка exact commit обязательны; R16 не принят целиком. Рабочий
+  сервер, его nginx и Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: ранний probe большого тела и приватный nginx log
 
 - R15 run 41368799645 прошёл configure_target с 201 и дошёл до upload_media;
