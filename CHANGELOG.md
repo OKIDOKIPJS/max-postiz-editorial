@@ -1,5 +1,21 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: настоящий Hub context в monitor command fixtures
+
+- Полный R13 CI выявил четыре monitor-command отказа после объединения main:
+  устаревший контекст Service не реализовывал новый Hub runtime-generation guard.
+  Две команды завершались unknown до смысловой проверки, два прямых start теста
+  получали AttributeError. Production Hub/guards не изменены.
+- Локальный gateway fixture теперь создаёт настоящий HubService с теми же
+  settings/БД и fake editor/publisher/http; валидный пустой publishing сохранён
+  до capture поколения, bootstrap_targets=False. Нет noop/monkeypatch guard или
+  изменения assertions. Новый Postiz client закрывается отдельно, владельцем
+  общей БД/http остаётся исходный fixture.
+- Проверки: весь tests/test_monitor_commands.py — 176 passed; focused 6 passed
+  сохраняют done/blocked, паузу, mutation и busy-translator ожидания. Ruff/diff
+  и независимый review прошли. Полный CI окончательного commit ещё требуется;
+  этот test-only фикс не подтверждает HTTP native exercise или перенос на VM.
+
 ## 0.14.0 — 2026-11-02: точная безопасная диагностика HTTP native сценария
 
 - R13 run 41365421111 подтвердил полные Next/Nest builds объединённого UI,

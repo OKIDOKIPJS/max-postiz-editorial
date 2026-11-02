@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from max_postiz_agent.config import AgentError, fingerprint
 from max_postiz_agent.db import Audit
+from max_postiz_agent.hub import HubService
 from max_postiz_agent.isolated_workspace import mark_isolated
 from max_postiz_agent.hub_models import BridgePost, Dispatch, Target, Variant
 from max_postiz_agent.monitor_commands import CommandGateway, parse_command, refill_preflight, _refill_service_checks, _editorial_actor
@@ -29,7 +30,13 @@ def gateway(service, monkeypatch):
     # Явный небезопасный URL, выставленный самим тестом позже, guard отклоняет.
     monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
     mark_isolated(service.settings.root, service.settings.root.parent / "untouched-source")
-    state = ServerState(service)
+    # Штатный монитор использует HubService и его настоящий runtime-generation
+    # guard. Конфигурация fixture сохранена на диске до захвата поколения.
+    publishing = {"schema_version": "1.0", "postiz": {}, "targets": [], "tasks": []}
+    (service.settings.root / "config/publishing.json").write_text(json.dumps(publishing), encoding="utf-8")
+    core = HubService(service.settings, service.db, editor=service.editor, publisher=service.publisher,
+                      http=service.http, bootstrap_targets=False)
+    state = ServerState(core)
     state.initialize()
     contract = {"messages": "[data-message-id]", "sender": "data-sender-id"}
     options = {"enabled": True, "control_chat_id": "-123", "owner_ids": ["321"],
@@ -38,7 +45,10 @@ def gateway(service, monkeypatch):
                                    "reconcile", "unblock", "source_propose", "source_settings"],
                "dom_contract_verified": True, "dom_contract": contract,
                "dom_contract_sha256": fingerprint(contract)}
-    return CommandGateway(service, options, service.settings.root / "data/monitor/control.sqlite")
+    try:
+        yield CommandGateway(core, options, core.settings.root / "data/monitor/control.sqlite")
+    finally:
+        core.postiz.close()
 
 
 def event(text="статус", **changes):
