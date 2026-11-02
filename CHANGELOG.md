@@ -1,5 +1,23 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: строгий UI locator области редакции
+
+- R18 run 41373325763 подтвердил ранний реальный sandboxed Chrome, большой nginx
+  transport и весь API exercise до preflight 201 после смены worker, включая
+  upload limits/create/revise/preview/restart/history. Безопасная диагностика
+  локализовала generic exception: strict_mode при глобальном heading «Редакция».
+  Закреплённый Postiz title.tsx и наша панель оба содержат h1 с таким текстом;
+  прежний результат не доказывал OOM или ошибку sandbox.
+- UI-проверка теперь требует ровно один видимый main и ровно один его видимый
+  level-1 heading с точным именем. .first/.last не используются; status/auth,
+  JavaScript, наличие трёх каналов и screenshot проверки сохранены. Продуктовый
+  frontend и Node context не изменены, уточнён только harness locator.
+- Проверки: полный Scenario 67 passed, в том числе два реальных sandboxed Chrome
+  set_content regression — внешний одноимённый h1 допускается, дубликат внутри
+  main отклоняется. Ruff/diff и независимый review прошли. Полная native/CI
+  приёмка нового exact commit обязательна; R18 accepted=false без image export.
+  Рабочий сервер и Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: диагностика Python/Chrome этапа native exercise
 
 - R17 run 41371284426 подтвердил исправленный 14 MiB nginx transport, полный

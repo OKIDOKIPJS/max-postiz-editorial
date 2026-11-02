@@ -214,6 +214,16 @@ def bind_source(root):
     sys.path.insert(0, str(source))
 
 
+def wait_editorial_panel(page):
+    panel = page.get_by_role("main")
+    panel.wait_for(state="visible", timeout=45000)
+    require(panel.count() == 1, "SCENARIO_BROWSER_PANEL_AMBIGUOUS")
+    heading = panel.get_by_role("heading", name="Редакция", exact=True, level=1)
+    heading.wait_for(state="visible", timeout=45000)
+    require(heading.count() == 1, "SCENARIO_BROWSER_HEADING_AMBIGUOUS")
+    return panel
+
+
 class Scenario:
     def __init__(self, root, state_path, evidence):
         self.root, self.state_path, self.evidence = plain(root), plain(state_path), plain(evidence)
@@ -470,7 +480,7 @@ class Scenario:
                 page = context.new_page()
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.goto(ORIGIN + "/editorial", wait_until="domcontentloaded", timeout=45000)
-                page.get_by_role("heading", name="Редакция", exact=True).wait_for(state="visible", timeout=45000)
+                wait_editorial_panel(page)
                 page.wait_for_function("ids=>ids.every(id=>[...document.querySelectorAll('option')].some(e=>e.value===id))",
                                        arg=list(TARGETS.values()), timeout=45000)
                 require(not errors, "SCENARIO_BROWSER_JAVASCRIPT_ERROR")

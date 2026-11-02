@@ -1,4 +1,4 @@
-"""Pure CI scenario guards/wire/PNG tests: no namespace, DB, browser or HTTP server."""
+"""CI guards and local synthetic DOM: no namespace, DB or HTTP server."""
 
 import base64
 import copy
@@ -19,6 +19,28 @@ def scenario():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("duplicate_inside", [False, True], ids=["upstream-heading", "duplicate-panel-heading"])
+def test_editorial_heading_is_unique_inside_the_main_panel(scenario, duplicate_inside):
+    from playwright.sync_api import Error, sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", chromium_sandbox=True, headless=True)
+        try:
+            page = browser.new_page()
+            page.route("**/*", lambda route: route.abort())
+            page.set_content("<header><h1>Редакция</h1></header><main><h1>Редакция</h1>"
+                             + ("<h1>Редакция</h1>" if duplicate_inside else "") + "</main>")
+            assert page.get_by_role("heading", name="Редакция", exact=True, level=1).count() == (
+                3 if duplicate_inside else 2)
+            if duplicate_inside:
+                with pytest.raises((scenario.ScenarioError, Error)):
+                    scenario.wait_editorial_panel(page)
+            else:
+                assert scenario.wait_editorial_panel(page).count() == 1
+        finally:
+            browser.close()
 
 
 def state(root):
