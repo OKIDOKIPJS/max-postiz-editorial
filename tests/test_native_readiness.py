@@ -700,3 +700,86 @@ def test_early_chrome_prerequisite_rejects_root_uid_before_home_or_unit(native, 
     with pytest.raises(native.ReadinessError, match="CHROME_PREREQUISITE_NONROOT_OWNER_REQUIRED"):
         instance.chrome_prerequisite()
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("verification_fails", [False, True, "fingerprint"])
+def test_restore_waits_for_read_only_backend_and_rebinds_source_only_after_exact_validation(native, tmp_path, monkeypatch, verification_fails):
+    instance = native.Acceptance.__new__(native.Acceptance)
+    instance.project, instance.private = tmp_path / "project", tmp_path / "private"
+    instance.private.mkdir()
+    (instance.project / "config").mkdir(parents=True)
+    preserved = instance.project / "config/preserved.json"
+    preserved.write_text('{"unchanged":true}')
+    (instance.project / "data").mkdir()
+    (instance.project / ".env.local").write_text("fixture\n")
+    instance.state_path = instance.private / "state.json"
+    instance.state_path.write_text(json.dumps({"postiz_dsn": "postgresql://fixture@127.0.0.1:5432/original",
+                                               "hub_dsn": "postgresql://fixture@127.0.0.1:5434/original"}))
+    instance.backend, instance.orchestrator, instance.proxy = "old-backend", "old-orchestrator", "own-proxy"
+    instance.image, instance.upload_volume, instance.report = "own-image", "own-uploads", {"checks": {}}
+    original = {"postiz": ("postiz-id", 5432, "postiz-user", "original-postiz"),
+                "hub": ("hub-id", 5434, "hub-user", "original-hub")}
+    instance.pg = dict(original)
+    events = []
+    instance.phase = lambda value: None
+    instance.engine = SimpleNamespace(docker=lambda *args, **kwargs: events.append(("docker", args)))
+    instance.clone_database = lambda role, database: {"empty_destination_verified": True}
+    instance.editorial_environment = lambda state: None
+    instance.app_environment = lambda state: {}
+    instance.container = lambda role, *args, **kwargs: events.append(("container", role)) or "new-backend"
+    def wait(ident, command, **kwargs):
+        events.append(("wait", command[-1], kwargs))
+        assert ident == "own-proxy"
+    instance.wait_exec = wait
+    def scenario(mode):
+        events.append(("scenario", mode))
+        if mode == "verify-restored":
+            assert instance.pg == original, "Never accept restored source before validation"
+            if verification_fails == "fingerprint":
+                preserved.write_text('{"unchanged":false}')
+            elif verification_fails:
+                raise native.ReadinessError("FIXTURE_VERIFY_FAILED")
+    instance.scenario = scenario
+    monkeypatch.setattr(native.subprocess, "run", lambda argv, **kwargs: events.append(("systemctl", argv)))
+    if verification_fails:
+        with pytest.raises(native.ReadinessError, match=("RESTORE_RUNTIME_FILES_CHANGED" if verification_fails == "fingerprint" else "FIXTURE_VERIFY_FAILED")):
+            instance.backup_restore()
+        assert instance.pg == original
+    else:
+        instance.backup_restore()
+        for role, database in (("postiz", "postiz_readiness_restore"), ("hub", "editorial_hub_restore")):
+            assert instance.pg[role] == (*original[role][:3], database)
+    backend_wait = next(index for index, item in enumerate(events) if item[0] == "wait" and "can-register" in item[1])
+    verify = events.index(("scenario", "verify-restored"))
+    start = next(index for index, item in enumerate(events) if item == ("systemctl", ["systemctl", "start", "max-postiz-editorial.service"]))
+    assert backend_wait < start < verify and events[backend_wait][2] == {"seconds": 180}
+    assert "http://127.0.0.1:14007/api/auth/can-register" in events[backend_wait][1]
+    assert "auth/login" not in events[backend_wait][1] and ".get(" in events[backend_wait][1]
+
+
+@pytest.mark.parametrize("error", [OSError("private/path/secret"), ValueError("private-input"), RuntimeError("SCENARIO_EVIDENCE_ENTRY_INVALID")])
+def test_collection_diagnostic_never_echoes_unknown_error_text_or_raw_cleanup_errors(native, error):
+    value = native.collection_failure_metadata(error, {"state": "closed", "cgroup_empty": True,
+                                                       "cleanup_errors": ["private-cleanup-message"]})
+    assert value["cleanup"] == {"closed": True, "cgroup_empty": True, "error_count": 1}
+    assert "private" not in json.dumps(value)
+
+
+def test_collection_diagnostic_has_finite_code_and_only_allowlisted_entry_metadata(native):
+    error = native.ReadinessError("SCENARIO_EVIDENCE_ENTRY_INVALID")
+    error.evidence_entry = {"name": "editorial-synthetic.png", "regular": True, "single_link": True,
+                            "owner_matches": True, "mode": 0o664, "bytes": 100}
+    value = native.collection_failure_metadata(error, None)
+    assert value == {"code": "SCENARIO_EVIDENCE_ENTRY_INVALID", "entry": error.evidence_entry}
+    error.evidence_entry = {**error.evidence_entry, "name": "private-secret-file"}
+    assert native.collection_failure_metadata(error, None) == {"code": "SCENARIO_EVIDENCE_ENTRY_INVALID"}
+
+
+def test_collection_cleanup_projection_emits_only_the_four_known_literal_codes(native):
+    value = native.collection_failure_metadata(native.ReadinessError("SCENARIO_PRODUCER_CLEANUP_UNCONFIRMED"),
+        {"state": "closed", "cgroup_empty": False,
+         "cleanup_errors": ["owned_unit_stop_unconfirmed", "private-secret-error", {"raw": "private-value"},
+                            "owned_cgroup_cleanup_unconfirmed"]})
+    assert value["cleanup"]["error_count"] == 4
+    assert value["cleanup"]["known_codes"] == ["owned_cgroup_cleanup_unconfirmed", "owned_unit_stop_unconfirmed"]
+    assert "private" not in json.dumps(value)

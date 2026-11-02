@@ -1,5 +1,34 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: готовность backend после restore и приватный producer PNG
+
+- R19 run 41374913726 прошёл полный native build, реальные owner API проверки,
+  загрузку изображений и граничные отказы, создание/правку/preview материалов,
+  restart с сохранением истории, browser UI, 29 Linux supervisor tests и запрет
+  второго worker. Оба MAX/VK portal механизма прошли native Chrome/profile/VNC
+  проверки с настоящим ожиданием 600-секундной lease; это не вход в аккаунты
+  платформ и не живая доставка. Стандартный CI R19 прошёл. Native accepted=false:
+  проверка восстановленного клона получила 502 на первом auth POST, пока новый
+  backend ещё не слушал порт; default boot и image export не были достигнуты.
+- После запуска backend-restored добавлено ограниченное read-only ожидание GET
+  can-register до первого auth POST. Auth и другие POST не повторяются, 502 не
+  принимается за успех. Источник следующего default clone переключается именно
+  на восстановленную БД только после успешной проверки restore и прежних точных
+  fingerprints; при любом отказе старое binding остаётся, история не меняется.
+- Отдельно исправлена переносимость PNG producer: Playwright screenshot(path)
+  наследовал umask, поэтому файл мог получить group-write. Теперь точные bytes
+  сохраняются один раз через private held directory FD, O_EXCL/NOFOLLOW, 0600 и
+  fsync без замены существующего файла. Это подтверждённый дефект переносимости,
+  но не доказанная причина R19 collection failure. Строгие collector проверки
+  сохранены; диагностика допускает только конечные коды, безопасные file bits и
+  четыре известных cleanup-кода без сырых ошибок, путей, содержимого и секретов.
+- Проверки: Main 85 passed / 8 Windows skips, Scenario 69 passed / 4 POSIX skips
+  на Windows; всего 154 passed / 12 skipped, включая два реальных sandboxed Chrome
+  set_content regression. Ruff/diff и независимое review прошли. Полная native
+  приёмка нового exact commit ещё обязательна; production service/helper limits,
+  Node context, auth/approval/send guards не ослаблены. Рабочий сервер и Пикабу
+  не затрагивались, внешних публикаций не выполнялось.
+
 ## 0.14.0 — 2026-11-02: строгий UI locator области редакции
 
 - R18 run 41373325763 подтвердил ранний реальный sandboxed Chrome, большой nginx

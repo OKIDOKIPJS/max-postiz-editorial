@@ -224,6 +224,48 @@ def wait_editorial_panel(page):
     return panel
 
 
+def save_screenshot(root, folder, raw):
+    root, folder = plain(root), plain(folder)
+    require(folder == root / "data/ci-public", "SCENARIO_SCREENSHOT_PATH_INVALID")
+    require(type(raw) is bytes and 0 < len(raw) <= 8 * MIB, "SCENARIO_SCREENSHOT_BYTES_INVALID")
+    descriptors = []
+    try:
+        if os.name != "nt":
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            project = os.open(root, flags)
+            descriptors.append(project)
+            data = os.open("data", flags, dir_fd=project)
+            descriptors.append(data)
+            directory = os.open("ci-public", flags, dir_fd=data)
+            descriptors.append(directory)
+            for descriptor in (data, directory):
+                info = os.fstat(descriptor)
+                require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+                        and not info.st_mode & 0o077, "SCENARIO_SCREENSHOT_DIRECTORY_INVALID")
+        else:
+            require(folder.is_dir(), "SCENARIO_SCREENSHOT_DIRECTORY_INVALID")
+            directory = None
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            target = os.open("editorial-synthetic.png" if directory is not None else folder / "editorial-synthetic.png",
+                             flags, 0o600, **({"dir_fd": directory} if directory is not None else {}))
+        except FileExistsError:
+            raise ScenarioError("SCENARIO_EVIDENCE_ALREADY_EXISTS") from None
+        with os.fdopen(target, "wb") as output:
+            if os.name != "nt":
+                os.fchmod(output.fileno(), 0o600)
+            info = os.fstat(output.fileno())
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "SCENARIO_SCREENSHOT_ENTRY_INVALID")
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        if directory is not None:
+            os.fsync(directory)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 class Scenario:
     def __init__(self, root, state_path, evidence):
         self.root, self.state_path, self.evidence = plain(root), plain(state_path), plain(evidence)
@@ -484,8 +526,8 @@ class Scenario:
                 page.wait_for_function("ids=>ids.every(id=>[...document.querySelectorAll('option')].some(e=>e.value===id))",
                                        arg=list(TARGETS.values()), timeout=45000)
                 require(not errors, "SCENARIO_BROWSER_JAVASCRIPT_ERROR")
-                self.evidence.mkdir(mode=0o755, parents=True, exist_ok=True)
-                screenshot = page.screenshot(path=str(self.evidence / "editorial-synthetic.png"), full_page=True)
+                screenshot = page.screenshot(full_page=True)
+                save_screenshot(self.root, self.evidence, screenshot)
                 context.close()
                 return {"screenshot": "editorial-synthetic.png", "sha256": hashlib.sha256(screenshot).hexdigest(),
                         "javascript_errors": 0, "channels_rendered": 3}

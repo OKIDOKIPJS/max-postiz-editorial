@@ -45,6 +45,11 @@ SCENARIO_ARTIFACTS = frozenset({"bootstrap-owner.json", "bootstrap-owner-failed.
 SCENARIO_FILE_LIMIT = 8 * 1024 * 1024
 SCENARIO_TOTAL_LIMIT = 16 * 1024 * 1024
 TEST_CLIENT_MEMORY = "2G"
+COLLECTION_FAILURE_CODES = frozenset({"SCENARIO_PRODUCER_CLEANUP_UNCONFIRMED", "SCENARIO_EVIDENCE_PATH_INVALID",
+    "SCENARIO_EVIDENCE_OWNER_INVALID", "SCENARIO_EVIDENCE_ENTRY_INVALID", "SCENARIO_EVIDENCE_SIZE_INVALID",
+    "SCENARIO_EVIDENCE_CHANGED", "SCENARIO_EVIDENCE_STAGING_INVALID"})
+KNOWN_CLEANUP_CODES = frozenset({"owned_container_cleanup_unconfirmed", "owned_unit_stop_unconfirmed",
+    "owned_cgroup_cleanup_unconfirmed", "owned_slice_stop_unconfirmed"})
 BASE = "ghcr.io/gitroomhq/postiz-app@sha256:d2b37802e96757729fdea2d3d71287f841c2b619faa1cb4c21dac07df657fde1"
 PINS = {
     "postgres": "postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
@@ -101,6 +106,27 @@ def redact_proxy_error(raw, values):
             text = text.replace(value, "[REDACTED]")
     text = re.sub(r"(?im)^.*(?:cookie|authorization).*$", "[REDACTED_AUTH_LINE]", text)
     return re.sub(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "[REDACTED_JWT]", text).encode()
+
+
+def collection_failure_metadata(error, closed):
+    code = str(error) if isinstance(error, ReadinessError) and str(error) in COLLECTION_FAILURE_CODES else (
+        "SCENARIO_EVIDENCE_IO_FAILED" if isinstance(error, OSError) else "SCENARIO_EVIDENCE_METADATA_INVALID")
+    result = {"code": code}
+    if isinstance(closed, dict):
+        result["cleanup"] = {"closed": closed.get("state") == "closed", "cgroup_empty": closed.get("cgroup_empty") is True}
+        if isinstance(closed.get("cleanup_errors"), list) and len(closed["cleanup_errors"]) <= 100:
+            result["cleanup"]["error_count"] = len(closed["cleanup_errors"])
+            known = sorted({value for value in closed["cleanup_errors"] if isinstance(value, str) and value in KNOWN_CLEANUP_CODES})
+            if known:
+                result["cleanup"]["known_codes"] = known
+    entry = getattr(error, "evidence_entry", None)
+    if (isinstance(entry, dict) and set(entry) == {"name", "regular", "single_link", "owner_matches", "mode", "bytes"}
+            and isinstance(entry.get("name"), str) and entry["name"] in SCENARIO_ARTIFACTS
+            and all(type(entry.get(key)) is bool for key in ("regular", "single_link", "owner_matches"))
+            and type(entry.get("mode")) is int and 0 <= entry["mode"] <= 0o7777
+            and type(entry.get("bytes")) is int and 0 <= entry["bytes"] <= SCENARIO_FILE_LIMIT + 1):
+        result["entry"] = dict(entry)
+    return result
 
 
 def helper_execstart_override(unit, project):
@@ -253,7 +279,13 @@ def collect_scenario_evidence(project, staging, owner_uid):
             descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source_fd)
             try:
                 before = os.fstat(descriptor)
-                validate_scenario_entry(name, before, owner_uid)
+                try:
+                    validate_scenario_entry(name, before, owner_uid)
+                except ReadinessError as error:
+                    error.evidence_entry = {"name": name, "regular": stat.S_ISREG(before.st_mode),
+                        "single_link": before.st_nlink == 1, "owner_matches": before.st_uid == owner_uid,
+                        "mode": stat.S_IMODE(before.st_mode), "bytes": min(max(before.st_size, 0), SCENARIO_FILE_LIMIT + 1)}
+                    raise
                 raw = bytearray()
                 while chunk := os.read(descriptor, min(1024 * 1024, SCENARIO_FILE_LIMIT + 1 - len(raw))):
                     raw.extend(chunk)
@@ -1290,8 +1322,8 @@ finally:s.client.close()
         private_write(self.private / "runtime-backup-files.json", files)
         self.engine.docker("stop", "--time", "20", self.backend)
         self.engine.docker("stop", "--time", "20", self.orchestrator)
-        backup = {role: self.clone_database(role, name) for role, name in
-                  (("postiz", "postiz_readiness_restore"), ("hub", "editorial_hub_restore"))}
+        restored = {"postiz": "postiz_readiness_restore", "hub": "editorial_hub_restore"}
+        backup = {role: self.clone_database(role, name) for role, name in restored.items()}
         state = json.loads(self.state_path.read_text())
         state["postiz_dsn"] = state["postiz_dsn"].rsplit("/", 1)[0] + "/postiz_readiness_restore"
         state["hub_dsn"] = state["hub_dsn"].rsplit("/", 1)[0] + "/editorial_hub_restore"
@@ -1300,6 +1332,7 @@ finally:s.client.close()
         self.backend = self.container("backend-restored", self.image, env=self.app_environment(state), entrypoint="node",
             memory="1536m", swap="3g", volumes=[self.upload_volume + ":/uploads"],
             command=["--experimental-require-module", "/app/apps/backend/dist/apps/backend/src/main.js"])
+        self.wait_postiz_backend()
         subprocess.run(["systemctl", "start", "max-postiz-editorial.service"], check=True, timeout=60)
         self.wait_exec(self.proxy, ["node", "-e", "require('http').get('http://127.0.0.1:8092/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"])
         self.scenario("verify-restored")
@@ -1308,9 +1341,16 @@ finally:s.client.close()
         if any(digest((self.project / name).read_bytes()) != sha for name, sha in files.items()
                if name != ".env.local"):
             raise ReadinessError("RESTORE_RUNTIME_FILES_CHANGED")
+        for role, database in restored.items():
+            ident, port, user, _ = self.pg[role]
+            self.pg[role] = (ident, port, user, database)
         self.report["checks"]["backup_restore"] = {"databases": backup, "history_and_unknown_preserved": True,
             "runtime_files_preserved_in_place": True, "runtime_files_checked": len(files) - 1,
             "all_paused": True, "claims_not_reset": True}
+
+    def wait_postiz_backend(self):
+        # Read-only readiness precedes the one-shot authentication verification.
+        return self.wait_exec(self.proxy, ["node", "-e", "require('http').get('http://127.0.0.1:14007/api/auth/can-register',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"], seconds=180)
 
     def default_boot(self):
         self.phase("default_entrypoint_fresh_clone")
@@ -1453,14 +1493,16 @@ finally:s.client.close()
 
     def final_report(self, error=None):
         if hasattr(self, "scenario_public"):
+            closed = None
             try:
                 closed = json.loads((self.private / "engine.json").read_text())
                 if (closed.get("state") != "closed" or closed.get("cgroup_empty") is not True or closed.get("cleanup_errors")):
                     raise ReadinessError("SCENARIO_PRODUCER_CLEANUP_UNCONFIRMED")
                 self.report["checks"]["scenario_artifact_collection"] = collect_scenario_evidence(
                     self.project, self.public, self.user.pw_uid)
-            except (OSError, ValueError, ReadinessError):
+            except (OSError, ValueError, ReadinessError) as collection_error:
                 self.report["scenario_artifact_collection_failed"] = True
+                self.report["scenario_artifact_collection_failure"] = collection_failure_metadata(collection_error, closed)
                 error = error or ReadinessError("SCENARIO_EVIDENCE_COLLECTION_FAILED")
         self.report["finished_at_utc_ns"] = time.time_ns()
         if error is not None:

@@ -4,7 +4,9 @@ import base64
 import copy
 import importlib.util
 import io
+import os
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 
 import httpx
@@ -41,6 +43,82 @@ def test_editorial_heading_is_unique_inside_the_main_panel(scenario, duplicate_i
                 assert scenario.wait_editorial_panel(page).count() == 1
         finally:
             browser.close()
+
+
+def screenshot_folder(root):
+    folder = root / "data/ci-public"
+    folder.mkdir(parents=True)
+    folder.parent.chmod(0o700)
+    folder.chmod(0o700)
+    return folder
+
+
+def test_screenshot_bytes_are_exclusive_and_use_explicit_private_mode(scenario, tmp_path, monkeypatch):
+    folder = screenshot_folder(tmp_path)
+    raw = scenario.png_bytes()
+    original_open, original_fsync = os.open, os.fsync
+    opened, synced = [], []
+
+    def tracked_open(path, flags, mode=0o777, **kwargs):
+        if flags & os.O_CREAT:
+            opened.append((flags, mode))
+        return original_open(path, flags, mode, **kwargs)
+
+    def tracked_fsync(descriptor):
+        synced.append(descriptor)
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(scenario.os, "open", tracked_open)
+    monkeypatch.setattr(scenario.os, "fsync", tracked_fsync)
+    scenario.save_screenshot(tmp_path, folder, raw)
+    path = folder / "editorial-synthetic.png"
+    assert path.read_bytes() == raw
+    assert len(opened) == 1 and opened[0][1] == 0o600
+    assert opened[0][0] & os.O_CREAT and opened[0][0] & os.O_EXCL
+    if os.name != "nt":
+        assert opened[0][0] & os.O_NOFOLLOW
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600 and len(synced) == 2
+    else:
+        assert len(synced) == 1
+    with pytest.raises(scenario.ScenarioError, match="SCENARIO_EVIDENCE_ALREADY_EXISTS"):
+        scenario.save_screenshot(tmp_path, folder, b"replacement")
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX umask and permission bits")
+@pytest.mark.parametrize("mask", [0o002, 0o777])
+def test_screenshot_mode_is_0600_independent_of_process_umask(scenario, tmp_path, mask):
+    folder = screenshot_folder(tmp_path)
+    previous = os.umask(mask)
+    try:
+        scenario.save_screenshot(tmp_path, folder, scenario.png_bytes())
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE((folder / "editorial-synthetic.png").stat().st_mode) == 0o600
+
+
+def test_screenshot_destination_must_be_exact_project_private_output(scenario, tmp_path):
+    folder = tmp_path / "elsewhere"
+    folder.mkdir()
+    with pytest.raises(scenario.ScenarioError, match="SCENARIO_SCREENSHOT_PATH_INVALID"):
+        scenario.save_screenshot(tmp_path, folder, scenario.png_bytes())
+    assert list(folder.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory and symlink guards")
+@pytest.mark.parametrize("bad_directory", ["permissions", "symlink"])
+def test_screenshot_rejects_nonprivate_or_linked_output(scenario, tmp_path, bad_directory):
+    folder = screenshot_folder(tmp_path)
+    if bad_directory == "permissions":
+        folder.chmod(0o755)
+    else:
+        folder.rmdir()
+        other = tmp_path / "outside"
+        other.mkdir(mode=0o700)
+        folder.symlink_to(other, target_is_directory=True)
+    with pytest.raises(scenario.ScenarioError):
+        scenario.save_screenshot(tmp_path, folder, scenario.png_bytes())
+    assert not (folder / "editorial-synthetic.png").exists()
 
 
 def state(root):
