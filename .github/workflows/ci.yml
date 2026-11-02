@@ -47,6 +47,14 @@ jobs:
         run: python -m pip check
       - name: Build wheel and source distribution
         run: python -m build --no-isolation
+      - name: Install and smoke-test the built wheel in a clean environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-check"
+          "$RUNNER_TEMP/wheel-check/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/wheel-check/bin/python" -m pip check
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-check/bin/python" -I -c 'import importlib.metadata; from max_postiz_agent import __version__; assert __version__ == importlib.metadata.version("max-postiz-agent"); print(__version__)'
 
   python-tests:
     name: Python tests (${{ matrix.os }}, part ${{ matrix.shard_index }}/${{ matrix.shard_count }})
