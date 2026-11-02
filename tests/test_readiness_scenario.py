@@ -68,7 +68,7 @@ def fake_client(scenario):
     instance.check = lambda: None
     calls = []
     instance.client = httpx.Client(base_url=scenario.ORIGIN, transport=httpx.MockTransport(
-        lambda request: calls.append(request) or httpx.Response(200, json={})))
+        lambda request: calls.append(request) or httpx.Response(201, json={})))
     return instance, calls
 
 
@@ -154,6 +154,51 @@ def test_mixed_owner_cookie_and_bearer_probe_keeps_existing_rejection_expectatio
                                  headers={"Authorization": "Bearer ci-invalid"}).status_code == status
         assert len(requests) == 1 and requests[0].headers["Authorization"] == "Bearer ci-invalid"
         assert "auth=fixture-owner-cookie" in requests[0].headers["Cookie"]
+    finally:
+        instance.client.close()
+
+
+@pytest.mark.parametrize("method,path,status,accepted", [
+    ("POST", "/api/editorial/route-admin", 201, True),
+    ("POST", "/api/editorial/route-admin", 200, False),
+    ("POST", "/api/editorial/route-admin", 202, False),
+    ("POST", "/api/editorial/route-action", 201, True),
+    ("POST", "/api/editorial/route-action", 200, False),
+    ("POST", "/api/editorial/control", 201, True),
+    ("POST", "/api/editorial/control", 202, False),
+    ("POST", "/api/auth/register", 200, True),
+    ("POST", "/api/auth/register", 201, False),
+    ("POST", "/api/auth/login", 200, True),
+    ("POST", "/api/auth/login", 201, False),
+    ("GET", "/api/editorial/route-setup", 200, True),
+    ("GET", "/api/editorial/route-setup", 201, False),
+])
+def test_native_success_status_matches_exact_auth_and_nest_bff_contract(scenario, method, path, status, accepted):
+    instance = object.__new__(scenario.Scenario)
+    instance.check = lambda: None
+    requests = []
+    instance.client = httpx.Client(base_url=scenario.ORIGIN, transport=httpx.MockTransport(
+        lambda request: requests.append(request) or httpx.Response(status, json={})))
+    kwargs = {"json": {"action": "preflight" if path.endswith("route-action") else "pause"}}
+    try:
+        if accepted:
+            assert instance.call(method, path, **kwargs).status_code == status
+        else:
+            with pytest.raises(scenario.ScenarioError, match="SCENARIO_HTTP_STATUS_INVALID"):
+                instance.call(method, path, **kwargs)
+        assert len(requests) == 1
+    finally:
+        instance.client.close()
+
+
+@pytest.mark.parametrize("status", [403, 413, 422])
+def test_explicit_negative_status_is_not_replaced_by_bff_success_default(scenario, status):
+    instance = object.__new__(scenario.Scenario)
+    instance.check = lambda: None
+    instance.client = httpx.Client(base_url=scenario.ORIGIN,
+        transport=httpx.MockTransport(lambda request: httpx.Response(status, json={})))
+    try:
+        assert instance.admin({"action": "upload_media"}, allowed=(status,)) == {}
     finally:
         instance.client.close()
 

@@ -1,5 +1,21 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: точный успешный статус Nest POST в native harness
+
+- R14 run 41367369667 подтвердил первый отказ: POST /api/editorial/route-admin,
+  configure_target, HTTP 201. Проверки доступа перед ним прошли. Закреплённый
+  Nest 11.1.21 по умолчанию выдаёт CREATED для POST без HttpCode; три BFF handler
+  его не переопределяют. Это несовпадение harness с действующим API, не auth отказ.
+- У native scenario точная карта: GET и auth register/login — 200; route-admin,
+  route-action и control POST — 201. Admin наследует эту карту. Явные отрицательные
+  ожидания 401/403/413/422, порядок, cookie/Bearer guards и запрет повтора сохранены.
+  Нет разрешения любого 2xx или изменения production handler/авторизации.
+- Проверки: 57 pure scenario tests passed, включая отклонение 200/202 для BFF,
+  201 для auth и сохранение negative overrides; Ruff/diff и независимый review
+  прошли. В этот кандидат также входит локально проверенный monitor fixture
+  commit 1656d22. Полные CI/canonical/native проверки обязательны для exact head;
+  R14 accepted=false и без image export, рабочий сервер/Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: настоящий Hub context в monitor command fixtures
 
 - Полный R13 CI выявил четыре monitor-command отказа после объединения main:

@@ -30,6 +30,8 @@ TARGETS = {"max": "ci_max", "telegram": "ci_tg", "vk": "ci_vk"}
 MIB = 1024 * 1024
 HTTP_PATHS = frozenset({"/api/auth/register", "/api/auth/login", "/api/user/self", "/api/editorial/route-setup",
     "/api/editorial/settings", "/api/editorial/control", "/api/editorial/route-admin", "/api/editorial/route-action"})
+POST_SUCCESS_STATUS = {"/api/auth/register": 200, "/api/auth/login": 200,
+    "/api/editorial/route-admin": 201, "/api/editorial/route-action": 201, "/api/editorial/control": 201}
 HTTP_ACTIONS = frozenset({"configure_target", "set_secret", "upload_media", "create_original", "revise_original",
     "request_restart", "prepare_login", "preview", "preflight", "pause"})
 HTTP_ERROR_CODES = frozenset({
@@ -209,7 +211,7 @@ class Scenario:
         phases[mode] = {"state": "started", "at": time.time()}
         self.save()
 
-    def call(self, method, path, *, allowed=(200,), **kwargs):
+    def call(self, method, path, *, allowed=None, **kwargs):
         self.check()
         require(method in {"GET", "POST"}, "SCENARIO_HTTP_SCOPE_INVALID")
         require(path in HTTP_PATHS, "SCENARIO_HTTP_SCOPE_INVALID")
@@ -217,6 +219,10 @@ class Scenario:
             require(kwargs.get("json", {}).get("action") in {"preview", "preflight"}, "SCENARIO_EXTERNAL_ACTION_FORBIDDEN")
         if path == "/api/editorial/control" and "json" in kwargs:
             require(kwargs["json"].get("action") == "pause", "SCENARIO_EXTERNAL_ACTION_FORBIDDEN")
+        if allowed is None:
+            expected = 200 if method == "GET" else POST_SUCCESS_STATUS.get(path)
+            require(expected is not None, "SCENARIO_HTTP_SCOPE_INVALID")
+            allowed = (expected,)
         try:
             response = self.client.request(method, path, **kwargs)
         except httpx.HTTPError:
@@ -283,7 +289,7 @@ class Scenario:
         self.save()
         return {"fresh_database": True, "registered": True, "cookie_login": True, "owner_verified": True}
 
-    def admin(self, value, allowed=(200,)):
+    def admin(self, value, allowed=None):
         require(value.get("action") in {"configure_target", "set_secret", "upload_media", "create_original",
                 "revise_original", "request_restart", "prepare_login"}, "SCENARIO_EXTERNAL_ACTION_FORBIDDEN")
         return self.body(self.call("POST", "/api/editorial/route-admin", json=value, allowed=allowed))
