@@ -1,3 +1,8 @@
+## 0.14.0 — CI follow-up, 2026-11-02 (Europe/Moscow)
+
+- The existing quality job now installs the built wheel into a new temporary virtual environment, checks its resolved dependencies with `pip check`, and verifies the installed package version through an isolated Python import outside the checkout. Existing required jobs and checks remain unchanged.
+- Validation: workflow YAML parsed and the added Bash commands reviewed; the current main wheel installation and GitHub-hosted run have not yet been executed. This CI-only change does not alter the runtime package version.
+
 # История версий
 
 ## 0.14.0 — 2026-11-02: ограниченный RFB/WebSocket probe без EOF busy loop
