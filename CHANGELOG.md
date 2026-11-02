@@ -1,5 +1,26 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: ранний probe большого тела и приватный nginx log
+
+- R15 run 41368799645 прошёл configure_target с 201 и дошёл до upload_media;
+  там HTTP 500 без известного JSON code. SHA тела совпал с штатным CRLF HTML
+  nginx/1.22.1, а не Nest JSON. Причина proxy-ошибки пока не установлена; типовые
+  версии о правах или месте не объявляются доказанными. Native acceptance false.
+- До тяжёлой сборки добавлен 14 MiB body transport probe через тот же BASE,
+  nginx config/read-only/tmpfs и lo-only namespace. Отдельные ограниченные client
+  и streaming stub контейнеры проверяют точное число bytes; stub auth 204 явно
+  fixture, не owner proof. Proxy остаётся 96 MiB, client/stub — 128 MiB.
+  После проверки все три процесса останавливаются и три listener ports свободны.
+- При отказе собирается только фиксированный nginx error file после проверки
+  собственного ID/label/cgroup/role: NOFOLLOW/regular/singlelink, bounded complete
+  lines. Raw остаётся private и не входит в public glob; все известные passwords,
+  auth lines и JWT удаляются до public tail и общего privacy gate. Тот же сбор
+  применяется к runtime Scenario failure до удаления собственного Engine.
+- Проверки: 74 pure/mock passed, 8 Windows FD/symlink skips; Ruff/diff и отдельный
+  review прошли. App/Node context, реальные auth/status проверки и default CMD
+  не менялись. Новый run должен дать раннюю причину либо выполнить весь native
+  сценарий; рабочий сервер и аккаунт Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: точный успешный статус Nest POST в native harness
 
 - R14 run 41367369667 подтвердил первый отказ: POST /api/editorial/route-admin,

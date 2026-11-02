@@ -560,3 +560,91 @@ def test_portal_reads_only_private_owned_bounded_restart_manifest_without_writin
     target.write_bytes(b"x" * 4097)
     with pytest.raises(native.ReadinessError, match="NATIVE_RESTART_LEASE_PRIVATE_REQUIRED"):
         native.read_restart_lease(tmp_path, os.getuid())
+
+
+def test_proxy_error_redaction_removes_whole_auth_lines_jwts_and_known_secrets(native):
+    raw = b'open failed fixture-secret\nCookie: unknown-cookie-value\nAuthorization: Bearer private-value\nother abcdefghijk.abcdefghijkl.abcdefghijklm\n'
+    value = native.redact_proxy_error(raw, {"fixture-secret"})
+    assert b'open failed [REDACTED]' in value and b'[REDACTED_JWT]' in value
+    assert all(secret not in value for secret in (b'fixture-secret', b'unknown-cookie-value', b'private-value', b'abcdefghijk.'))
+
+
+@pytest.mark.parametrize("changed", ["label", "role", "parent"])
+def test_nginx_private_log_reader_rejects_foreign_container_before_exec(native, tmp_path, changed):
+    instance = native.Acceptance.__new__(native.Acceptance)
+    value = {"Config": {"Labels": {native.LABEL_KEY: "owned", "editorial.readiness.role": "proxy"}},
+             "HostConfig": {"CgroupParent": "/owned.slice"}}
+    if changed == "label":
+        value["Config"]["Labels"][native.LABEL_KEY] = "foreign"
+    elif changed == "role":
+        value["Config"]["Labels"]["editorial.readiness.role"] = "backend"
+    else:
+        value["HostConfig"]["CgroupParent"] = "/foreign.slice"
+    calls = []
+    def docker(*argv, **kwargs):
+        calls.append(argv)
+        assert argv == ("inspect", "container"), "Must not read logs before exact owner validation"
+        return SimpleNamespace(stdout=json.dumps([value]))
+    instance.engine = SimpleNamespace(docker=docker, label_value="owned", cgroup_parent="/owned.slice")
+    with pytest.raises(native.ReadinessError, match="PROXY_DIAGNOSTIC_OWNER_MISMATCH"):
+        instance.proxy_error_diagnostic("container")
+    assert calls == [("inspect", "container")]
+
+
+def test_early_large_proxy_transport_uses_separate_capped_client_and_releases_all_ports(native, tmp_path):
+    instance = native.Acceptance.__new__(native.Acceptance)
+    instance.project, instance.private = tmp_path / "project", tmp_path / "private"
+    (instance.project / "deployment/linux").mkdir(parents=True)
+    instance.private.mkdir()
+    (instance.project / "deployment/linux/editorial-postiz.nginx.conf").write_text("server{listen 4007;}")
+    calls, containers, commands = [], {}, []
+    def docker(*argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "wait":
+            return SimpleNamespace(stdout="0\n")
+        if argv[0] == "logs":
+            return SimpleNamespace(stdout=json.dumps({"passed": True, "status": 201, "bytes": 14 * 1024 * 1024}))
+        if argv[0] == "inspect":
+            return SimpleNamespace(stdout=json.dumps([{"State": {"Running": False}}]))
+        assert argv[0] == "stop"
+        return SimpleNamespace(stdout="")
+    instance.engine = SimpleNamespace(root=tmp_path, docker=docker)
+    instance.anchor_pid = 123
+    instance.report = {"checks": {}}
+    instance.phase = lambda value: None
+    instance.network_anchor = lambda: None
+    instance.container = lambda role, image, **kwargs: containers.setdefault(role, kwargs) and role
+    instance.wait_exec = lambda *args, **kwargs: None
+    instance.namespace = lambda command: command
+    instance.run = lambda command, **kwargs: commands.append(command)
+    instance.proxy_preflight()
+    assert containers["proxy-preflight"]["memory"] == "96m"
+    assert containers["proxy-transport-client"]["memory"] == "128m"
+    assert "Buffer.alloc(14*1024*1024" in containers["proxy-transport-client"]["command"][1]
+    assert "createServer" in containers["proxy-transport-stub"]["command"][1]
+    assert all(port in commands[0][-1] for port in ("3000", "14007", "4007"))
+    assert {args[-1] for args in calls if args[0] == "stop"} == set(containers)
+    proof = instance.report["checks"]["early_proxy_preflight"]
+    assert proof["large_body_transport_bytes"] == 14 * 1024 * 1024 and proof["real_owner_authentication"] is False
+
+
+def test_owned_nginx_error_capture_discards_partial_line_and_never_publishes_auth(native, tmp_path, monkeypatch):
+    instance = native.Acceptance.__new__(native.Acceptance)
+    instance.private, instance.report = tmp_path, {"checks": {}}
+    instance.runtime_passwords = {"internal": "fixture-private-key"}
+    inspected = {"Config": {"Labels": {native.LABEL_KEY: "owned", "editorial.readiness.role": "proxy"}},
+                 "HostConfig": {"CgroupParent": "/owned.slice"}}
+    instance.engine = SimpleNamespace(label_value="owned", cgroup_parent="/owned.slice",
+        docker=lambda *args: SimpleNamespace(stdout=json.dumps([inspected])), docker_binary=PurePosixPath("/own/docker"),
+        socket="unix:///own/engine.sock", config_dir=PurePosixPath("/own/config"), environment={})
+    def output(command, environment):
+        assert command[:5] == ["/own/docker", "--host", "unix:///own/engine.sock", "--config", "/own/config"]
+        assert command[5:9] == ["exec", "container", "node", "-e"]
+        assert "'/tmp/nginx-error.log'" in command[9] and "O_NOFOLLOW" in command[9]
+        return b'open failed fixture-private-key\nCookie: unknown-cookie\nprivate-key-fragment', {"truncated": False}
+    monkeypatch.setattr(native, "bounded_diagnostic_output", output)
+    instance.proxy_error_diagnostic("container")
+    raw, published = (tmp_path / "proxy-nginx-error.raw").read_bytes(), (tmp_path / "proxy-nginx-error.log").read_bytes()
+    assert raw.endswith(b'\n') and b'private-key-fragment' not in raw
+    assert b'fixture-private-key' not in published and b'unknown-cookie' not in published
+    assert instance.report["checks"]["proxy_error_capture"]["owner_verified"] is True

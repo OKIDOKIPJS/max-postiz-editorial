@@ -93,6 +93,15 @@ def proxy_configuration(outer):
         "proxy_set_header X-Forwarded-Proto $scheme;}}}")
 
 
+def redact_proxy_error(raw, values):
+    text = raw.decode("utf-8", errors="replace")
+    for value in sorted(values, key=len, reverse=True):
+        if value:
+            text = text.replace(value, "[REDACTED]")
+    text = re.sub(r"(?im)^.*(?:cookie|authorization).*$", "[REDACTED_AUTH_LINE]", text)
+    return re.sub(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "[REDACTED_JWT]", text).encode()
+
+
 def helper_execstart_override(unit, project):
     helpers = {"max-postiz-login.service": "login-browser.py",
                "max-postiz-editorial-restart.service": "restart-editorial.py"}
@@ -750,6 +759,28 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
         subprocess.run(self.namespace(["ip", "address", "add", "10.20.30.45/32", "dev", "lo"]), check=True, timeout=10)
         self.report["checks"]["runtime_namespace"] = self.namespace_proof()
 
+    def proxy_error_diagnostic(self, ident):
+        value = json.loads(self.engine.docker("inspect", ident).stdout)[0]
+        labels = value.get("Config", {}).get("Labels", {})
+        role = labels.get("editorial.readiness.role")
+        if (labels.get(LABEL_KEY) != self.engine.label_value or role not in {"proxy", "proxy-preflight"}
+                or value.get("HostConfig", {}).get("CgroupParent") != self.engine.cgroup_parent):
+            raise ReadinessError("PROXY_DIAGNOSTIC_OWNER_MISMATCH")
+        script = "const fs=require('fs');const p='/tmp/nginx-error.log';const f=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);try{const s=fs.fstatSync(f);if(!s.isFile()||s.nlink!==1)throw Error('INVALID');const b=Buffer.alloc(65537);const n=fs.readSync(f,b,0,b.length,0);process.stdout.write(b.subarray(0,n));}finally{fs.closeSync(f)}"
+        command = [str(self.engine.docker_binary), "--host", self.engine.socket, "--config", str(self.engine.config_dir),
+                   "exec", ident, "node", "-e", script]
+        raw, bounded = bounded_diagnostic_output(command, self.engine.environment)
+        if raw and not raw.endswith(b"\n"):
+            raw = raw[:raw.rfind(b"\n") + 1]
+        private_write(self.private / (role + "-nginx-error-metadata.json"), {"sha256": digest(raw), **bounded})
+        (self.private / (role + "-nginx-error.raw")).write_bytes(raw)
+        values = set(getattr(self, "runtime_passwords", {}).values())
+        if hasattr(self, "state_path") and self.state_path.exists():
+            values.update(synthetic_secrets(json.loads(self.state_path.read_text())))
+        (self.private / (role + "-nginx-error.log")).write_bytes(redact_proxy_error(raw, values))
+        self.report["checks"][role + "_error_capture"] = {"fixed_path": "/tmp/nginx-error.log",  # noqa: S108 - fixed file inside an identity-verified private container.
+            "owner_verified": True, "raw_sha256": digest(raw), "captured_bytes": len(raw), **bounded}
+
     def proxy_preflight(self):
         self.phase("early_proxy_preflight")
         self.network_anchor()
@@ -763,14 +794,36 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
             volumes=[str(self.proxy_dir) + ":/readiness:ro"], command=["-c", "/readiness/nginx.conf", "-g", "daemon off;"])
         probe = "Promise.all(['http://127.0.0.1:14007/','http://10.20.30.45:4007/'].map(url=>new Promise(resolve=>require('http').get(url,r=>resolve(r.statusCode===502&&String(r.headers.server).includes('nginx'))).on('error',()=>resolve(false))))).then(values=>process.exit(values.every(Boolean)?0:1))"
         self.wait_exec(proxy, ["node", "-e", probe], seconds=30)
-        self.engine.docker("stop", "--time", "10", proxy)
-        if json.loads(self.engine.docker("inspect", proxy).stdout)[0]["State"]["Running"]:
-            raise ReadinessError("PROXY_PREFLIGHT_NOT_STOPPED")
-        release = "import socket; handles=[]\nfor host,port in [('127.0.0.1',14007),('10.20.30.45',4007)]:\n s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((host,port));handles.append(s)\nfor s in handles:s.close()"
+        stub_script = "require('http').createServer((q,r)=>{if(q.url==='/editorial/browser-authorize'){r.writeHead(q.headers.cookie==='ci-transport=1'?204:403);r.end();return;}if(q.method!=='POST'||q.url!=='/editorial/route-admin'){r.writeHead(404);r.end();return;}let n=0;q.on('data',b=>n+=b.length);q.on('end',()=>{r.writeHead(201,{'content-type':'application/json'});r.end(JSON.stringify({bytes:n,transport_fixture:true}));});}).listen(3000,'127.0.0.1')"
+        stub = self.container("proxy-transport-stub", BASE, entrypoint="node", memory="128m", swap="256m", command=["-e", stub_script])
+        client = None
+        try:
+            self.wait_exec(stub, ["node", "-e", "require('http').get('http://127.0.0.1:3000/',r=>process.exit(r.statusCode===404?0:1)).on('error',()=>process.exit(1))"], seconds=30)
+            client_script = "const h=require('http');const b=Buffer.alloc(14*1024*1024,32);b[0]=34;b[b.length-1]=34;const q=h.request('http://10.20.30.45:4007/api/editorial/route-admin',{method:'POST',headers:{Cookie:'ci-transport=1',Origin:'" + ORIGIN + "','Content-Type':'application/json','Content-Length':b.length}},r=>{let out='';r.on('data',v=>{out+=v;if(out.length>4096)q.destroy();});r.on('end',()=>{let v;try{v=JSON.parse(out)}catch{}const ok=r.statusCode===201&&v?.bytes===b.length&&v?.transport_fixture===true;console.log(JSON.stringify({passed:ok,status:r.statusCode,bytes:v?.bytes,real_owner_authentication:false}));process.exit(ok?0:1);});});q.setTimeout(15000,()=>q.destroy());q.on('error',()=>process.exit(1));q.end(b);"
+            client = self.container("proxy-transport-client", BASE, entrypoint="node", memory="128m", swap="256m", command=["-e", client_script])
+            code = self.engine.docker("wait", client, timeout=30).stdout.strip()
+            outcome = self.engine.docker("logs", client).stdout
+            (self.private / "proxy-transport.log").write_text(outcome)
+            if code != "0" or json.loads(outcome).get("passed") is not True:
+                raise ReadinessError("PROXY_LARGE_BODY_TRANSPORT_FAILED")
+        except BaseException:
+            try:
+                self.proxy_error_diagnostic(proxy)
+            except Exception:
+                self.report["proxy_error_capture_failed"] = True
+            raise
+        finally:
+            for ident in (client, stub, proxy):
+                if ident is not None:
+                    self.engine.docker("stop", "--time", "10", ident)
+                    if json.loads(self.engine.docker("inspect", ident).stdout)[0]["State"]["Running"]:
+                        raise ReadinessError("PROXY_PREFLIGHT_NOT_STOPPED")
+        release = "import socket; handles=[]\nfor host,port in [('127.0.0.1',3000),('127.0.0.1',14007),('10.20.30.45',4007)]:\n s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((host,port));handles.append(s)\nfor s in handles:s.close()"
         self.run(self.namespace([sys.executable, "-c", release]), name="proxy-ports-released", timeout=10)
         self.report["checks"]["early_proxy_preflight"] = {"passed": True, "read_only": True,
             "read_only_profile": "five-private-tmpfs-paths-v1",
             "pinned_base_used": True, "both_listeners_reached": True, "ports_released": True,
+            "large_body_transport_bytes": 14 * 1024 * 1024, "real_owner_authentication": False,
             "database_started": False, "default_cmd_executed": False, "configuration_sha256": self.proxy_sha256}
 
     def runtime_dependencies(self):
@@ -839,10 +892,18 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
 
     def scenario(self, mode):
         self.namespace_proof()
-        result = self.user_run([str(self.python),
-            str(self.project / "deployment/linux/readiness_scenario.py"), "--root", str(self.project),
-            "--state", str(self.state_path), "--evidence", str(self.scenario_public), "--mode", mode],
-            name="scenario-" + mode, timeout=600)
+        try:
+            result = self.user_run([str(self.python),
+                str(self.project / "deployment/linux/readiness_scenario.py"), "--root", str(self.project),
+                "--state", str(self.state_path), "--evidence", str(self.scenario_public), "--mode", mode],
+                name="scenario-" + mode, timeout=600)
+        except BaseException:
+            if hasattr(self, "proxy"):
+                try:
+                    self.proxy_error_diagnostic(self.proxy)
+                except Exception:
+                    self.report["proxy_error_capture_failed"] = True
+            raise
         self.namespace_proof()
         return result
 
