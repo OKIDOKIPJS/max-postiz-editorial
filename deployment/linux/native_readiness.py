@@ -43,7 +43,8 @@ ENGINE_FAILURE_STAGES = frozenset({
 })
 SCENARIO_ARTIFACTS = frozenset({"bootstrap-owner.json", "bootstrap-owner-failed.json", "exercise.json",
     "exercise-failed.json", "snapshot.json", "snapshot-failed.json", "verify-restored.json",
-    "verify-restored-failed.json", "portal.json", "default-cmd.json", "editorial-synthetic.png"})
+    "verify-restored-failed.json", "portal.json", "default-cmd.json", "editorial-synthetic.png",
+    "monitor-snapshot.json", "monitor-snapshot-failed.json", "monitor-restore.json", "monitor-restore-failed.json"})
 SCENARIO_FILE_LIMIT = 8 * 1024 * 1024
 SCENARIO_TOTAL_LIMIT = 16 * 1024 * 1024
 TEST_CLIENT_MEMORY = "2G"
@@ -1557,6 +1558,49 @@ finally:s.client.close()
         for unit in reversed(self.unit_names):
             subprocess.run(["systemctl", "stop", unit], capture_output=True, timeout=30, check=False)
 
+    def monitor_copy_acceptance(self):
+        """A genuine marked copy owns its DB; the main native project stays unmarked."""
+        self.phase("isolated_monitor_0133_backup_restore")
+        parent = self.created_opt / "monitor-copies"
+        parent.mkdir(mode=0o700)
+        os.chown(parent, self.user.pw_uid, self.user.pw_gid)
+        self.runtime_passwords["monitor"] = secrets.token_urlsafe(36)
+        user, port, database = "monitor_admin", 55448, "editorial_hub"
+        ident = self.container("monitor-pg", PINS["postgres"], env={"POSTGRES_USER": user,
+            "POSTGRES_DB": database, "POSTGRES_PASSWORD": self.runtime_passwords["monitor"],
+            "PGDATA": "/var/lib/postgresql/data/pgdata"},
+            volumes=[self.volume("monitor-pg") + ":/var/lib/postgresql/data"], memory="192m", swap="768m",
+            extra=["--user", "postgres", "--tmpfs", "/var/run/postgresql:rw,nosuid,nodev,mode=1777"],
+            command=["postgres", "-p", str(port), "-c", "listen_addresses=127.0.0.1",
+                     "-c", "shared_buffers=32MB", "-c", "max_connections=50", "-c", "log_statement=ddl"])
+        self.pg["monitor"] = (ident, port, user, database)
+        self.wait_exec(ident, ["pg_isready", "-h", "127.0.0.1", "-p", str(port), "-U", user, "-d", database])
+        count = self.engine.docker("exec", ident, "psql", "-p", str(port), "-U", user, "-d", database,
+            "-tAc", "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'").stdout.strip()
+        if count != "0":
+            raise ReadinessError("MONITOR_INITIAL_DATABASE_NOT_EMPTY")
+        state = json.loads(self.state_path.read_text())
+        state["monitor_dsn"] = ("postgresql+psycopg://" + user + ":" + self.runtime_passwords["monitor"]
+                                + "@127.0.0.1:55448/editorial_hub")
+        private_write(self.state_path, state, exclusive=False)
+        os.chown(self.state_path, self.user.pw_uid, self.user.pw_gid)
+        self.scenario("monitor-snapshot")
+        backup = self.clone_database("monitor", "editorial_hub_tests")
+        self.scenario("monitor-restore")
+        for mode in ("monitor-snapshot", "monitor-restore"):
+            value = json.loads((self.scenario_public / (mode + ".json")).read_text())
+            if value.get("passed") is not True or not all(value.get(key) is True for key in (
+                    "configured_disabled", "owner_api_verified", "fresh_heartbeat", "heartbeat_advanced",
+                    "actual_lanes_stopped", "sender_disabled",
+                    "watchdog_no_notify", "history_preserved", "no_browser_or_send", "main_history_unchanged")):
+                raise ReadinessError("MONITOR_NATIVE_ACCEPTANCE_INCOMPLETE")
+        self.report["checks"]["monitor_0133_native_copy"] = {"passed": True,
+            "separate_marker_and_database": True, "postgres_port": port, "initially_empty": True,
+            "restart_and_restore": True, "unknown_and_commands_not_replayed": True,
+            "watchdog_no_notify": True, "actual_lanes_stopped": True, "heartbeat_advanced_each_start": True,
+            "browser_or_send_calls": 0, "backup": backup,
+            "scope": "synthetic_disabled_monitor_no_live_delivery"}
+
     def execute(self):
         self.report["disk"] = disk_preflight(self.job, self.workspace)
         self.phase("pinned_docker_tools")
@@ -1582,6 +1626,7 @@ finally:s.client.close()
                 self.supervisor_and_single_worker()
                 self.portal()
                 self.backup_restore()
+                self.monitor_copy_acceptance()
                 self.default_boot()
                 self.namespace_proof()
                 self.report["native_checks_passed"] = True
@@ -1621,6 +1666,14 @@ finally:s.client.close()
                 if line and not line.lstrip().startswith("#") and "=" in line:
                     key, value = line.split("=", 1)
                     values.update(synthetic_secrets({key: value}))
+        if getattr(self, "created_opt", None) is not None:
+            for copy in ("initial", "restored"):
+                path = self.created_opt / "monitor-copies" / copy / ".env.local"
+                if path.is_file() and not path.is_symlink():
+                    for line in path.read_text().splitlines():
+                        if line and not line.lstrip().startswith("#") and "=" in line:
+                            key, value = line.split("=", 1)
+                            values.update(synthetic_secrets({key: value}))
         # Only fixed codes and redacted bounded tails are exposed, never whole
         # logs, environment, cookie jars, browser profiles or database dumps.
         if error is not None:

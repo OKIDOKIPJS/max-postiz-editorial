@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import closing, contextmanager, redirect_stdout
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
+import sqlite3
 import stat
 import struct
 import sys
+import threading
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -53,7 +58,195 @@ EXCEPTION_KINDS = frozenset({"ScenarioError", "KeyError", "TypeError", "ValueErr
     "InvalidRequestError", "NoSuchTableError", "MemoryError", "OverflowError", "AssertionError"})
 SCENARIO_FUNCTIONS = frozenset({"main", "run", "exercise", "bootstrap", "login", "body", "call", "admin", "setup",
     "runtime", "browser", "engine", "hub_snapshot", "postiz_snapshot", "snapshot", "seed_unknown", "check", "save",
-    "phase", "atomic", "digest", "png_bytes", "dsn", "plain", "bind_source", "validate_state", "namespace_guard", "require"})
+    "phase", "atomic", "digest", "png_bytes", "dsn", "plain", "bind_source", "validate_state", "namespace_guard", "require",
+    "monitor_scope", "monitor_environment", "monitor_history", "monitor_ledger_history", "monitor_files",
+    "monitor_round", "monitor_copy", "monitor_acceptance", "monitor_lanes", "monitor_advanced"})
+MONITOR_TABLE_SELECTS = {
+    "monitor_reports": "SELECT * FROM monitor_reports", "monitor_meta": "SELECT * FROM monitor_meta",
+    "monitor_command_jobs": "SELECT * FROM monitor_command_jobs",
+    "monitor_source_proposals": "SELECT * FROM monitor_source_proposals",
+    "monitor_command_controls": "SELECT * FROM monitor_command_controls",
+    "monitor_command_mutation_minutes": "SELECT * FROM monitor_command_mutation_minutes",
+    "monitor_command_cancellations": "SELECT * FROM monitor_command_cancellations",
+    "monitor_command_permission_migrations": "SELECT * FROM monitor_command_permission_migrations",
+}
+
+
+def monitor_scope(state, root, *, restored=False):
+    """The production isolation guard retains its exact 55448/14007 contracts."""
+    database = "editorial_hub_tests" if restored else "editorial_hub"
+    value = dsn(state.get("monitor_dsn", ""), 55448)
+    require(urlsplit(value).path == "/editorial_hub", "SCENARIO_MONITOR_DATABASE_INVALID")
+    endpoint = value.rsplit("/", 1)[0] + "/" + database
+    copy = plain(root.parent / "monitor-copies" / ("restored" if restored else "initial"))
+    require(not copy.is_relative_to(root) and not root.is_relative_to(copy), "SCENARIO_MONITOR_COPY_OVERLAP")
+    return copy, endpoint
+
+
+@contextmanager
+def monitor_environment(state, endpoint):
+    """Only this ephemeral process receives synthetic copy credentials."""
+    before = dict(os.environ)
+    values = {"DATABASE_URL": endpoint, "TEST_DATABASE_URL": endpoint.rsplit("/", 1)[0] + "/editorial_hub_tests",
+        "POSTIZ_BASE_URL": POSTIZ, "POSTIZ_API_KEY": state["postiz_api_key"],
+        "POSTIZ_PUBLIC_ORIGIN": ORIGIN, "EDITORIAL_INTERNAL_KEY": state["internal_key"],
+        "EDITORIAL_OWNER_USER_ID": state["owner_id"], "EDITORIAL_OWNER_ORGANIZATION_ID": state["org_id"],
+        "MONITOR_WATCHDOG_KEY": state["internal_key"], "MONITOR_WATCHDOG_OWNER": state["owner_id"],
+        "MONITOR_WATCHDOG_ORGANIZATION": state["org_id"]}
+    try:
+        os.environ.update(values)
+        yield values
+    finally:
+        os.environ.clear()
+        os.environ.update(before)
+
+
+def monitor_history(core):
+    """Compare all editorial rows and durable monitor rows, excluding heartbeat only."""
+    from sqlalchemy import MetaData, select
+    metadata = MetaData()
+    metadata.reflect(bind=core.db.engine)
+    editorial = {}
+    with core.db.engine.connect() as connection:
+        connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+        for table in metadata.sorted_tables:
+            rows = [dict(row._mapping) for row in connection.execute(select(table))]
+            editorial[table.name] = {"count": len(rows), "sha256": digest(sorted(rows, key=digest))}
+    return {"editorial": editorial, "monitor": monitor_ledger_history(core.settings.root)}
+
+
+def monitor_ledger_history(root):
+    path = plain(root / "data/monitor/monitor.sqlite")
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        monitor = {}
+        for name in tables:
+            require(name in MONITOR_TABLE_SELECTS, "SCENARIO_MONITOR_TABLE_INVALID")
+            rows = [dict(row) for row in connection.execute(MONITOR_TABLE_SELECTS[name])]
+            if name == "monitor_meta":
+                rows = [row for row in rows if row["key"] not in {"observer", "sender", "command_receiver"}]
+            monitor[name] = {"count": len(rows), "sha256": digest(sorted(rows, key=digest))}
+    return monitor
+
+
+def monitor_files(root):
+    files = {}
+    for folder in ("config", "data"):
+        for path in sorted((plain(root) / folder).rglob("*")):
+            require(not path.is_symlink(), "SCENARIO_MONITOR_BACKUP_ENTRY_INVALID")
+            if path.is_dir():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if relative == "data/four-platform/isolation.json":
+                continue
+            require(path.is_file() and path.stat().st_nlink == 1, "SCENARIO_MONITOR_BACKUP_ENTRY_INVALID")
+            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files
+
+
+def monitor_lanes():
+    return [thread for thread in threading.enumerate() if thread.name in {
+        "monitor-reports", "monitor-receive", "monitor-tasks"} and thread.is_alive()]
+
+
+def monitor_advanced(status, baseline, started_at):
+    observer = status.get("observer", {})
+    for field in ("heartbeat_at", "source_collected_at", "sender_heartbeat_at"):
+        stamp, previous = observer.get(field), baseline.get(field)
+        if (type(stamp) not in {int, float} or not math.isfinite(stamp) or stamp < started_at
+                or previous is not None and (type(previous) not in {int, float}
+                    or not math.isfinite(previous) or stamp <= previous)):
+            return False
+    return True
+
+
+def monitor_round(core, state):
+    """Real loopback HTTP and real monitor lanes; any browser construction fails."""
+    import uvicorn
+    from max_postiz_agent.monitor_api import monitor_status
+    from max_postiz_agent.monitor_cli import run, watchdog_once
+    from max_postiz_agent.monitor_config import MonitorConfig
+    from max_postiz_agent.monitor_service import MonitorService
+    from max_postiz_agent.server_api import editorial_app
+    require(not monitor_lanes(), "SCENARIO_MONITOR_LANES_NOT_STOPPED")
+    stop = threading.Event()
+    server = uvicorn.Server(uvicorn.Config(editorial_app(core), host="127.0.0.1", port=18092,
+        access_log=False, log_level="warning"))
+    api = threading.Thread(target=server.run, name="ci-monitor-api")
+    worker = threading.Thread(target=run, args=(core, stop), name="ci-monitor-run")
+    calls = []
+    original = MonitorService._transport
+
+    def forbidden_transport(self):
+        calls.append("browser")
+        raise ScenarioError("SCENARIO_MONITOR_EXTERNAL_TRANSPORT_FORBIDDEN")
+
+    before = monitor_history(core)
+    baseline = monitor_status(core).get("observer", {})
+    started_at = time.time()
+    MonitorService._transport = forbidden_transport
+    try:
+        api.start()
+        worker.start()
+        deadline = time.monotonic() + 25
+        status = {}
+        while time.monotonic() < deadline:
+            status = monitor_status(core)
+            advanced = monitor_advanced(status, baseline, started_at)
+            if (server.started and advanced and status.get("freshness") == "fresh"
+                    and status.get("observer", {}).get("sender_state") == "disabled"):
+                break
+            if not worker.is_alive():
+                break
+            stop.wait(0.05)
+        require(server.started and monitor_advanced(status, baseline, started_at) and status.get("freshness") == "fresh"
+                and status.get("enabled") is False and status.get("destination_configured") is False
+                and status.get("observer", {}).get("source_paused") is True
+                and status.get("observer", {}).get("sender_state") == "disabled", "SCENARIO_MONITOR_HEARTBEAT_INVALID")
+        headers = {"X-Editorial-Key": state["internal_key"], "X-Editorial-Owner": state["owner_id"],
+                   "X-Editorial-Organization": state["org_id"]}
+        with httpx.Client(base_url="http://127.0.0.1:18092", trust_env=False, timeout=10, follow_redirects=False) as client:
+            for route in ("monitor", "monitor-heartbeat", "monitor-preview"):
+                path = "/internal/editorial/" + route
+                for bad in ({}, {**headers, "X-Editorial-Key": "wrong"},
+                            {**headers, "X-Editorial-Owner": "wrong"},
+                            {**headers, "X-Editorial-Organization": "wrong"}):
+                    require(client.get(path, headers=bad).status_code == 403, "SCENARIO_MONITOR_AUTH_FAILED")
+                response = client.get(path, headers=headers)
+                require(response.status_code == 200 and response.headers.get("cache-control") == "no-store"
+                        and response.json().get("read_only") is True
+                        and response.json().get("external_mutations") == 0, "SCENARIO_MONITOR_OWNER_API_FAILED")
+                require(client.get(path + "?unused=1", headers=headers).status_code == 422,
+                        "SCENARIO_MONITOR_QUERY_NOT_REJECTED")
+        service = MonitorService(core, MonitorConfig.load(core.settings.root))
+        result = watchdog_once(service, "http://127.0.0.1:18092/internal/editorial/monitor-heartbeat",
+                               status["instance_id"], notify=False)
+        require(result.get("state") == "healthy", "SCENARIO_MONITOR_WATCHDOG_FAILED")
+    finally:
+        stop.set()
+        server.should_exit = True
+        if worker.ident is not None:
+            worker.join(timeout=15)
+        if api.ident is not None:
+            api.join(timeout=15)
+        # run() itself has bounded joins: its wrapper can finish while a real
+        # daemon lane still owns the SQLite ledger. Never snapshot that state.
+        lanes = monitor_lanes()
+        if not lanes and not worker.is_alive() and not api.is_alive():
+            MonitorService._transport = original
+        # These checks belong in finally so an HTTP/watchdog failure cannot
+        # bypass quiescence. On leaks the deny-transport sentinel stays armed
+        # until the bounded scenario process/cgroup is stopped by its owner.
+        require(not lanes, "SCENARIO_MONITOR_LANES_NOT_STOPPED")
+        require(not worker.is_alive() and not api.is_alive(), "SCENARIO_MONITOR_THREADS_NOT_STOPPED")
+    require(not calls, "SCENARIO_MONITOR_EXTERNAL_TRANSPORT_ATTEMPTED")
+    require(monitor_history(core) == before, "SCENARIO_MONITOR_HISTORY_CHANGED")
+    return {"instance_id": status["instance_id"], "configured_disabled": True, "owner_api_verified": True,
+        "fresh_heartbeat": True, "heartbeat_advanced": True, "actual_lanes_stopped": True,
+        "sender_disabled": True, "watchdog_no_notify": True,
+        "history_preserved": True, "no_browser_or_send": True}
 
 
 class ScenarioError(RuntimeError):
@@ -643,15 +836,162 @@ class Scenario:
         return {"history_sha256": digest(value), "tables": value, "postiz": postiz, "all_paused": True,
                 "unknown_fixture_preserved": True, "owner_identity_preserved": True, "external_publications": 0}
 
+    def monitor_copy(self, root, endpoint, values, *, restored):
+        from max_postiz_agent.isolated_workspace import assert_isolated
+        from max_postiz_agent.monitor_config import initialize_monitor_config
+        from max_postiz_agent.routes_cli import initialize_copy
+        from max_postiz_agent.server_cli import main as server_main
+        require(not root.exists(), "SCENARIO_MONITOR_COPY_ALREADY_EXISTS")
+        root.mkdir(mode=0o700)
+        (root / "config").mkdir(mode=0o700)
+        # Public templates only: no primary runtime, browser profile or credentials.
+        for template in (self.root / "config").glob("*.example.json"):
+            require(template.is_file() and not template.is_symlink(), "SCENARIO_MONITOR_TEMPLATE_INVALID")
+            shutil.copy2(template, root / "config" / template.name)
+        for folder in ("schemas",):
+            for source in (self.root / folder).rglob("*"):
+                require(not source.is_symlink(), "SCENARIO_MONITOR_TEMPLATE_INVALID")
+            shutil.copytree(self.root / folder, root / folder)
+        shutil.copy2(self.root / "TOPIC.md", root / "TOPIC.md")
+        initialize_copy(root, self.root)
+        app = json.loads((root / "config/app.json").read_text())
+        app["require_postgresql"] = True
+        atomic(root / "config/app.json", app, private=True)
+        publishing = json.loads((root / "config/publishing.json").read_text())
+        publishing["targets"] = []
+        atomic(root / "config/publishing.json", publishing, private=True)
+        path = root / ".env.local"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write("\n" + "\n".join(key + "=" + value for key, value in values.items()) + "\n")
+        path.chmod(0o600)
+        assert_isolated(root)
+        initialize_monitor_config(root)
+        if not restored:
+            policy = json.loads((root / "config/hourly_article_policy.example.json").read_text(encoding="utf-8-sig"))
+            policy["enabled"] = False
+            atomic(root / "data/hourly-article-policy.local.json", policy, private=True)
+            # The only explicit migration; monitor build/run/status never initialize PG.
+            with redirect_stdout(io.StringIO()):
+                server_main(["--root", str(root), "migrate"])
+        else:
+            backup = self.root / "data/ci-private/monitor-backup"
+            require(backup.is_dir(), "SCENARIO_MONITOR_BACKUP_ABSENT")
+            for folder in ("config", "data"):
+                for source in sorted((backup / folder).rglob("*")):
+                    if source.is_dir():
+                        continue
+                    relative = source.relative_to(backup)
+                    require(source.is_file() and not source.is_symlink() and source.stat().st_nlink == 1
+                            and relative.as_posix() != "data/four-platform/isolation.json",
+                            "SCENARIO_MONITOR_BACKUP_ENTRY_INVALID")
+                    target = root / relative
+                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+            assert_isolated(root)
+            require(monitor_files(root) == self.state.get("monitor_backup_files"),
+                    "SCENARIO_MONITOR_RESTORE_FILES_CHANGED")
+        require(urlsplit(endpoint).port == 55448, "SCENARIO_MONITOR_DATABASE_INVALID")
+
+    def monitor_acceptance(self, *, restored=False):
+        from max_postiz_agent.monitor_cli import build_monitor
+        from max_postiz_agent.monitor_commands import CommandGateway
+        from max_postiz_agent.monitor_config import MonitorConfig
+        from max_postiz_agent.monitor_store import MonitorStore
+        self.check()
+        before_main = self.hub_snapshot()
+        root, endpoint = monitor_scope(self.state, self.root, restored=restored)
+        with monitor_environment(self.state, endpoint) as values:
+            self.monitor_copy(root, endpoint, values, restored=restored)
+            core = build_monitor(root)
+            try:
+                store = MonitorStore(root)
+                config = MonitorConfig.load(root)
+                if not restored:
+                    # Unknown and queued synthetic history exist before observation;
+                    # they must survive restarts/restore without claiming or replay.
+                    at = time.time()
+                    store.enqueue("ci-unknown", "incident", "Synthetic unknown; never sent", config.hash,
+                                  "123456789", at=at, expires_at=at + 3600)
+                    claimed = store.claim(config.hash, "123456789", at=at)
+                    require(claimed is not None, "SCENARIO_MONITOR_FIXTURE_CLAIM_FAILED")
+                    store.finish(claimed, "unknown", {}, at=at)
+                    store.enqueue("ci-pending", "hourly", "Synthetic queued; never sent", config.hash,
+                                  "123456789", at=at + 1, expires_at=at + 3600)
+                    gateway = CommandGateway(core, config.command_options(), store.path)
+                    with gateway._connection() as connection:
+                        for index, state in enumerate(("unknown", "queued")):
+                            connection.execute("INSERT INTO monitor_command_jobs "
+                                "(id,event_key,event_hash,actor,chat_id,payload,config_hash,state,result,created_at,updated_at) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (f"{index + 1:032x}", "ci-" + state,
+                                digest(state), "ci_fixture", "123456789", '{"action":"status"}', config.hash,
+                                state, '{"fixture":true,"external_mutations":0}', at, at))
+                initial = monitor_history(core)
+                require(initial["monitor"]["monitor_reports"]["count"] == 2
+                        and initial["monitor"]["monitor_command_jobs"]["count"] == 2,
+                        "SCENARIO_MONITOR_HISTORY_FIXTURES_ABSENT")
+                if restored:
+                    require(initial == self.state.get("monitor_history"), "SCENARIO_MONITOR_RESTORE_CHANGED_HISTORY")
+                result = monitor_round(core, self.state)
+                require(result["instance_id"] == store.meta("instance_id"), "SCENARIO_MONITOR_INSTANCE_CHANGED")
+                if not restored:
+                    # A fresh core simulates process restart, not only another GET.
+                    core.close()
+                    core = build_monitor(root)
+                    again = monitor_round(core, self.state)
+                    require(again["instance_id"] == result["instance_id"] and monitor_history(core) == initial,
+                            "SCENARIO_MONITOR_RESTART_CHANGED_HISTORY")
+                    self.state["monitor_history"] = initial
+                    self.state["monitor_instance_id"] = result["instance_id"]
+                    self.save()
+                    backup = self.root / "data/ci-private/monitor-backup"
+                    backup.mkdir(mode=0o700)
+                    for folder in ("config", "data"):
+                        for source in sorted((root / folder).rglob("*")):
+                            if source.is_dir():
+                                continue
+                            relative = source.relative_to(root)
+                            if relative.as_posix() == "data/four-platform/isolation.json":
+                                continue
+                            require(source.is_file() and not source.is_symlink() and source.stat().st_nlink == 1,
+                                    "SCENARIO_MONITOR_BACKUP_ENTRY_INVALID")
+                            target = backup / relative
+                            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            if relative.as_posix() == "data/monitor/monitor.sqlite":
+                                with closing(sqlite3.connect(source)) as original, closing(sqlite3.connect(target)) as destination:
+                                    original.backup(destination)
+                                    destination.commit()
+                                target.chmod(0o600)
+                            else:
+                                shutil.copy2(source, target)
+                    self.state["monitor_backup_files"] = monitor_files(backup)
+                    self.save()
+                else:
+                    require(result["instance_id"] == self.state.get("monitor_instance_id"),
+                            "SCENARIO_MONITOR_RESTORE_INSTANCE_CHANGED")
+                require(monitor_history(core) == initial, "SCENARIO_MONITOR_HISTORY_CHANGED")
+                result.update(history_sha256=digest(initial), unknown_reports=1, pending_reports=1,
+                    unknown_commands=1, queued_commands=1, restart_verified=not restored,
+                    restored=restored, external_publications=0,
+                    runtime_files_sha256=digest(self.state["monitor_backup_files"]))
+            finally:
+                core.close()
+        self.check()
+        require(self.hub_snapshot() == before_main, "SCENARIO_MONITOR_CHANGED_MAIN_HISTORY")
+        result["main_history_unchanged"] = True
+        return result
+
     def run(self, mode):
-        prerequisites = {"exercise": "bootstrap-owner", "snapshot": "exercise", "verify-restored": "snapshot"}
+        prerequisites = {"exercise": "bootstrap-owner", "snapshot": "exercise", "verify-restored": "snapshot",
+                         "monitor-snapshot": "verify-restored", "monitor-restore": "monitor-snapshot"}
         if mode in prerequisites:
             require(self.state.get("phases", {}).get(prerequisites[mode], {}).get("state") == "passed"
                     and all(isinstance(self.state.get(key), str) and self.state[key]
                             for key in ("owner_id", "org_id", "postiz_api_key")), "SCENARIO_PHASE_PREREQUISITE_MISSING")
         self.phase(mode)
         result = {"bootstrap-owner": self.bootstrap, "exercise": self.exercise,
-                  "snapshot": self.snapshot, "verify-restored": lambda: self.snapshot(restored=True)}[mode]()
+                  "snapshot": self.snapshot, "verify-restored": lambda: self.snapshot(restored=True),
+                  "monitor-snapshot": self.monitor_acceptance,
+                  "monitor-restore": lambda: self.monitor_acceptance(restored=True)}[mode]()
         self.check()
         self.state["phases"][mode]["state"] = "passed"
         self.save()
@@ -663,7 +1003,8 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--mode", choices=("bootstrap-owner", "exercise", "snapshot", "verify-restored"), required=True)
+    parser.add_argument("--mode", choices=("bootstrap-owner", "exercise", "snapshot", "verify-restored",
+                                         "monitor-snapshot", "monitor-restore"), required=True)
     args = parser.parse_args(argv)
     scenario = None
     try:

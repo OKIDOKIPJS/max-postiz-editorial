@@ -18,6 +18,7 @@ from max_postiz_agent.article_reserve import ArticleReserveStore
 from max_postiz_agent.config import AgentError
 from max_postiz_agent.db import Audit, Database, uid
 from max_postiz_agent.hub_models import BridgePost, Dispatch, Target
+from max_postiz_agent.isolated_workspace import mark_isolated
 from max_postiz_agent.monitor_commands import _editorial_actor
 from max_postiz_agent.server_models import EditorialControl, EditorialLedger, EditorialPreparationClaim
 from max_postiz_agent.server_state import (
@@ -236,4 +237,82 @@ def test_real_pg_closed_claim_and_ledger_survive_revision_changes_without_active
         assert stored.token == token and stored.control_revision == initial["revision"]
         assert stored.state == "quality_ready" and stored.active_key is None
         assert session.scalar(select(func.count()).select_from(Dispatch)) == 0
+    assert owned_pg_bridge[3] == []
+
+
+def _monitor_pg_bootstrap(core, monkeypatch):
+    """Inject only this fixture's verified PG schema; runtime isolation guards stay real.
+
+    QA uses its dedicated cluster rather than runtime's port 55448. No environment
+    URL or runtime allowlist is broadened to make this schema-check proof possible.
+    """
+    from max_postiz_agent import hub_cli, monitor_cli
+
+    for name in ("DATABASE_URL", "TEST_DATABASE_URL", "POSTIZ_BASE_URL", "MAX_EXISTING_BROWSER_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    root = core.settings.root
+    mark_isolated(root, root.parent / "owned-monitor-bootstrap-source")
+    owned_url = core.db.engine.url.render_as_string(hide_password=False)
+    monkeypatch.setattr(hub_cli, "Database", lambda settings: Database(settings, url=owned_url))
+    return lambda: monitor_cli.build_monitor(root)
+
+
+def test_real_pg_monitor_bootstrap_checks_schema_without_migration_or_history_changes(owned_pg_bridge, monkeypatch):
+    from max_postiz_agent.hub import HubService
+    from max_postiz_agent.service import Service
+
+    core = draft(owned_pg_bridge)
+    state = ServerState(core)
+    initial = state.initialize()
+    all_targets_paused(core)
+    with core.db.session.begin() as session:
+        session.add(EditorialPreparationClaim(control_revision=initial["revision"], state="unknown"))
+        session.add(EditorialLedger(id=LEDGER_ID, revision=7,
+            payload={"records": [{"id": "historical-monitor-bootstrap", "state": "cancelled"}]}))
+    before = core.db.export()
+    bootstrap = _monitor_pg_bootstrap(core, monkeypatch)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Ordinary monitor bootstrap attempted PostgreSQL migration or activation")
+
+    monkeypatch.setattr(Database, "initialize", forbidden)
+    monkeypatch.setattr(HubService, "sync_targets", forbidden)
+    monkeypatch.setattr(Service, "activate", forbidden)
+    started = bootstrap()
+    try:
+        assert started.db.engine.dialect.name == "postgresql"
+        assert started.db.export() == before
+    finally:
+        started.close()
+    assert core.db.export() == before
+    assert owned_pg_bridge[3] == []
+
+
+@pytest.mark.parametrize("change", ["missing_column", "unapproved_revision"])
+def test_real_pg_monitor_bootstrap_rejects_schema_drift_without_ddl(owned_pg_bridge, monkeypatch, change):
+    core = owned_pg_bridge[0]
+    with core.db.engine.begin() as connection:
+        if change == "missing_column":
+            connection.execute(text("ALTER TABLE hub_dispatches DROP COLUMN verified"))
+        else:
+            connection.execute(text("UPDATE alembic_version SET version_num='unapproved_fixture_revision'"))
+
+    def schema_snapshot():
+        with core.db.engine.connect() as connection:
+            columns = connection.execute(text(
+                "SELECT table_name,column_name,data_type,is_nullable FROM information_schema.columns "
+                "WHERE table_schema=current_schema() ORDER BY table_name,ordinal_position")).all()
+            revision = connection.execute(text("SELECT version_num FROM alembic_version")).all()
+        return columns, revision
+
+    before = schema_snapshot()
+    bootstrap = _monitor_pg_bootstrap(core, monkeypatch)
+    started = None
+    try:
+        with pytest.raises(AgentError, match="^SERVER_MIGRATION_REQUIRED$"):
+            started = bootstrap()
+    finally:
+        if started is not None:
+            started.close()
+    assert schema_snapshot() == before
     assert owned_pg_bridge[3] == []

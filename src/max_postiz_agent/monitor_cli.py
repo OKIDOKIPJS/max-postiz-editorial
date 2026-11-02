@@ -26,7 +26,8 @@ def build_monitor(root):
     assert_isolated(root, environment=False)
     load_env(root)
     assert_isolated(root)
-    return build(root, activate=False)
+    # Только явный init создаёт схему; обычные команды проверяют сохранённую.
+    return build(root, activate=False, initialize=False)
 
 
 def run(core, stop=None, *, control_only=False):
