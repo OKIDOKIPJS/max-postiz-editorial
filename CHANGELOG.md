@@ -1,5 +1,31 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: ограниченный RFB/WebSocket probe без EOF busy loop
+
+- R20 run 41378325059 прошёл стандартный CI/CodeQL, полную сборку, owner API/UI
+  exercise, Linux supervisor и single-worker fence; строгий collector впервые
+  сохранил PNG и пройденные сценарии. Native accepted=false: portal client был
+  остановлен по 780-секундному timeout, почти всё время потребляя CPU. В прежних
+  recv loops подтверждён дефект: пустой recv не завершал цикл. Какой upstream
+  закрыл соединение и какой именно loop вызвал R20 timeout, не установлено.
+- Portal probe теперь немедленно прекращается при EOF, ограничивает socket reads,
+  абсолютный WebSocket deadline 10 секунд и HTTP headers 8192 bytes. До одного
+  owner WebSocket handshake выполняется read-only ожидание настоящего RFB banner
+  на 5900 не более 15 секунд. Login/prepare_login и другие POST не повторяются;
+  реальные 600 секунд selection lease и общий client budget 780 секунд сохранены.
+- Проверяются 101, точный nonce accept, Upgrade/Connection и точный 12-byte RFB
+  banner. Поток собирается из нескольких binary messages или корректных
+  continuation frames с общими пределами 512 bytes / 32 frames; control/close,
+  неверные frames, неполный banner и превышения не принимаются. Диагностика
+  содержит только фиксированные platform/stage/error literals, без cookie.
+- Проверки: 106 passed / 8 Windows skips, включая EOF обоих loops, partial и
+  coalesced stream, несколько binary frames, continuation, slow dribble deadline,
+  caps, timeout, неверные 101/accept/RFB и отсутствие повторов. Ruff/diff и
+  независимое review прошли. Продуктовые auth/units/Node context не изменены;
+  server-side race не объявляется доказанной. Полная native приёмка нового
+  exact commit ещё обязательна; default boot и image export остаются непроверенными.
+  Рабочая VM, Пикабу и внешние публикации не затрагивались.
+
 ## 0.14.0 — 2026-11-02: готовность backend после restore и приватный producer PNG
 
 - R19 run 41374913726 прошёл полный native build, реальные owner API проверки,

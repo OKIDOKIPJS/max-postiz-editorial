@@ -783,3 +783,124 @@ def test_collection_cleanup_projection_emits_only_the_four_known_literal_codes(n
     assert value["cleanup"]["error_count"] == 4
     assert value["cleanup"]["known_codes"] == ["owned_cgroup_cleanup_unconfirmed", "owned_unit_stop_unconfirmed"]
     assert "private" not in json.dumps(value)
+
+
+class PortalWire:
+    def __init__(self, chunks, advance=None):
+        self.chunks, self.reads, self.sent, self.timeouts = list(chunks), 0, [], []
+        self.advance = advance
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        pass
+    def settimeout(self, value):
+        self.timeouts.append(value)
+    def sendall(self, value):
+        self.sent.append(value)
+    def recv(self, amount):
+        self.reads += 1
+        if self.advance:
+            self.advance()
+        if not self.chunks:
+            return b""
+        value = self.chunks.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        if len(value) > amount:
+            self.chunks.insert(0, value[amount:])
+        return value[:amount]
+
+
+@pytest.mark.parametrize("initial,kwargs", [(b"", {"marker": b"\r\n\r\n"}), (b"partial", {"marker": b"\r\n\r\n"}),
+                                          (b"", {"size": 2}), (b"\x82\x0cRFB", {"size": 14})])
+def test_portal_wire_eof_is_immediate_for_header_and_frame(native, initial, kwargs):
+    wire = PortalWire([])
+    with pytest.raises(native.ReadinessError, match="PORTAL_WIRE_EOF"):
+        native.portal_receive(wire, initial, **kwargs, cap=8192, deadline=10, clock=lambda: 0)
+    assert wire.reads == 1
+
+
+def test_portal_slow_dribble_cannot_extend_absolute_deadline(native):
+    ticks = [0]
+    wire = PortalWire([b"x"] * 100, advance=lambda: ticks.__setitem__(0, ticks[0] + 1))
+    with pytest.raises(native.ReadinessError, match="PORTAL_WIRE_TIMEOUT"):
+        native.portal_receive(wire, marker=b"done", cap=8192, deadline=3, clock=lambda: ticks[0])
+    assert wire.reads == 3 and max(wire.timeouts) <= 2
+
+
+@pytest.mark.parametrize("kind", ["cap", "timeout"])
+def test_portal_header_cap_and_socket_timeout_are_bounded(native, kind):
+    wire = PortalWire([b"x" * 8192] if kind == "cap" else [TimeoutError("private-cookie")])
+    expected = "PORTAL_WIRE_CAP_EXCEEDED" if kind == "cap" else "PORTAL_WIRE_UNAVAILABLE"
+    with pytest.raises(native.ReadinessError, match=expected) as caught:
+        native.portal_receive(wire, marker=b"\r\n\r\n", cap=8192, deadline=10, clock=lambda: 0)
+    assert "private-cookie" not in str(caught.value) and wire.reads <= 2
+
+
+@pytest.mark.parametrize("fault", [None, "partial", "two_coalesced", "two_separate", "continuation",
+    "status", "accept", "close", "wrong_banner", "eof_body", "eof_second_frame", "empty_frame_cap"])
+def test_owner_websocket_requires_one_valid_upgrade_and_binary_rfb_frame(native, monkeypatch, fault):
+    import base64
+    import hashlib
+    monkeypatch.setattr(native.os, "urandom", lambda amount: b"a" * amount)
+    key = base64.b64encode(b"a" * 16).decode()
+    expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(), usedforsecurity=False).digest()).decode()
+    header = ("HTTP/1.1 " + ("200 OK" if fault == "status" else "101 Switching Protocols") +
+              "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
+              ("wrong" if fault == "accept" else expected) + "\r\n\r\n").encode()
+    banner = b"not-rfb-data" if fault == "wrong_banner" else b"RFB 003.008\n"
+    frame = bytes([0x88 if fault == "close" else 0x82, len(banner)]) + banner
+    chunks = [header] if fault == "eof_body" else ([header[:12], header[12:] + frame[:1], frame[1:]] if fault == "partial" else [header + frame])
+    first = b"\x82\x04RFB "
+    second = b"\x82\x08003.008\n"
+    if fault in {"two_coalesced", "two_separate", "continuation", "eof_second_frame"}:
+        if fault == "continuation":
+            first, second = b"\x02\x04RFB ", b"\x80\x08003.008\n"
+        chunks = ([header + first + second] if fault == "two_coalesced" else
+                  [header + first] if fault == "eof_second_frame" else [header + first, second])
+    elif fault == "empty_frame_cap":
+        chunks = [header + b"\x82\x00" * 33]
+    wire, calls = PortalWire(chunks), []
+    def connect(address, **kwargs):
+        calls.append(address)
+        return wire
+    if fault in {None, "partial", "two_coalesced", "two_separate", "continuation"}:
+        native.portal_websocket("private-cookie", connect=connect, clock=lambda: 0)
+    else:
+        with pytest.raises(native.ReadinessError) as caught:
+            native.portal_websocket("private-cookie", connect=connect, clock=lambda: 0)
+        assert "private-cookie" not in str(caught.value)
+    assert calls == [("10.20.30.45", 4007)] and len(wire.sent) == 1
+
+
+def test_rfb_readiness_is_read_only_before_one_websocket_without_auth_post_retry(native):
+    ticks, attempts = [0.0], []
+    ready = PortalWire([b"RFB 003.", b"008\n"])
+    def connect(address, **kwargs):
+        attempts.append(address)
+        if len(attempts) < 3:
+            raise ConnectionRefusedError("private-server-message")
+        return ready
+    native.wait_portal_rfb(connect=connect, clock=lambda: ticks[0],
+        sleep=lambda amount: ticks.__setitem__(0, ticks[0] + amount))
+    assert attempts == [("127.0.0.1", 5900)] * 3 and not ready.sent
+    import inspect
+    code = inspect.getsource(native.Acceptance.portal)
+    assert code.index("wait_portal_rfb()") < code.index("portal_websocket(cookie)")
+    assert code.count("value=s.admin({'action':'prepare_login'") == 1
+
+
+def test_rfb_readiness_never_accepts_wrong_protocol_and_stops_at_deadline(native):
+    calls, ticks = [], [0.0]
+    def wrong(address, **kwargs):
+        calls.append(address)
+        return PortalWire([b"HTTP/1.1\n"])
+    with pytest.raises(native.ReadinessError, match="PORTAL_RFB_PROTOCOL_INVALID"):
+        native.wait_portal_rfb(connect=wrong, clock=lambda: ticks[0])
+    assert len(calls) == 1
+    def closed(address, **kwargs):
+        return PortalWire([])
+    with pytest.raises(native.ReadinessError, match="PORTAL_RFB_NOT_READY"):
+        native.wait_portal_rfb(connect=closed, clock=lambda: ticks[0],
+            sleep=lambda amount: ticks.__setitem__(0, ticks[0] + amount))
+    assert ticks[0] == 15

@@ -7,6 +7,7 @@ Only explicitly selected, sanitized evidence leaves this disposable environment.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -127,6 +129,100 @@ def collection_failure_metadata(error, closed):
             and type(entry.get("bytes")) is int and 0 <= entry["bytes"] <= SCENARIO_FILE_LIMIT + 1):
         result["entry"] = dict(entry)
     return result
+
+
+def portal_receive(wire, initial=b"", *, marker=None, size=None, cap, deadline, clock=None):
+    clock = clock or time.monotonic
+    value = bytearray(initial)
+    while True:
+        if len(value) > cap:
+            raise ReadinessError("PORTAL_WIRE_CAP_EXCEEDED")
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise ReadinessError("PORTAL_WIRE_TIMEOUT")
+        if (marker is not None and marker in value) or (size is not None and len(value) >= size):
+            return bytes(value)
+        if len(value) == cap:
+            raise ReadinessError("PORTAL_WIRE_CAP_EXCEEDED")
+        wire.settimeout(min(2, remaining))
+        try:
+            chunk = wire.recv(min(4096, cap - len(value)))
+        except (TimeoutError, OSError):
+            raise ReadinessError("PORTAL_WIRE_UNAVAILABLE") from None
+        if not chunk:
+            raise ReadinessError("PORTAL_WIRE_EOF")
+        value.extend(chunk)
+
+
+def wait_portal_rfb(*, connect=None, clock=None, sleep=None):
+    connect, clock, sleep = connect or socket.create_connection, clock or time.monotonic, sleep or time.sleep
+    deadline = clock() + 15
+    while clock() < deadline:
+        try:
+            with connect(("127.0.0.1", 5900), timeout=min(1, max(0.05, deadline - clock()))) as wire:
+                banner = portal_receive(wire, marker=b"\n", cap=64, deadline=min(deadline, clock() + 2), clock=clock)
+            if not re.fullmatch(rb"RFB [0-9]{3}\.[0-9]{3}\n", banner):
+                raise ReadinessError("PORTAL_RFB_PROTOCOL_INVALID")
+            return
+        except (OSError, TimeoutError):
+            pass
+        except ReadinessError as error:
+            if str(error) not in {"PORTAL_WIRE_EOF", "PORTAL_WIRE_TIMEOUT", "PORTAL_WIRE_UNAVAILABLE"}:
+                raise
+        sleep(min(0.1, max(0, deadline - clock())))
+    raise ReadinessError("PORTAL_RFB_NOT_READY")
+
+
+def portal_websocket(cookie, *, connect=None, clock=None):
+    connect, clock = connect or socket.create_connection, clock or time.monotonic
+    deadline = clock() + 10
+    key = base64.b64encode(os.urandom(16)).decode()
+    message = ('GET /owner-browser/websockify HTTP/1.1\r\nHost: 10.20.30.45:4007\r\nOrigin: ' + ORIGIN +
+        '\r\nCookie: auth=' + cookie + '\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n'
+        'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\nSec-WebSocket-Key: ' + key + '\r\n\r\n')
+    try:
+        with connect(("10.20.30.45", 4007), timeout=2) as wire:
+            wire.sendall(message.encode())
+            raw = portal_receive(wire, marker=b"\r\n\r\n", cap=8192, deadline=deadline, clock=clock)
+            header, body = raw.split(b"\r\n\r\n", 1)
+            lines = header.split(b"\r\n")
+            if not re.fullmatch(rb"HTTP/1\.1 101(?: [^\r\n]*)?", lines[0]):
+                raise ReadinessError("PORTAL_WEBSOCKET_STATUS_INVALID")
+            headers = {}
+            for line in lines[1:]:
+                name, separator, value = line.partition(b":")
+                name = name.strip().lower()
+                if not separator or name in headers:
+                    raise ReadinessError("PORTAL_WEBSOCKET_HEADER_INVALID")
+                headers[name] = value.strip()
+            # RFC 6455 mandates this nonce digest; it is not a password/signature hash.
+            expected = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode(), usedforsecurity=False).digest())
+            if (headers.get(b"sec-websocket-accept") != expected or headers.get(b"upgrade", b"").lower() != b"websocket"
+                    or b"upgrade" not in [part.strip().lower() for part in headers.get(b"connection", b"").split(b",")]):
+                raise ReadinessError("PORTAL_WEBSOCKET_HEADER_INVALID")
+            banner, consumed, fragmented = b"", 0, False
+            for _ in range(32):
+                body = portal_receive(wire, body, size=2, cap=512, deadline=deadline, clock=clock)
+                fin, opcode = bool(body[0] & 0x80), body[0] & 0x0f
+                if (body[0] & 0x70 or body[1] & 0x80 or body[1] & 0x7f >= 126
+                        or opcode != (0 if fragmented else 2)):
+                    raise ReadinessError("PORTAL_WEBSOCKET_FRAME_INVALID")
+                length = body[1] & 0x7f
+                consumed += 2 + length
+                if consumed > 512:
+                    raise ReadinessError("PORTAL_WIRE_CAP_EXCEEDED")
+                body = portal_receive(wire, body, size=2 + length, cap=512, deadline=deadline, clock=clock)
+                banner, body = banner + body[2:2 + length], body[2 + length:]
+                fragmented = not fin
+                if len(banner) > 12:
+                    raise ReadinessError("PORTAL_RFB_PROTOCOL_INVALID")
+                if len(banner) == 12 and not fragmented:
+                    if not re.fullmatch(rb"RFB [0-9]{3}\.[0-9]{3}\n", banner):
+                        raise ReadinessError("PORTAL_RFB_PROTOCOL_INVALID")
+                    return
+            raise ReadinessError("PORTAL_WIRE_CAP_EXCEEDED")
+    except (OSError, TimeoutError):
+        raise ReadinessError("PORTAL_WIRE_UNAVAILABLE") from None
 
 
 def helper_execstart_override(unit, project):
@@ -1225,14 +1321,17 @@ print(json.dumps(result));sys.exit(0 if result['passed'] else 1)
         code = r'''
 import base64,hashlib,json,os,pathlib,socket,subprocess,sys,time
 sys.path.insert(0,str(pathlib.Path(sys.argv[1])/'deployment/linux'))
-from readiness_scenario import Scenario,atomic,require
+from readiness_scenario import Scenario,ScenarioError,atomic,require
+from native_readiness import wait_portal_rfb,portal_websocket,ReadinessError
 s=Scenario(pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3]));s.login()
-result=[]
+result=[];platform='max';stage='prepare_login'
 try:
  for platform in ('max','vk'):
+  stage='prepare_login'
   setup=s.setup();target=next(x for x in setup['targets'] if x['id']=={'max':'ci_max','vk':'ci_vk'}[platform])
   value=s.admin({'action':'prepare_login','id':target['id'],'expected_binding_hash':target['binding_hash']})
   require(value['login_url']=='/owner-browser/' and value['live_verified'] is False,'PORTAL_SELECTION_INVALID')
+  stage='observe_chrome'
   deadline=time.monotonic()+60;seen=False;group=None;started=False
   while time.monotonic()<deadline:
    state=subprocess.check_output(['systemctl','show','max-postiz-login.service','-p','ControlGroup','-p','ActiveState'],text=True)
@@ -1250,34 +1349,39 @@ try:
    if started and values.get('ActiveState') in {'failed','inactive'}:break
    time.sleep(.02)
   require(seen,'PORTAL_NATIVE_CHROME_NOT_OBSERVED')
+  stage='profile_check'
   selection=json.loads((s.root/'data/owner-browser-selection.json').read_text())
   require(selection['target_id']==target['id'],'PORTAL_WRONG_PROFILE')
   profile=s.root/selection['profile_dir'];require(profile.is_dir(),'PORTAL_PROFILE_NOT_CREATED')
   if group is not None and group.exists():
    require(all(not item.read_text().strip() for item in group.rglob('cgroup.procs')),'PORTAL_WORKER_NOT_CLEANED')
+  stage='owner_vnc_http'
   response=s.client.get('/owner-browser/vnc.html',follow_redirects=False)
   require(response.status_code==200 and 'novnc' in response.text.lower(),'PORTAL_OWNER_VNC_PAGE_FAILED')
   import httpx
   with httpx.Client(trust_env=False,follow_redirects=False) as anon:
    require(anon.get(s.state['public_origin']+'/owner-browser/vnc.html').status_code in (401,403),'PORTAL_ANONYMOUS_ACCESS')
-  key=base64.b64encode(os.urandom(16)).decode();cookie=s.client.cookies.get('auth');require(bool(cookie),'PORTAL_COOKIE_MISSING')
-  with socket.create_connection(('10.20.30.45',4007),timeout=5) as wire:
-   message='GET /owner-browser/websockify HTTP/1.1\r\nHost: 10.20.30.45:4007\r\nOrigin: '+s.state['public_origin']+'\r\nCookie: auth='+cookie+'\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\nSec-WebSocket-Key: '+key+'\r\n\r\n'
-   wire.sendall(message.encode());raw=b''
-   while b'\r\n\r\n' not in raw and len(raw)<8192:raw+=wire.recv(1024)
-   require(raw.startswith(b'HTTP/1.1 101'),'PORTAL_WEBSOCKET_FAILED')
-   header,body=raw.split(b'\r\n\r\n',1)
-   expected=base64.b64encode(hashlib.sha1((key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest())
-   require(expected.lower() in header.lower(),'PORTAL_WEBSOCKET_ACCEPT_INVALID')
-   while b'RFB ' not in body and len(body)<512:body+=wire.recv(128)
-   require(b'RFB ' in body,'PORTAL_RFB_HANDSHAKE_FAILED')
+  cookie=s.client.cookies.get('auth');require(bool(cookie),'PORTAL_COOKIE_MISSING')
+  stage='rfb_readiness';wait_portal_rfb()
+  stage='owner_websocket';portal_websocket(cookie)
   result.append({'platform':platform,'owner_request':True,'native_chrome_observed':True,'dedicated_profile_created':True,
     'supervised_cleanup':True,'vnc_owner_guard':True,'websocket_rfb':True,'account_authenticated':False,'external_delivery_verified':False})
   if platform=='max':
+   stage='selection_expiry'
    # The actual product intentionally retains its ten-minute selection lease.
    require(selection['expires_at']<=time.time()+601,'PORTAL_EXPIRY_INVALID')
    while time.time()<=selection['expires_at']:time.sleep(1)
  s.check();atomic(s.evidence/'portal.json',{'passed':True,'checks':result,'fixture_scope':'native_mechanism_with_external_navigation_unavailable','external_publications':0},exclusive=True)
+except Exception as error:
+ allowed={'PORTAL_WIRE_CAP_EXCEEDED','PORTAL_WIRE_TIMEOUT','PORTAL_WIRE_UNAVAILABLE','PORTAL_WIRE_EOF',
+  'PORTAL_RFB_PROTOCOL_INVALID','PORTAL_RFB_NOT_READY','PORTAL_WEBSOCKET_STATUS_INVALID',
+  'PORTAL_WEBSOCKET_HEADER_INVALID','PORTAL_WEBSOCKET_FRAME_INVALID','PORTAL_SELECTION_INVALID',
+  'PORTAL_NATIVE_CHROME_NOT_OBSERVED','PORTAL_WRONG_PROFILE','PORTAL_PROFILE_NOT_CREATED',
+  'PORTAL_WORKER_NOT_CLEANED','PORTAL_OWNER_VNC_PAGE_FAILED','PORTAL_ANONYMOUS_ACCESS','PORTAL_COOKIE_MISSING','PORTAL_EXPIRY_INVALID'}
+ code=str(error) if isinstance(error,(ReadinessError,ScenarioError)) and str(error) in allowed else 'PORTAL_NATIVE_PROBE_FAILED'
+ failure={'platform':platform,'stage':stage,'code':code}
+ atomic(s.evidence/'portal.json',{'passed':False,'failure':failure,'checks':result,'external_publications':0},exclusive=True)
+ print(json.dumps({'portal_failed':failure}));raise ReadinessError(code) from None
 finally:s.client.close()
 '''
         script.write_text(code)
