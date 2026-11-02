@@ -47,6 +47,13 @@ HTTP_ERROR_CODES = frozenset({
     "EDITORIAL_MAINTENANCE_BUSY", "POSTIZ_NEAR_QUEUE_RESTART_BLOCKED", "POSTIZ_NOT_CONFIGURED",
     "RESTART_ALREADY_REQUESTED", "RESTART_SELECTION_INVALID", "ROUTE_CONFIG_CONFLICT",
 })
+EXCEPTION_KINDS = frozenset({"ScenarioError", "KeyError", "TypeError", "ValueError", "AttributeError", "NameError",
+    "RuntimeError", "OSError", "PermissionError", "FileNotFoundError", "JSONDecodeError", "UnicodeDecodeError",
+    "TimeoutError", "Error", "OperationalError", "ProgrammingError", "InterfaceError", "IntegrityError",
+    "InvalidRequestError", "NoSuchTableError", "MemoryError", "OverflowError", "AssertionError"})
+SCENARIO_FUNCTIONS = frozenset({"main", "run", "exercise", "bootstrap", "login", "body", "call", "admin", "setup",
+    "runtime", "browser", "engine", "hub_snapshot", "postiz_snapshot", "snapshot", "seed_unknown", "check", "save",
+    "phase", "atomic", "digest", "png_bytes", "dsn", "plain", "bind_source", "validate_state", "namespace_guard", "require"})
 
 
 class ScenarioError(RuntimeError):
@@ -68,6 +75,28 @@ def safe_http_metadata(value):
                 or value["response_code"] not in HTTP_ERROR_CODES))):
         return None
     return dict(value)
+
+
+def safe_exception_metadata(error):
+    kind = type(error).__name__
+    frames, trace = [], error.__traceback__
+    source = os.path.normcase(os.path.abspath(__file__))
+    while trace is not None:
+        code = trace.tb_frame.f_code
+        if (os.path.normcase(os.path.abspath(code.co_filename)) == source and code.co_name in SCENARIO_FUNCTIONS
+                and type(trace.tb_lineno) is int and 1 <= trace.tb_lineno <= 10000):
+            frames.append({"function": code.co_name, "line": trace.tb_lineno})
+        trace = trace.tb_next
+    flags = {"sandbox_blocked": False, "executable_missing": False, "strict_mode": False, "err_blocked": False}
+    if type(error).__module__.startswith("playwright."):
+        message = str(error)[:65536].lower()
+        flags.update(sandbox_blocked=any(pattern in message for pattern in (
+            "no usable sandbox", "failed to move to new namespace", "suid sandbox helper binary")),
+            executable_missing="executable doesn't exist" in message,
+            strict_mode="strict mode violation" in message,
+            err_blocked=any(pattern in message for pattern in (
+                "net::err_blocked_by_client", "net::err_blocked_by_response", "net::err_blocked_by_csp", "net::err_blocked_by_orb")))
+    return {"kind": kind if kind in EXCEPTION_KINDS else "OtherError", "frames": frames[-8:], "playwright_flags": flags}
 
 
 def require(condition, code):
@@ -198,6 +227,7 @@ class Scenario:
         bind_source(self.root)
         self.client = httpx.Client(base_url=ORIGIN, trust_env=False, follow_redirects=False, timeout=30,
                                    headers={"Origin": ORIGIN, "Referer": ORIGIN + "/editorial", "Sec-Fetch-Site": "same-origin"})
+        self.last_http = None
 
     def check(self):
         namespace_guard(self.state)
@@ -243,6 +273,12 @@ class Scenario:
                 if isinstance(code, str) and code in HTTP_ERROR_CODES:
                     metadata["response_code"] = code
             raise ScenarioError("SCENARIO_HTTP_STATUS_INVALID", http=metadata)
+        self.last_http = {"method": method, "path": path, "status": response.status_code,
+                          "body_sha256": hashlib.sha256(response.content).hexdigest()}
+        payload = kwargs.get("json")
+        action = payload.get("action") if isinstance(payload, dict) else None
+        if isinstance(action, str) and action in HTTP_ACTIONS:
+            self.last_http["action"] = action
         return response
 
     def body(self, response):
@@ -589,10 +625,13 @@ def main(argv=None):
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,99}", code):
             code = "SCENARIO_FAILED"
         # Never print an HTTP response, DSN, exception text, cookie or secret.
-        result = {"mode": args.mode, "passed": False, "code": code}
+        result = {"mode": args.mode, "passed": False, "code": code, "exception": safe_exception_metadata(error)}
         metadata = safe_http_metadata(getattr(error, "http", None)) if isinstance(error, ScenarioError) else None
         if metadata is not None:
             result["http"] = metadata
+        previous = safe_http_metadata(getattr(scenario, "last_http", None))
+        if previous is not None:
+            result["last_http"] = previous
         atomic(args.evidence / (args.mode + "-failed.json"), result, exclusive=True)
         print(json.dumps(result))
         return 1

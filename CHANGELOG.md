@@ -1,5 +1,25 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: диагностика Python/Chrome этапа native exercise
+
+- R17 run 41371284426 подтвердил исправленный 14 MiB nginx transport, полный
+  build и реальные API-проверки загрузки ровно 10 MiB, превышения и 15m/1m/200KiB
+  limits. Позже exercise завершился SCENARIO_FAILED без HTTP-отказа; unit exit 1,
+  peak 848 MiB. Тип/строка исходное сообщение не сохраняло; OOM либо Chrome cause
+  не объявляются доказанными. Accepted=false, переносимый image не экспортирован.
+- Диагностика теперь публикует только конечный enum исключения, до восьми frames
+  точного readiness_scenario.py (static function/line, без paths/message/locals),
+  безопасный last_http и фиксированные Playwright boolean hints. Ответы и секреты
+  не выводятся; все HTTP/status/auth/assertions и порядок exercise сохранены.
+- До build добавлен реальный sandboxed Chrome about:blank prerequisite в own
+  loopback namespace/transient unit с NNP/Delegate/45s и отдельным приватным HOME
+  существующего nonroot runner. Это не owner login proof. Только тестовые transient
+  clients получили явные 2 GiB для HTTP+browser; production service остаётся 1 GiB,
+  helper/Engine limits не изменены. --no-sandbox/sysctl обходов нет.
+- Проверки: scenario 65 pure passed; native 77 passed, 8 Windows FD/symlink skips;
+  Ruff/diff и независимый review прошли. Полные native/canonical/CI проверки
+  следующего exact commit обязательны; рабочий сервер и Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: лимит тела внутреннего nginx auth subrequest
 
 - R16 run 41370668926 воспроизвёл ошибку до тяжёлой сборки. Точный nginx log:

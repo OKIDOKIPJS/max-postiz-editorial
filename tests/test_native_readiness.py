@@ -387,6 +387,7 @@ def test_private_user_producers_are_owned_units_even_when_parent_wait_times_out(
     assert "--property=NetworkNamespacePath=/proc/123/ns/net" in argv
     assert "--property=KillMode=control-group" in argv and "--property=RuntimeMaxSec=60" in argv
     assert "--property=NoNewPrivileges=yes" in argv and "--property=Delegate=yes" in argv
+    assert "--property=MemoryMax=2G" in argv and "--property=MemorySwapMax=2G" in argv
     assert argv[-2:] == command and "/usr/sbin/runuser" not in argv and options["timeout"] == 85
     assert acceptance.unit_names == ["mp-native-scenario-exercise-aaaaaaaaaaaa.service"]
 
@@ -660,3 +661,42 @@ def test_only_internal_owner_auth_and_exact_admin_scopes_allow_bounded_image_env
     auth = locations["= /_editorial-owner-auth"]
     assert "internal;" in auth and "proxy_pass_request_body off;" in auth and 'proxy_set_header Content-Length "";' in auth
     assert "auth_request /_editorial-owner-auth;" in locations["= /api/editorial/route-admin"]
+
+
+def test_early_chrome_prerequisite_is_nonroot_sandboxed_private_and_kernel_owned(native, tmp_path, monkeypatch):
+    import ast
+    import inspect
+    instance = native.Acceptance.__new__(native.Acceptance)
+    instance.workspace = SimpleNamespace(stat=lambda: SimpleNamespace(st_uid=1001, st_gid=1001))
+    instance.created_opt, instance.python, instance.browsers = tmp_path, tmp_path / "python", tmp_path / "browsers"
+    instance.engine = SimpleNamespace(label_value="a" * 32, slice="owned.slice")
+    instance.anchor_pid, instance.unit_names, instance.report = 123, [], {"checks": {}}
+    calls, namespaces = [], []
+    instance.phase = lambda value: None
+    instance.namespace_proof = lambda: namespaces.append(True)
+    instance.run = lambda argv, **kwargs: calls.append((argv, kwargs))
+    monkeypatch.setattr(native.os, "chown", lambda *args: None, raising=False)
+    instance.chrome_prerequisite()
+    argv, options = calls[0]
+    assert "--uid=1001" in argv and "--slice=owned.slice" in argv
+    assert all(flag in argv for flag in ("--property=NoNewPrivileges=yes", "--property=Delegate=yes",
+        "--property=KillMode=control-group", "--property=RuntimeMaxSec=45", "--property=MemoryMax=2G",
+        "--property=NetworkNamespacePath=/proc/123/ns/net"))
+    assert "TMPDIR=" + str(tmp_path / "chrome-prerequisite-home") in argv
+    assert options["timeout"] == 65 and len(instance.unit_names) == 1 and len(namespaces) == 2
+    script = (tmp_path / "chrome-prerequisite.py").read_text()
+    ast.parse(script)
+    assert "chromium_sandbox=True" in script and "about:blank" in script and "--no-sandbox" not in script
+    assert instance.report["checks"]["sandboxed_chrome_prerequisite"]["owner_authentication"] is False
+    order = inspect.getsource(native.Acceptance.execute)
+    assert order.index("self.chrome_prerequisite()") < order.index("self.build()")
+
+
+def test_early_chrome_prerequisite_rejects_root_uid_before_home_or_unit(native, tmp_path):
+    instance = native.Acceptance.__new__(native.Acceptance)
+    instance.workspace = SimpleNamespace(stat=lambda: SimpleNamespace(st_uid=0, st_gid=0))
+    instance.phase, instance.namespace_proof = lambda value: None, lambda: None
+    instance.created_opt = tmp_path
+    with pytest.raises(native.ReadinessError, match="CHROME_PREREQUISITE_NONROOT_OWNER_REQUIRED"):
+        instance.chrome_prerequisite()
+    assert list(tmp_path.iterdir()) == []

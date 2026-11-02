@@ -96,7 +96,11 @@ def test_failed_http_evidence_keeps_only_fixed_route_status_action_and_body_dige
                               "--evidence", str(tmp_path / "public"), "--mode", "exercise"]) == 1
         printed = capsys.readouterr().out
         result = json.loads(printed)
-        assert result == {"mode": "exercise", "passed": False, "code": "SCENARIO_HTTP_STATUS_INVALID", "http": expected}
+        assert {key: value for key, value in result.items() if key != "exception"} == {
+            "mode": "exercise", "passed": False, "code": "SCENARIO_HTTP_STATUS_INVALID", "http": expected}
+        assert result["exception"]["kind"] == "ScenarioError"
+        assert all(frame["function"] in {"main", "admin", "call"} and type(frame["line"]) is int
+                   for frame in result["exception"]["frames"])
         assert writes == [(tmp_path / "public/exercise-failed.json", result, {"exclusive": True})]
         assert fixture_canary not in printed and fixture_canary not in json.dumps(writes, default=str)
     finally:
@@ -199,6 +203,58 @@ def test_explicit_negative_status_is_not_replaced_by_bff_success_default(scenari
         transport=httpx.MockTransport(lambda request: httpx.Response(status, json={})))
     try:
         assert instance.admin({"action": "upload_media"}, allowed=(status,)) == {}
+    finally:
+        instance.client.close()
+
+
+def test_generic_exception_metadata_excludes_foreign_frames_messages_and_arguments(scenario):
+    import json
+    fixture_canary = "private-exception-fixture-must-never-be-logged"
+    try:
+        scenario.require(False, fixture_canary)
+    except scenario.ScenarioError as error:
+        result = scenario.safe_exception_metadata(error)
+    assert result["kind"] == "ScenarioError" and result["frames"]
+    assert all(frame["function"] == "require" and 1 <= frame["line"] <= 10000 for frame in result["frames"])
+    serialized = json.dumps(result)
+    assert fixture_canary not in serialized and str(Path(__file__).parent) not in serialized
+    assert "test_generic_exception_metadata" not in serialized
+
+
+@pytest.mark.parametrize("message,flag", [
+    ("No usable sandbox! private-canary", "sandbox_blocked"),
+    ("Failed to move to new namespace private-canary", "sandbox_blocked"),
+    ("Executable doesn't exist at private-canary", "executable_missing"),
+    ("strict mode violation: private-canary", "strict_mode"),
+    ("net::ERR_BLOCKED_BY_CLIENT private-canary", "err_blocked"),
+    ("unlisted private-canary", None),
+])
+def test_playwright_exception_flags_are_only_finite_booleans_never_raw_text(scenario, message, flag):
+    error_type = type("Error", (RuntimeError,), {"__module__": "playwright._impl._errors"})
+    result = scenario.safe_exception_metadata(error_type(message))
+    assert result["kind"] == "Error" and result["frames"] == []
+    assert {key for key, value in result["playwright_flags"].items() if value} == ({flag} if flag else set())
+    assert "private-canary" not in scenario.json.dumps(result)
+    assert not any(scenario.safe_exception_metadata(RuntimeError(message))["playwright_flags"].values())
+
+
+def test_last_completed_http_is_kept_in_memory_and_strictly_projected_on_generic_failure(scenario, tmp_path, monkeypatch, capsys):
+    instance, requests = fake_client(scenario)
+    try:
+        instance.admin({"action": "upload_media", "value": "private-request-fixture"})
+        metadata = scenario.safe_http_metadata(instance.last_http)
+        assert metadata["action"] == "upload_media" and metadata["status"] == 201
+        instance.run = lambda mode: (_ for _ in ()).throw(KeyError("private-exception-fixture"))
+        monkeypatch.setattr(scenario, "Scenario", lambda *args: instance)
+        writes = []
+        monkeypatch.setattr(scenario, "atomic", lambda path, value, **kwargs: writes.append(value))
+        assert scenario.main(["--root", str(tmp_path), "--state", str(tmp_path / "state"),
+            "--evidence", str(tmp_path / "evidence"), "--mode", "exercise"]) == 1
+        output = capsys.readouterr().out
+        result = scenario.json.loads(output)
+        assert result["code"] == "SCENARIO_FAILED" and result["exception"]["kind"] == "KeyError"
+        assert result["last_http"] == metadata and writes == [result] and len(requests) == 1
+        assert "private-request-fixture" not in output and "private-exception-fixture" not in output
     finally:
         instance.client.close()
 

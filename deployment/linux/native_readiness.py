@@ -44,6 +44,7 @@ SCENARIO_ARTIFACTS = frozenset({"bootstrap-owner.json", "bootstrap-owner-failed.
     "verify-restored-failed.json", "portal.json", "default-cmd.json", "editorial-synthetic.png"})
 SCENARIO_FILE_LIMIT = 8 * 1024 * 1024
 SCENARIO_TOTAL_LIMIT = 16 * 1024 * 1024
+TEST_CLIENT_MEMORY = "2G"
 BASE = "ghcr.io/gitroomhq/postiz-app@sha256:d2b37802e96757729fdea2d3d71287f841c2b619faa1cb4c21dac07df657fde1"
 PINS = {
     "postgres": "postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
@@ -865,6 +866,52 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
         self.report["checks"]["real_databases_redis_temporal"] = {"postgres_instances": 3, "initially_empty": True,
             "temporal_ready": True, "elasticsearch_ready": True, "network": "loopback_namespace_only"}
 
+    def chrome_prerequisite(self):
+        self.phase("sandboxed_chrome_prerequisite")
+        self.namespace_proof()
+        owner = self.workspace.stat()
+        if owner.st_uid <= 0:
+            raise ReadinessError("CHROME_PREREQUISITE_NONROOT_OWNER_REQUIRED")
+        home = self.created_opt / "chrome-prerequisite-home"
+        home.mkdir(mode=0o700)
+        os.chown(home, owner.st_uid, owner.st_gid)
+        script = self.created_opt / "chrome-prerequisite.py"
+        script.write_text(r'''
+import json,os,pathlib,socket,sys
+from playwright.sync_api import sync_playwright
+result={'passed':False,'sandbox_enabled':True,'owner_authentication':False}
+try:
+ if [name for _,name in socket.if_nameindex()]!=['lo']:raise RuntimeError('network_scope')
+ with sync_playwright() as p:
+  browser=p.chromium.launch(channel='chrome',headless=True,chromium_sandbox=True,timeout=30000)
+  try:
+   page=browser.new_page();page.goto('about:blank');result['passed']=True
+  finally:browser.close()
+except Exception as error:
+ text=str(error).lower()
+ path=pathlib.Path(os.environ['HOME'])/'failure.private.txt'
+ fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+ with os.fdopen(fd,'w') as output:output.write(str(error)[:65536])
+ result.update(sandbox_denied=any(v in text for v in ('no usable sandbox','operation not permitted','failed to move to new namespace')),
+  executable_missing=any(v in text for v in ('executable doesn\'t exist','executable does not exist')),
+  shared_library_missing='error while loading shared libraries' in text)
+print(json.dumps(result));sys.exit(0 if result['passed'] else 1)
+''')
+        unit = "mp-native-chrome-prerequisite-" + self.engine.label_value[:12] + ".service"
+        self.unit_names.append(unit)
+        command = ["systemd-run", "--wait", "--pipe", "--collect", "--unit=" + unit,
+            "--uid=" + str(owner.st_uid), "--service-type=exec", "--slice=" + self.engine.slice,
+            "--property=NoNewPrivileges=yes", "--property=Delegate=yes", "--property=KillMode=control-group",
+            "--property=NetworkNamespacePath=/proc/" + str(self.anchor_pid) + "/ns/net",
+            "--property=RuntimeMaxSec=45", "--property=TimeoutStopSec=10", "--property=MemoryMax=" + TEST_CLIENT_MEMORY,
+            "--property=MemorySwapMax=2G", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "HOME=" + str(home),
+            "TMPDIR=" + str(home), "PYTHONUTF8=1", "LD_LIBRARY_PATH=" + str(Path(sys.base_prefix) / "lib"),
+            "PLAYWRIGHT_BROWSERS_PATH=" + str(self.browsers), str(self.python), str(script)]
+        self.run(command, name="chrome-prerequisite", timeout=65)
+        self.namespace_proof()
+        self.report["checks"]["sandboxed_chrome_prerequisite"] = {"passed": True,
+            "sandbox_enabled": True, "nonroot": True, "owner_authentication": False, "url": "about:blank"}
+
     def user_environment(self):
         return ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
                 "HOME=" + str(self.project / "data/ci-home"), "PYTHONUTF8=1",
@@ -884,7 +931,7 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
             "--service-type=exec", "--slice=" + self.engine.slice, "--property=Delegate=yes",
             "--property=NoNewPrivileges=yes", "--property=KillMode=control-group",
             "--property=RuntimeMaxSec=" + str(timeout), "--property=TimeoutStopSec=15",
-            "--property=MemoryMax=1G", "--property=MemorySwapMax=2G", "--property=TasksMax=1024",
+            "--property=MemoryMax=" + TEST_CLIENT_MEMORY, "--property=MemorySwapMax=2G", "--property=TasksMax=1024",
             "--property=WorkingDirectory=" + str(self.project),
             "--property=NetworkNamespacePath=/proc/" + str(self.anchor_pid) + "/ns/net",
             *self.user_environment(), *command]
@@ -1380,6 +1427,7 @@ finally:s.client.close()
                 self.dependencies()
                 self.image_pull()
                 self.proxy_preflight()
+                self.chrome_prerequisite()
                 self.build()
                 self.inspect_image()
                 self.runtime_dependencies()
