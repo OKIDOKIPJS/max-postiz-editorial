@@ -468,3 +468,95 @@ def test_native_policy_creation_rejects_public_data_directory(native, tmp_path):
     with pytest.raises(native.ReadinessError, match="NATIVE_POLICY_PRIVATE_DIRECTORY_REQUIRED"):
         native.initialize_disabled_policy(tmp_path, os.getuid(), os.getgid())
     assert not (data / "hourly-article-policy.local.json").exists()
+
+
+@pytest.mark.parametrize("unit,helper", [
+    ("max-postiz-login.service", "login-browser.py"),
+    ("max-postiz-editorial-restart.service", "restart-editorial.py"),
+])
+def test_relocated_owner_helper_resets_only_execstart_and_passes_exact_root(native, unit, helper):
+    import shlex
+    project = PurePosixPath("/opt/max-postiz-readiness-abc123/project")
+    lines = native.helper_execstart_override(unit, project).splitlines()
+    assert lines[0] == "ExecStart=" and len(lines) == 2
+    assert shlex.split(lines[1].removeprefix("ExecStart=")) == [
+        str(project / ".venv/bin/python"), str(project / "deployment/linux" / helper), "--root", str(project)]
+    assert all(not line.startswith(("User=", "Environment=", "Slice=", "NoNewPrivileges=")) for line in lines)
+
+
+@pytest.mark.parametrize("unit,project", [
+    ("max-postiz-editorial.service", "/opt/max-postiz-readiness-abc123/project"),
+    ("max-postiz-display.service", "/opt/max-postiz-readiness-abc123/project"),
+    ("arbitrary.service", "/opt/max-postiz-readiness-abc123/project"),
+    ("max-postiz-login.service", "relative/project"),
+    ("max-postiz-login.service", "/opt/project\nUser=root"),
+    ("max-postiz-editorial-restart.service", "/opt/%n/project"),
+])
+def test_relocated_helper_override_refuses_other_units_or_systemd_expansion(native, unit, project):
+    with pytest.raises(native.ReadinessError, match="NATIVE_HELPER_UNIT_OVERRIDE_INVALID"):
+        native.helper_execstart_override(unit, project)
+
+
+def restart_lease(project):
+    return {"contract": "editorial-restart-request-v1", "request_id": "a" * 32, "root": str(project),
+            "issued_at": 100, "expires_at": 160, "runtime_generation": "b" * 64,
+            "previous_worker_id": "11111111-1111-4111-8111-111111111111"}
+
+
+@pytest.mark.parametrize("now", [100, 160, 161])
+def test_portal_waits_for_exact_restart_expiry_without_mutating_request(native, now):
+    project = PurePosixPath("/opt/native/project")
+    value = restart_lease(project)
+    before = json.dumps(value, sort_keys=True)
+    ticks = [float(now), 0.0]
+    def sleep(seconds):
+        ticks[0] += seconds
+        ticks[1] += seconds
+    result = native.wait_restart_expiry(value, project, clock=lambda: ticks[0], monotonic=lambda: ticks[1], sleep=sleep)
+    assert ticks[0] > 160 and result["waited_seconds"] <= 61
+    assert result["lease_mutated"] is False and json.dumps(value, sort_keys=True) == before
+
+
+def test_portal_restart_expiry_has_bounded_monotonic_wait_even_if_wallclock_stalls(native):
+    project = PurePosixPath("/opt/native/project")
+    elapsed = [0.0]
+    with pytest.raises(native.ReadinessError, match="NATIVE_RESTART_LEASE_WAIT_EXCEEDED"):
+        native.wait_restart_expiry(restart_lease(project), project, clock=lambda: 101,
+            monotonic=lambda: elapsed[0], sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds))
+    assert elapsed[0] == 65
+
+
+@pytest.mark.parametrize("key,value", [("expires_at", 166), ("root", "/other"), ("request_id", "invalid"), ("issued_at", 170)])
+def test_portal_restart_expiry_rejects_wrong_nonce_root_or_expiry_instead_of_shortening(native, key, value):
+    project = PurePosixPath("/opt/native/project")
+    lease = {**restart_lease(project), key: value}
+    with pytest.raises(native.ReadinessError, match="NATIVE_RESTART_LEASE_INVALID"):
+        native.wait_restart_expiry(lease, project, clock=lambda: 101,
+            sleep=lambda seconds: pytest.fail("Must not sleep or mutate an invalid lease"))
+
+
+def test_portal_restart_expiry_rejects_an_overslept_deadline(native):
+    project = PurePosixPath("/opt/native/project")
+    ticks = [101.0, 0.0]
+    def sleep(seconds):
+        ticks[:] = [201.0, 100.0]
+    with pytest.raises(native.ReadinessError, match="NATIVE_RESTART_LEASE_WAIT_EXCEEDED"):
+        native.wait_restart_expiry(restart_lease(project), project,
+            clock=lambda: ticks[0], monotonic=lambda: ticks[1], sleep=sleep)
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="Private restart lease reads require Linux directory descriptors")
+def test_portal_reads_only_private_owned_bounded_restart_manifest_without_writing(native, tmp_path):
+    import os
+    folder = tmp_path / "data"
+    folder.mkdir(mode=0o700)
+    target = folder / "editorial-restart-request.json"
+    raw = json.dumps(restart_lease(tmp_path)).encode()
+    target.write_bytes(raw)
+    target.chmod(0o600)
+    before = target.stat()
+    assert native.read_restart_lease(tmp_path, os.getuid()) == raw
+    assert target.stat().st_mtime_ns == before.st_mtime_ns and target.read_bytes() == raw
+    target.write_bytes(b"x" * 4097)
+    with pytest.raises(native.ReadinessError, match="NATIVE_RESTART_LEASE_PRIVATE_REQUIRED"):
+        native.read_restart_lease(tmp_path, os.getuid())

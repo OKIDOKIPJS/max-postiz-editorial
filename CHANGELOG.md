@@ -1,5 +1,22 @@
 # История версий
 
+## 0.14.0 — 2026-11-02: явный root helper-сервисов изолированного стенда
+
+- Независимый разбор следующих native-этапов выявил две конкретные несовместимости
+  harness: перенесённые login/restart units оставляли helper default root
+  /opt/max-postiz; после завершённого restart ещё действовал его 60-секундный
+  manifest, намеренно блокирующий prepare_login. Production contracts не менялись.
+- Только в drop-ins двух собственных unit стенда сбрасывается ExecStart и передаётся
+  абсолютный helper с --root текущей копии. User/NNP/netns/slice и cleanup сохранены.
+  До portal unit добавлено ограниченное ожидание истечения точного приватного
+  restart manifest: FD/owner/0600/singlelink/size/shape/TTL и повторная сверка bytes;
+  максимум 65 секунд по monotonic. Manifest и сроки не изменяются, POST не повторяется.
+- Проверки: 68 pure/mock native tests passed, 8 Windows FD/symlink skips;
+  Ruff/diff и независимый review прошли. Незавершённый R12 заменяется новым точным
+  кандидатом; его сборка и полная приёмка не объявляются успешными или неуспешными
+  без terminal proof. Новому commit требуются все CI/canonical/native проверки.
+  Рабочий сервер, production units и Пикабу не затрагивались.
+
 ## 0.14.0 — 2026-11-02: память полной Next/TypeScript сборки
 
 - R11 run 41363544861 прошёл строгий resource/network probe и оба Nest builds;

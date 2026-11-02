@@ -93,6 +93,66 @@ def proxy_configuration(outer):
         "proxy_set_header X-Forwarded-Proto $scheme;}}}")
 
 
+def helper_execstart_override(unit, project):
+    helpers = {"max-postiz-login.service": "login-browser.py",
+               "max-postiz-editorial-restart.service": "restart-editorial.py"}
+    root = str(project)
+    if unit not in helpers or not re.fullmatch(r"/[A-Za-z0-9_/-]+", root) or ".." in root.split("/"):
+        raise ReadinessError("NATIVE_HELPER_UNIT_OVERRIDE_INVALID")
+    return ("ExecStart=\nExecStart=" + root + "/.venv/bin/python " + root +
+            "/deployment/linux/" + helpers[unit] + " --root " + root + "\n")
+
+
+def wait_restart_expiry(value, project, *, clock=None, monotonic=None, sleep=None):
+    clock, monotonic, sleep = clock or time.time, monotonic or time.monotonic, sleep or time.sleep
+    fields = {"contract", "request_id", "root", "issued_at", "expires_at", "runtime_generation", "previous_worker_id"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("contract") != "editorial-restart-request-v1" or value.get("root") != str(project)
+            or not isinstance(value.get("request_id"), str) or not re.fullmatch(r"[a-f0-9]{32}", value["request_id"])
+            or any(type(value.get(key)) is not int for key in ("issued_at", "expires_at"))
+            or not 0 < value["expires_at"] - value["issued_at"] <= 60
+            or value["issued_at"] > clock()
+            or not isinstance(value.get("runtime_generation"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", value["runtime_generation"])):
+        raise ReadinessError("NATIVE_RESTART_LEASE_INVALID")
+    try:
+        if str(uuid.UUID(value["previous_worker_id"])) != value["previous_worker_id"]:
+            raise ValueError
+    except (ValueError, TypeError, AttributeError):
+        raise ReadinessError("NATIVE_RESTART_LEASE_INVALID") from None
+    start = monotonic()
+    while clock() <= value["expires_at"]:
+        if monotonic() - start >= 65:
+            raise ReadinessError("NATIVE_RESTART_LEASE_WAIT_EXCEEDED")
+        sleep(min(1, max(0.05, value["expires_at"] - clock() + 0.05)))
+    if monotonic() - start > 65:
+        raise ReadinessError("NATIVE_RESTART_LEASE_WAIT_EXCEEDED")
+    return {"waited_seconds": round(monotonic() - start, 3), "lease_mutated": False}
+
+
+def read_restart_lease(project, owner_uid):
+    folder = os.open(Path(project) / "data", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    try:
+        info = os.fstat(folder)
+        if info.st_uid != owner_uid or stat.S_IMODE(info.st_mode) != 0o700:
+            raise ReadinessError("NATIVE_RESTART_LEASE_PRIVATE_REQUIRED")
+        descriptor = os.open("editorial-restart-request.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != owner_uid
+                or stat.S_IMODE(info.st_mode) != 0o600 or not 0 < info.st_size <= 4096):
+            raise ReadinessError("NATIVE_RESTART_LEASE_PRIVATE_REQUIRED")
+        raw = os.read(descriptor, 4097)
+        after = os.fstat(descriptor)
+        if len(raw) != info.st_size or (info.st_ino, info.st_size, info.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ReadinessError("NATIVE_RESTART_LEASE_CHANGED")
+        return raw
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(folder)
+
+
 def validate_scenario_entry(name, info, owner_uid):
     if (name not in SCENARIO_ARTIFACTS or not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1 or info.st_uid != owner_uid or info.st_mode & 0o022
@@ -971,10 +1031,12 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
                 continue
             folder = Path("/etc/systemd/system") / (name + ".d")
             folder.mkdir(exist_ok=True)
+            helper = (helper_execstart_override(name, self.project) if name in {
+                "max-postiz-login.service", "max-postiz-editorial-restart.service"} else "")
             (folder / "readiness.conf").write_text("[Service]\nNetworkNamespacePath=/proc/" + str(self.anchor_pid) +
                 "/ns/net\nSlice=" + self.engine.slice + "\nEnvironment=HOME=" + str(self.project / "data/ci-home") +
                 "\nEnvironment=PLAYWRIGHT_BROWSERS_PATH=" + str(self.browsers) +
-                "\nEnvironment=LD_LIBRARY_PATH=" + str(Path(sys.base_prefix) / "lib") + "\n")
+                "\nEnvironment=LD_LIBRARY_PATH=" + str(Path(sys.base_prefix) / "lib") + "\n" + helper)
         subprocess.run(["systemctl", "daemon-reload"], check=True, timeout=30)
         subprocess.run(["systemctl", "start", unit], check=True, timeout=60)
         self.wait_exec(self.proxy, ["node", "-e", "require('http').get('http://127.0.0.1:8092/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"])
@@ -1011,6 +1073,11 @@ console.log(JSON.stringify({passed:true,compiled_files:required.length,full_next
 
     def portal(self):
         self.phase("owner_portal_native_offline")
+        lease = read_restart_lease(self.project, self.user.pw_uid)
+        waited = wait_restart_expiry(json.loads(lease), self.project)
+        if read_restart_lease(self.project, self.user.pw_uid) != lease:
+            raise ReadinessError("NATIVE_RESTART_LEASE_CHANGED")
+        self.report["checks"]["restart_lease_expired_before_portal"] = {**waited, "request_sha256": digest(lease)}
         # This is a private probe, not an alternate product login URL. The
         # production helper opens its real allowlisted URL in a network with no
         # external interface. Account authentication is deliberately not claimed.
