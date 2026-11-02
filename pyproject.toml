@@ -8,7 +8,7 @@ version = "0.14.0"
 description = "Автономная редакция на VM с PostgreSQL, OpenCode и управлением из Postiz"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "sqlalchemy>=2.0,<2.1",
+  "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "sqlalchemy>=2.0,<2.2",
   "psycopg[binary]>=3.2,<4", "httpx>=0.28,<1", "jsonschema>=4.23,<5",
   "beautifulsoup4>=4.13,<5", "feedparser>=6.0,<7", "tzdata>=2025.1",
   "certifi>=2026.10.23", "opentelemetry-api>=1.45.2,<2",
@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3,<10", "pytest-cov>=6,<8", "ruff>=0.11,<1", "build>=1.2,<2"]
-browser = ["playwright==1.63.0"]
+browser = ["playwright==1.64.1"]
 images = ["onnxruntime>=1.31,<1.32", "Pillow>=13,<14", "tokenizers>=0.23,<0.24", "numpy>=2.5,<3"]
 
 [project.scripts]
